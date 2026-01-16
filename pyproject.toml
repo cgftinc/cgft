@@ -1,0 +1,25 @@
+[project]
+name = "synthetic-data-prep"
+version = "0.1.0"
+description = "Tools for preparing synthetic training data, including document chunking pipelines"
+readme = "README.md"
+authors = [
+    { name = "cgft", email = "finetune@cgft.io" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.76.0",
+    "langchain-text-splitters>=0.3.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "jupyter>=1.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.13,<0.9.0"]
+build-backend = "uv_build"
