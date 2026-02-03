@@ -1,13 +1,25 @@
 """Markdown document chunker with header-aware splitting."""
 
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
     RecursiveCharacterTextSplitter,
 )
 
-from synthetic_data_prep.models import Chunk
+from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
+
+
+@dataclass
+class _MutableSection:
+    """Mutable intermediate representation used during chunking."""
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return len(self.content)
 
 
 class MarkdownChunker:
@@ -22,7 +34,7 @@ class MarkdownChunker:
         >>> chunker = MarkdownChunker(min_char=1024, max_char=2048)
         >>> chunks = chunker.chunk(markdown_text)
         >>> for chunk in chunks:
-        ...     print(chunk.content, chunk.metadata)
+        ...     print(chunk.content, chunk.metadata_dict)
     """
 
     def __init__(
@@ -44,6 +56,7 @@ class MarkdownChunker:
         self.min_char = min_char
         self.max_char = max_char
         self.chunk_overlap = chunk_overlap
+        self._seen_hashes: set[str] = set()
 
         self._header_splitter = MarkdownHeaderTextSplitter(
             headers_to_split_on=[
@@ -61,31 +74,69 @@ class MarkdownChunker:
             separators=["\n\n", "\n", ". ", " ", ""],
         )
 
-    def chunk(self, content: str) -> list[Chunk]:
+    def chunk(
+        self,
+        content: str,
+        file: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> list[Chunk]:
         """Chunk a markdown document.
 
         Args:
             content: Raw markdown text.
+            file: Optional file path to include in metadata.
+            extra_metadata: Optional additional metadata to include in all chunks.
 
         Returns:
             List of Chunk objects with content and metadata.
-            Metadata includes header hierarchy (h1, h2, h3) and index.
+            Metadata includes header hierarchy (h1, h2, h3), index, and file if provided.
         """
         sections = self._split_by_headers(content)
 
         if not sections:
             if content.strip():
-                sections = [Chunk(content=content, metadata={})]
+                sections = [_MutableSection(content=content, metadata={})]
             else:
                 return []
 
         fused = self._fuse_short_sections(sections)
-        chunks = self._split_large_sections(fused)
+        split_sections = self._split_large_sections(fused)
 
-        for idx, chunk in enumerate(chunks):
-            chunk.metadata["index"] = idx
+        # Build final immutable chunks with all metadata
+        chunks: list[Chunk] = []
+        for idx, section in enumerate(split_sections):
+            metadata = section.metadata.copy()
+            metadata["index"] = idx
+            if file is not None:
+                metadata["file"] = file
+            if extra_metadata:
+                metadata.update(extra_metadata)
+            chunk = Chunk(
+                content=section.content,
+                metadata=tuple(metadata.items()),
+            )
+
+            # Check for duplicate chunk hash
+            if chunk.hash in self._seen_hashes:
+                file_info = f" in file '{file}'" if file else ""
+                raise ValueError(
+                    f"Duplicate chunk detected{file_info}. "
+                    f"Chunk with hash '{chunk.hash}' has already been processed. "
+                    f"This may indicate duplicate content or repeated processing of the same file."
+                )
+
+            self._seen_hashes.add(chunk.hash)
+            chunks.append(chunk)
 
         return chunks
+
+    def reset_hash_tracking(self) -> None:
+        """Reset the hash tracking to allow reprocessing of files.
+
+        Use this if you want to reuse the same chunker instance
+        and allow processing the same content again.
+        """
+        self._seen_hashes.clear()
 
     def chunk_file(self, file_path: str | Path) -> list[Chunk]:
         """Chunk a markdown file.
@@ -98,68 +149,66 @@ class MarkdownChunker:
         """
         file_path = Path(file_path)
         content = file_path.read_text(encoding="utf-8")
-        chunks = self.chunk(content)
-
-        for chunk in chunks:
-            chunk.metadata["file"] = str(file_path.name)
-
-        return chunks
+        return self.chunk(content, file=str(file_path.name))
 
     def chunk_folder(
         self,
         folder_path: str | Path,
-        file_extension: str = ".md",
-    ) -> list[Chunk]:
+        file_extensions: list[str] | str | None = None,
+    ) -> ChunkCollection:
         """Chunk all markdown files in a folder recursively.
 
         Args:
             folder_path: Path to the folder to process.
-            file_extension: File extension to filter (default: .md).
+            file_extensions: File extension(s) to filter. Can be a string or list of strings.
+                Defaults to [".md", ".mdx"] if not provided.
 
         Returns:
-            List of all chunks from all files, with relative 'file' path
-            in metadata.
+            ChunkCollection with all chunks from all files, preserving file structure.
         """
         folder_path = Path(folder_path).resolve()
         all_chunks: list[Chunk] = []
 
-        files = list(folder_path.rglob(f"*{file_extension}"))
+        if file_extensions is None:
+            file_extensions = [".md", ".mdx"]
+        elif isinstance(file_extensions, str):
+            file_extensions = [file_extensions]
+
+        files = []
+        for ext in file_extensions:
+            files.extend(folder_path.rglob(f"*{ext}"))
 
         for file_path in files:
             try:
                 content = file_path.read_text(encoding="utf-8")
                 relative_path = str(file_path.relative_to(folder_path))
-                chunks = self.chunk(content)
-
-                for chunk in chunks:
-                    chunk.metadata["file"] = relative_path
-
+                chunks = self.chunk(content, file=relative_path)
                 all_chunks.extend(chunks)
 
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
 
-        return all_chunks
+        return ChunkCollection(all_chunks)
 
-    def _split_by_headers(self, content: str) -> list[Chunk]:
+    def _split_by_headers(self, content: str) -> list[_MutableSection]:
         """Split content by markdown headers."""
         splits = self._header_splitter.split_text(content)
         return [
-            Chunk(content=doc.page_content, metadata=dict(doc.metadata))
+            _MutableSection(content=doc.page_content, metadata=dict(doc.metadata))
             for doc in splits
         ]
 
-    def _fuse_short_sections(self, sections: list[Chunk]) -> list[Chunk]:
+    def _fuse_short_sections(self, sections: list[_MutableSection]) -> list[_MutableSection]:
         """Fuse adjacent short sections until they reach min_char threshold."""
         if not sections:
             return []
 
-        def single_pass(secs: list[Chunk]) -> list[Chunk]:
+        def single_pass(secs: list[_MutableSection]) -> list[_MutableSection]:
             if not secs:
                 return []
 
-            fused: list[Chunk] = []
-            current = Chunk(
+            fused: list[_MutableSection] = []
+            current = _MutableSection(
                 content=secs[0].content,
                 metadata=secs[0].metadata.copy(),
             )
@@ -175,7 +224,7 @@ class MarkdownChunker:
                             current.metadata[key] = value
                 else:
                     fused.append(current)
-                    current = Chunk(
+                    current = _MutableSection(
                         content=next_section.content,
                         metadata=next_section.metadata.copy(),
                     )
@@ -192,15 +241,15 @@ class MarkdownChunker:
 
         return result
 
-    def _split_large_sections(self, sections: list[Chunk]) -> list[Chunk]:
+    def _split_large_sections(self, sections: list[_MutableSection]) -> list[_MutableSection]:
         """Split sections that exceed max_char."""
-        result: list[Chunk] = []
+        result: list[_MutableSection] = []
 
         for section in sections:
             sub_chunks = self._text_splitter.split_text(section.content)
             for sub_chunk in sub_chunks:
                 result.append(
-                    Chunk(content=sub_chunk, metadata=section.metadata.copy())
+                    _MutableSection(content=sub_chunk, metadata=section.metadata.copy())
                 )
 
         return result
