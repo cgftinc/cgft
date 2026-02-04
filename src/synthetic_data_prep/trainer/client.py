@@ -246,7 +246,7 @@ class TrainerClient:
 
     def _handle_response_errors(self, response: httpx.Response) -> None:
         """Convert HTTP errors to appropriate exceptions."""
-        if response.status_code in (200, 201):
+        if response.status_code in (200, 201, 202):
             return
 
         try:
@@ -260,23 +260,33 @@ class TrainerClient:
 
         raise JobLaunchError(message, response.status_code)
 
-    def launch_job(self, job_type: str, args: dict[str, Any]) -> dict:
-        """Launch a training job.
+    def launch_experiment(
+        self, experiment_type: str, env_cls_path: str, env_kwargs_path: str
+    ) -> str:
+        """Launch a new experiment from a job template.
 
         Args:
-            job_type: Type of job to launch (e.g. "search")
-            args: Job arguments (e.g. {"dataset": "path/to/dataset.jsonl"})
+            experiment_type: Type of experiment to launch (e.g. "search")
+            env_cls_path: Path to the environment class bundle (.bmxp file)
+            env_kwargs_path: Path to the environment kwargs JSON file
 
         Returns:
-            Response from the API (structure depends on endpoint).
+            The experiment ID.
 
         Raises:
             AuthenticationError: If API key is invalid
-            JobLaunchError: If job launch fails
+            JobLaunchError: If experiment launch fails
         """
         response = self._http_client.post(
-            "/api/jobs/launch",
-            json={"type": job_type, "args": args},
+            "/api/experiments/launch",
+            json={
+                "type": experiment_type,
+                "args": {
+                    "env_cls_path": env_cls_path,
+                    "env_kwargs_path": env_kwargs_path,
+                },
+            },
         )
         self._handle_response_errors(response)
-        return response.json()
+        return response.json()["experimentId"]
+
