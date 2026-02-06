@@ -1,0 +1,38 @@
+# managing experiments
+
+## monitoring experiments
+
+cgft also lets you monitor the progress of your model training. this is crucial to make sure the model is learning useful behaviors.
+you can *monitor the situation* in 3 different ways:
+- quantitative metrics
+- completions produced by the model for training prompts
+- chatting with the model as it's being baked 🙂
+
+### quantitative metrics
+
+< image of dashboard >
+
+rl training samples multiple completions per prompt. these metrics help you understand if your model is learning to solve the task:
+
+**reward**: average reward across all completions for a prompt. tracks overall quality.
+
+**pass@k**: did at least one completion get non-zero reward? binary signal of whether the model can solve this prompt.
+
+**max@k**: best reward achieved across k completions for a prompt. shows the model's peak capability.
+
+**why max@k and pass@k matter**: they track how many prompts your model can solve. if average reward climbs but pass@k stays flat, you're overfitting to a subset of prompts. you want both climbing - the model should expand coverage across the training distribution.
+
+### training completions
+< insert image of rollout tracker >
+
+inspect what your model is actually generating during training. view the full prompt, completion text, and tool call traces for each rollout.
+
+**filtering rollouts**: search by text content to find specific behaviors, or filter by reward score to identify patterns. filtering by reward is particularly useful - low reward rollouts show where your model struggles, high reward ones reveal what's working. this helps you spot systematic issues in your prompt distribution or reward function.
+
+**tool traces**: for agentic workflows, expand tool call traces to debug multi-step reasoning and see where the model goes wrong.
+
+
+### chat with baking model
+< insert image >
+or best yet, you can just query the llm as it's being trained to get a more intuitive sense of what it's learning!
+

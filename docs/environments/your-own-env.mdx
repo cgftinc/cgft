@@ -1,0 +1,427 @@
+# writing your own environment
+
+an environment defines how your model interacts with a task during rl training. you specify what tools it can use, how to score its performance, and how to load your dataset.
+
+## core interface
+
+every environment extends `BaseEnv` and implements these methods:
+
+```python
+from benchmax.envs.base_env import BaseEnv, ToolDefinition, StandardizedExample
+
+class MyEnv(BaseEnv):
+    system_prompt: str = "Your instructions here..."  # optional
+
+    def __init__(self, **config):
+        """Initialize with any config you need."""
+        pass
+
+    # === tools ===
+    async def list_tools(self) -> list[ToolDefinition]:
+        """Return tool definitions available to the model."""
+        pass
+
+    async def run_tool(self, rollout_id: str, tool_name: str, **tool_args) -> Any:
+        """Execute a tool call from the model."""
+        pass
+
+    # === rewards ===
+    async def compute_reward(
+        self, rollout_id: str, completion: str, ground_truth: Any, **kwargs
+    ) -> dict[str, float]:
+        """Score the model's completion. Return {reward_name: score}."""
+        pass
+
+    # === dataset ===
+    def get_train_val_split(self, train_ratio: float = 0.7, seed: int = 42, **kwargs):
+        """Load and split your dataset. Return (train_dataset, val_dataset)."""
+        pass
+
+    @classmethod
+    def dataset_preprocess(cls, example: Any, **kwargs) -> StandardizedExample:
+        """Convert dataset example to StandardizedExample format."""
+        pass
+
+    # === lifecycle (often no-ops) ===
+    async def init_rollout(self, rollout_id: str, **rollout_args) -> None:
+        pass
+
+    async def release_rollout(self, rollout_id: str) -> None:
+        pass
+
+    async def shutdown(self):
+        pass
+```
+
+## 1. tools
+
+tools are what the model can do. define them with a schema:
+
+```python
+from benchmax.envs.base_env import ToolDefinition
+
+class SearchEnv(BaseEnv):
+    def __init__(self, api_key: str, corpus_id: str, base_url: str):
+        self._api_key = api_key
+        self._corpus_id = corpus_id
+        self._base_url = base_url
+
+        # define tool with JSON schema
+        search_tool = ToolDefinition(
+            name="search_corpus",
+            description="Search the corpus using BM25 with optional filters.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query string.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default 10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        )
+
+        # map tool name to (definition, implementation)
+        self._tools = {
+            "search_corpus": (search_tool, self._search_impl)
+        }
+
+    async def _search_impl(self, query: str, limit: int = 10, **kwargs) -> str:
+        """Actual implementation of the search tool."""
+        url = f"{self._base_url}/api/corpora/{self._corpus_id}/search"
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+
+        async with aiohttp.ClientSession() as session:
+            resp = await session.post(url, json={"query": query, "limit": limit}, headers=headers)
+            data = await resp.json()
+
+        # format results for the model
+        results = data.get("results", [])
+        lines = [f"{i}. {r['filename']}: {r['content']}" for i, r in enumerate(results, 1)]
+        return "\n".join(lines) if lines else "No results found."
+
+    async def list_tools(self) -> list[ToolDefinition]:
+        return [defn for defn, _ in self._tools.values()]
+
+    async def run_tool(self, rollout_id: str, tool_name: str, **tool_args) -> Any:
+        _, impl = self._tools[tool_name]
+        return await impl(**tool_args)
+```
+
+**key points:**
+- `input_schema` follows JSON Schema format
+- tool implementations are async functions that return strings or JSON-serializable data
+- tool names must match between definition and implementation
+
+## 2. rewards
+
+rewards tell the model what success looks like:
+
+```python
+async def chunk_overlap_reward(completion: str, ground_truth: str, **kwargs) -> float:
+    """Reward based on whether model retrieved the right chunks."""
+    reference_chunks = kwargs.get("reference_chunks", [])
+    reference_text = " ".join([c.get("content", "") for c in reference_chunks])
+
+    # extract what the model retrieved (from tool call results in completion)
+    if isinstance(completion, list):  # completion is list of messages
+        retrieved_text = " ".join([
+            msg.get("content", "")
+            for msg in completion
+            if msg.get("role") != "assistant"  # tool results
+        ])
+    else:
+        retrieved_text = completion
+
+    # compute overlap
+    overlap = calculate_text_overlap(reference_text, retrieved_text)
+
+    # threshold: reward only if sufficient overlap
+    return overlap if overlap >= 0.25 else 0.0
+
+
+class SearchEnv(BaseEnv):
+    reward_funcs = [chunk_overlap_reward]  # list all reward functions
+
+    async def compute_reward(
+        self, rollout_id: str, completion: str, ground_truth: Any, **kwargs
+    ) -> dict[str, float]:
+        """Run reward functions and return scores."""
+        return {
+            "chunk_overlap": await chunk_overlap_reward(
+                completion, ground_truth, **kwargs
+            )
+        }
+```
+
+**reward tips:**
+- return floats between 0.0 and 1.0
+- sparse rewards (0 or 1) work fine if criteria are clear
+- use `**kwargs` to pass extra context (reference chunks, metadata, etc.)
+- `completion` can be a string or list of messages depending on your setup
+
+## 3. dataset
+
+load your data and convert to standardized format:
+
+```python
+from datasets import load_dataset as hf_load_dataset
+from benchmax.envs.types import StandardizedExample
+
+class SearchEnv(BaseEnv):
+    def __init__(self, dataset_path: str, **kwargs):
+        self._dataset_path = dataset_path
+
+    def get_train_val_split(self, train_ratio: float = 0.7, seed: int = 42, **kwargs):
+        """Load dataset and return train/val splits."""
+        ds = hf_load_dataset("json", data_files=self._dataset_path)["train"]
+        ds = ds.shuffle(seed=seed)
+
+        split_idx = int(len(ds) * train_ratio)
+        train = ds.select(range(split_idx))
+        val = ds.select(range(split_idx, len(ds)))
+
+        return train, val
+
+    @classmethod
+    def dataset_preprocess(cls, example: Any, **kwargs) -> StandardizedExample:
+        """Convert your data format to StandardizedExample."""
+        return StandardizedExample(
+            prompt=example["question"],
+            ground_truth=example.get("answer"),
+            init_rollout_args={},  # extra args for init_rollout if needed
+        )
+```
+
+**dataset format:**
+- `prompt`: what the model sees as input
+- `ground_truth`: reference answer for reward computation
+- `init_rollout_args`: any state to pass to `init_rollout()` (usually empty dict)
+
+## testing your environment
+
+### local testing
+
+test your environment locally before bundling:
+
+```python
+import asyncio
+from my_envs import SearchEnv
+
+async def test_env():
+    # instantiate
+    env = SearchEnv(
+        api_key="test-key",
+        corpus_id="test-corpus",
+        base_url="http://localhost:8000",
+        dataset_path="data/qa-dataset.jsonl",
+    )
+
+    # test tools
+    tools = await env.list_tools()
+    print(f"Tools: {[t.name for t in tools]}")
+
+    # test tool execution
+    result = await env.run_tool(
+        rollout_id="test-123",
+        tool_name="search_corpus",
+        query="test query"
+    )
+    print(f"Search result: {result}")
+
+    # test dataset loading
+    train, val = env.get_train_val_split(train_ratio=0.8, seed=42)
+    print(f"Train size: {len(train)}, Val size: {len(val)}")
+
+    # test reward computation
+    mock_completion = "retrieved some text here"
+    reward = await env.compute_reward(
+        rollout_id="test-123",
+        completion=mock_completion,
+        ground_truth="expected answer",
+        reference_chunks=[{"content": "some text"}],
+    )
+    print(f"Reward: {reward}")
+
+    await env.shutdown()
+
+asyncio.run(test_env())
+```
+
+### bundle and validate
+
+once your environment works locally, bundle it and run isolated validation:
+
+```python
+from benchmax.bundle.bundler import bundle_env
+from benchmax.bundle.validator import validate_payload
+from my_envs import SearchEnv
+
+# bundle environment class + dependencies
+payload = bundle_env(
+    SearchEnv,
+    pip_dependencies=["aiohttp"],  # list any pip packages you need
+    local_modules=[],  # list any local modules to include
+    extra_metadata={"description": "BM25 search environment"},
+)
+
+# validate in isolated environment (spawns subprocess with fresh python env)
+constructor_args = {
+    "api_key": "test-key",
+    "corpus_id": "test-corpus",
+    "base_url": "http://localhost:8000",
+    "dataset_path": "~/user-data/datasets/search/test-corpus/qa-dataset.jsonl",
+}
+
+warnings = validate_payload(
+    payload,
+    constructor_args=constructor_args,
+)
+
+if warnings:
+    print(f"⚠️  Validation warnings: {warnings}")
+else:
+    print("✅ Validation passed!")
+```
+
+**what validation checks:**
+- environment class can be instantiated with `constructor_args`
+- all required methods are implemented
+- tools can be listed and executed
+- dataset can be loaded and preprocessed
+- reward computation runs without errors
+- no missing dependencies
+
+**common validation errors:**
+- missing pip dependencies: add them to `pip_dependencies`
+- import errors: check that all imports are available in isolated env
+- missing methods: implement all required BaseEnv methods
+- dataset path issues: paths should be relative to `~/user-data/` for remote training
+
+### get your api key
+
+before uploading and launching jobs, you need an API key from the cgft platform:
+
+1. sign up or log in at [app.cgft.io](https://app.cgft.io)
+2. navigate to **Settings** → **API Keys**
+3. click **Create API Key**
+4. copy the key (store it securely - you won't see it again)
+
+use this key for all `upload_env()` and `launch_job()` calls:
+
+```python
+API_KEY = "your-api-key-here"  # or use os.getenv("CGFT_API_KEY")
+```
+
+### upload and launch
+
+```python
+from synthetic_data_prep.trainer.pipeline import upload_env, launch_job
+
+# upload environment
+env_path, args_path = upload_env(
+    env_class=SearchEnv,
+    constructor_args=constructor_args,
+    api_key=API_KEY,
+    pip_dependencies=["aiohttp"],
+    validate=True,  # runs validation before upload
+    show_summary=True,
+)
+
+# launch training job
+job = launch_job(
+    dataset_blob_path="datasets/search/test-corpus/qa-dataset.jsonl",
+    env_blob_path=env_path,
+    api_key=API_KEY,
+)
+
+print(f"Job launched: {job}")
+```
+
+## complete minimal example
+
+```python
+from benchmax.envs.base_env import BaseEnv, ToolDefinition, StandardizedExample
+from datasets import load_dataset as hf_load_dataset
+from typing import Any
+import aiohttp
+
+class MinimalSearchEnv(BaseEnv):
+    system_prompt = """Use search to find information.
+Answer on the final line as: <answer>your answer</answer>"""
+
+    def __init__(self, corpus_api_url: str, api_key: str, dataset_path: str):
+        self.api_url = corpus_api_url
+        self.api_key = api_key
+        self.dataset_path = dataset_path
+
+        tool = ToolDefinition(
+            name="search",
+            description="Search the corpus",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+        self._tools = {"search": (tool, self._search)}
+
+    async def _search(self, query: str, **kwargs) -> str:
+        async with aiohttp.ClientSession() as session:
+            resp = await session.post(
+                self.api_url,
+                json={"query": query},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            data = await resp.json()
+            return "\n".join([f"{i}. {r['text']}" for i, r in enumerate(data["results"], 1)])
+
+    async def list_tools(self) -> list[ToolDefinition]:
+        return [self._tools["search"][0]]
+
+    async def run_tool(self, rollout_id: str, tool_name: str, **tool_args) -> Any:
+        _, impl = self._tools[tool_name]
+        return await impl(**tool_args)
+
+    async def compute_reward(self, rollout_id: str, completion: str, ground_truth: Any, **kwargs) -> dict[str, float]:
+        # simple exact match
+        answer = extract_answer_tag(completion)
+        score = 1.0 if answer.strip().lower() == ground_truth.strip().lower() else 0.0
+        return {"exact_match": score}
+
+    def get_train_val_split(self, train_ratio: float = 0.7, seed: int = 42, **kwargs):
+        ds = hf_load_dataset("json", data_files=self.dataset_path)["train"].shuffle(seed=seed)
+        split = int(len(ds) * train_ratio)
+        return ds.select(range(split)), ds.select(range(split, len(ds)))
+
+    @classmethod
+    def dataset_preprocess(cls, example: Any, **kwargs) -> StandardizedExample:
+        return StandardizedExample(
+            prompt=example["question"],
+            ground_truth=example["answer"],
+            init_rollout_args={},
+        )
+
+    async def init_rollout(self, rollout_id: str, **rollout_args) -> None:
+        pass
+
+    async def release_rollout(self, rollout_id: str) -> None:
+        pass
+
+    async def shutdown(self):
+        pass
+```
+
+## next steps
+
+1. implement your environment locally
+2. test with `asyncio.run(test_env())`
+3. bundle with `bundle_env()` and validate with `validate_payload()`
+4. upload with `upload_env()` and launch with `launch_job()`
+
+see [SearchEnv](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/src/synthetic_data_prep/envs/search_env.py) for a full production example.
