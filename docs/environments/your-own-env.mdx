@@ -346,7 +346,8 @@ print(f"Job launched: {job}")
 ## complete minimal example
 
 ```python
-from benchmax.envs.base_env import BaseEnv, ToolDefinition, StandardizedExample
+from benchmax.envs.base_env import BaseEnv
+from benchmax.envs.types import ToolDefinition, StandardizedExample
 from datasets import load_dataset as hf_load_dataset
 from typing import Any
 import aiohttp
