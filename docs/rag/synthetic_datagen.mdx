@@ -175,7 +175,7 @@ dataset structure:
 - **chunk size matters**: 1024-2048 chars works well (too small = low context, too big = noisy)
 - **corpus diversity**: sample different doc types for broader question coverage
 - **limit questions per chunk**: use `max_questions=2` to avoid over-concentrating on few chunks
-- **review samples**: inspect a few generated Q&As before batch processing (see notebook cells 18, 20)
+- **review samples**: inspect a few generated Q&As before batch processing
 - **multi-hop is expensive**: fewer samples (10-20) can still create diverse questions
 
 see [notebooks/synthetic_rag_dataset_gen.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/synthetic_rag_dataset_gen.ipynb) for full working example with prompt templates.
