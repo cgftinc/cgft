@@ -41,6 +41,49 @@ job = launch_job(dataset_path, env_path, API_KEY)
 
 for detailed explanations and customization, continue reading below or see the [full notebook](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/synthetic_rag_dataset_gen.ipynb).
 
+## getting sample data
+
+### download from notion
+
+export your notion workspace or pages as markdown:
+
+1. in notion, click the **•••** menu → **Export**
+2. select **Markdown & CSV** format
+3. check **Include subpages** if you want nested content
+4. click **Export** and unzip the downloaded file
+
+point `docs_path` to the unzipped folder:
+```python
+corpus, collection, corpus_client = prepare_corpus(
+    docs_path="./notion-export/My-Workspace-abc123",
+    corpus_name="my-notion-docs",
+    api_key=API_KEY,
+)
+```
+
+### online sample datasets
+
+try these ready-to-use markdown datasets:
+
+- **[posthog docs](https://github.com/PostHog/posthog/tree/master/docs)** — product analytics documentation
+- **[langchain docs](https://github.com/langchain-ai/docs)** — llm framework docs
+- **awesome-readme** — clone any github repo with good markdown READMEs
+
+clone and point to the docs folder:
+```python
+corpus, collection, corpus_client = prepare_corpus(
+    docs_path="./posthog.com/contents/docs",
+    corpus_name="posthog-docs",
+    api_key=API_KEY,
+)
+```
+
+### other markdown sources
+
+- **confluence/github wikis** — export as markdown via settings
+- **gitbook/docusaurus sites** — clone the repo, markdown is usually in `/docs`
+- **markdown note-taking apps** — obsidian, logseq, bear (export as markdown)
+
 ## how it works
 
 the process samples chunks from your corpus and uses an LLM to generate realistic search queries that could only be answered by that chunk. this creates `<question, answer, reference_chunks>` triplets for training.
