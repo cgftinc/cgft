@@ -34,7 +34,7 @@ def generate_dataset(
     num_single_hop: int = 40,
     num_multi_hop: int = 5,
     model: str = "grok-4-fast-non-reasoning",
-    model_endpoint: str = "http://localhost:3000/api/llm",
+    model_endpoint: str = "http://app.cgft.io/api/llm",
     output_dir: str = "outputs",
     max_questions_per_chunk: int = 2,
     show_summary: bool = True,
@@ -159,15 +159,32 @@ Your goal is to understand the overall themes, content type, and typical query t
 
 Based on the context and thoughts, form an understanding of the corpus, and then provide a short summary and example search queries. Weigh the user's input if provided.
 
+Guidelines:
+- Try to generalize and identify the overall theme of the corpus.
+- Use your context of the theme, domain, etc. to guess the persona and purpose of searching this corpus
+- i.e.
+    - student finding their learning notes
+    - developer looking up API documentation
+    - journalist researching a topic
+    - business analyst gathering market research
+- Use that persona to guess the types of queries they might perform.
+
 For the summary:
 - First line - corpus themes (documentation, tutorials, reference, etc.)
 - Second line - content domain (technical, business, scientific, etc.)
 - Third line - user persona and purpose (likely developer looking up API documentation)
+- Do NOT cite specific chunk content in the summary.
 
 For the example queries:
 - Provide 5-10 realistic example queries a user might search for in this corpus.
+- Use the inferred user persona and purpose to guide the query style.
+- Queries can have incomplete information, as often users do not remember full context.
 
-Return JSON with: thoughts, summary, example_queries
+Return JSON with:
+- thoughts: Your analysis and reasoning here
+- summary: our summary here (3 lines as described above)
+- example_queries: List of example queries in the form of ["query1", "query2", ...]
+
 """
 
     corpus_user_template = """Analyze the following document corpus:
@@ -193,18 +210,18 @@ Return your analysis as JSON with keys: thoughts, summary, example_queries
     sampled_random = random.sample(all_chunks, min(4, len(all_chunks)))
 
     variables = {
-        "user_context": f"Description: {description}\nExample queries: {', '.join(example_queries)}",
+        "user_context": f"Description: {description}\nExample queries provided by user: {', '.join(example_queries)}",
         "top_level_content": "\n\n".join([chunk.chunk_str() for chunk in sampled_top_level]),
         "random_content": "\n\n".join([chunk.chunk_str() for chunk in sampled_random]),
     }
 
-    user_prompt = render_template(corpus_user_template, variables)
+    corpus_user_prompt = render_template(corpus_user_template, variables)
 
     completion = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": corpus_system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": corpus_user_prompt},
         ],
     )
 
@@ -233,12 +250,20 @@ Example queries:
 {corpus_queries}
 
 Guide:
-- Keep queries terse, keyword-heavy like real users would search
-- Queries/answers don't need to encompass the whole chunk
-- Query should be answerable from the provided chunk alone
-- Paraphrase keywords to make queries natural and varied
+- When generating queries, keep them terse, keyword-heavy like how real users would search. i.e.:
+    - "k8s pod memory limits configuration"
+    - "python async await best practices"
+    - "quarterly revenue breakdown Q3"
+- Queries / answers does not need to encompass the whole chunk. Query just need to target specific piece in the chunk that a user would likely want to know
+- Query does not have to completely target all keywords in the chunk since users often only have partial recollection of the information, which is why they are searching
+- The query should be answerable from the provided chunk alone
+- Paraphrase the keywords / use synonyms in the query to make it natural and varied
+- Rank and place your best question first if multiple q&a pairs are generated
 
-Return JSON with: keywords, confidence, qa_pairs
+Return JSON with:
+- keywords: Relevant keywords that a user might search for in the chunk
+- confidence: "low" | "mid" | "high";  use "low" if chunk has no meaningful information (too generic, boilerplate, or navigation-only)
+- qa_pairs: List of query and answer pairs in the form of [{{"query": "q1", "answer": "a1"}}, ...]
 """
 
     single_hop_user_template = """Generate single-hop search q&a pairs based on the following chunk:
@@ -254,6 +279,8 @@ Return JSON with: keywords, confidence, qa_pairs
 <context_after>
 {next_chunk_preview}
 </context_after>
+
+Context before and after are only provided as additional context. Q&A should only target main chunk content.
 
 Return JSON with keys: keywords, confidence, qa_pairs
 """
@@ -284,28 +311,158 @@ def _generate_multi_hop(
     max_questions: int,
 ) -> QADataset:
     """Generate multi-hop QA pairs."""
+
+    # Prompt for finding related chunks
     related_chunk_system_template = """You are generating BM25 search queries to find chunks that have meaningful relationships with the given chunk.
 
 Corpus summary:
 {corpus_summary}
 
-Generate queries to find related chunks using distinctive keywords.
+## BM25 Behavior
+BM25 matches exact keywords, weighted by rarity. This means:
+- Specific/rare terms (product names, technical terms, unique phrases) are powerful
+- Common corpus terms (e.g., "API", "data", "system") barely help
+- BM25 won't match synonyms: "k8s" won't find "Kubernetes"
+- Shorter, focused queries often outperform long ones
 
-Return JSON with: keywords, confidence, queries
+## Query Strategies
+
+**1. Entity-focused**: Target specific named things that might appear elsewhere
+  - Product/tool names: "Redis", "Workday", "Stripe"
+  - Internal terms: "Project Atlas", "Q3 planning", "customer churn analysis"
+  - Document names: "migration guide", "onboarding checklist"
+
+**2. Reference-chasing**: If this chunk mentions other docs/sections, query for them
+  - "see the deployment guide" → query: "deployment guide"
+  - "as discussed in Q2 review" → query: "Q2 review"
+
+**3. Inverse references**: Query for terms that other chunks might use to reference this one
+  - If this is the Redis setup guide → query: "Redis setup", "Redis configuration"
+  - If this covers auth flow → query: "authentication", "OAuth implementation"
+
+**5. Synonym/variant expansion**: Generate alternate phrasings for key concepts
+  - "Kubernetes" + "k8s"
+  - "authentication" + "auth" + "login"
+  - "configuration" + "config" + "setup"
+
+## Query Format
+- Prefer specific terms over generic ones
+- Include both the canonical term and common variants
+- Each query should target a *different* potential related chunk
+- If the chunk is boilerplate (e.g., empty template, generic footer), set confidence to "low" and generate few/no queries
+
+Return JSON with:
+- keywords: Distinctive terms from this chunk likely to appear in related chunks
+- confidence: "low" | "mid" | "high" - based on how much unique, linkable content exists
+- queries: ["q1", "q2", ...] - diverse queries targeting different potential relationships
 """
 
+    # Prompt for validating chunk connections and generating QA
     multi_hop_system_template = """You are analyzing whether two chunks have a meaningful dependency.
 
 Corpus summary:
 {corpus_summary}
 
-Example queries:
+Example queries from corpus:
 {corpus_queries}
 
-Analyze if there's a meaningful relationship and generate multi-hop questions.
+## Task
 
-Return JSON with: thoughts, relationship_type, direction, linking_info, qa_pairs
-"""
+Analyze two chunks to determine if a meaningful relationship exists, then generate multi-hop questions that exploit that relationship.
+
+**Terminology:**
+- **Source chunk**: Contains the reference, pointer, or entry point
+- **Target chunk**: Contains the referenced content, details, or destination
+
+## Overall Notes:
+- Queries should be terse, keyword-heavy like real user searches: "k8s pod memory limits configuration", "quarterly revenue breakdown Q3"
+- Connecting queries come from BM25 (keyword matching)—shared terms don't guarantee meaningful relationships. Scrutinize whether matched terms have the same meaning in both chunks.
+- Same high-level entity ≠ valid connection. Two chunks mentioning "Q3 revenue" or "the API" need actual dependency, not just shared subject matter.
+- **When in doubt, choose "No Valid Relationship."** Weak relationships produce bad questions.
+- **Hard requirements for every question:**
+1. Question vocabulary matches source chunk better than target
+2. Source chunk contains explicit or inferrable path to target
+3. Answer cannot be complete without target chunk's information
+4. Target chunk's distinctive terms must be paraphrased (use hypernyms, describe function/outcome, genericize proper nouns)
+- Rank and place your best question first if multiple q&a pairs are generated
+
+## Step 1: Identify relationship type
+
+Classify into exactly one category:
+
+### Explicit Reference
+One chunk mentions, names, or links to content that the other chunk *is*.
+
+Signals: Direct references ("see X", "refer to X"), matching document/section names, links, citations, phrases like "as explained in..."
+
+Example: Source says "Q3 planning doc references the customer research findings" → Target is the customer research report
+
+If found: Note direction (A→B means A is source, B is target)
+
+### Abstraction Levels
+Same core information at different granularity. One summarizes/claims, the other details/proves.
+
+Signals: Claim + evidence, code + rationale, concept + procedure, summary + full content
+
+Example: Source says "Mediterranean diet has strong evidence for heart health" → Target has study details with participant data and outcomes
+
+Ensure both chunks refer to the same topic/sub-topic, not something tangentially related. **Bidirectional questions possible**—either chunk can serve as source.
+
+### No Valid Relationship
+
+Choose this if:
+- Chunks are unrelated or connection is superficial
+- Connection requires excessive inference (more than one logical step / only tangentially related)
+- Near-duplicates (multi-hop adds no value)
+- Content is independently complete on similar subjects
+
+## Step 2: Generate Questions
+
+Skip if relationship type is "No Valid Relationship."
+
+### Question Strategies
+
+**Explicit Reference:** Frame question around the *context* in source where reference appears. Ask for what target provides using paraphrased terms.
+
+Source: "Trip itinerary mentions the restaurant recommendations doc"
+Target: [Restaurant list: Tsuta for ramen, Sukiyabashi for sushi...]
+✓ "good food japan trip plan" — matches source context, needs target for specifics, no target keywords
+✗ "Tsuta ramen Sukiyabashi sushi" — retrieves target directly, bypasses source
+✗ "japan trip plan" — matches source, but has no relevance to the target
+
+Source: "Customer onboarding improvements are detailed in the Q3 ops review"
+Target: [Ops review data: automated welcome emails, support ticket reduction 60%, average onboarding time 3 days → 4 hours...]
+✓ "what changed in customer onboarding process" — matches source context, needs target for specifics, no target keywords
+✗ "welcome email automation support ticket reduction" — retrieves target directly, bypasses source
+✗ "when was Q3 ops review published" — retrieves source, but asks about metadata, not onboarding details
+
+**Abstraction Levels:** Use vocabulary from source chunk, require precision only target provides. Generate questions in both directions.
+
+General: "The org restructure significantly improved cross-team collaboration"
+Specific: [Survey data: cross-team project completion up 40%, meeting conflicts down 25%...]
+✓ General→Specific: "measurable impact of reorg on team collaboration"
+✓ Specific→General: "leadership claims about collaboration survey results"
+✗ "cross-team project completion meeting conflicts" — retrieves specific directly, bypasses general
+✗ "org restructure announcement" — retrieves general, but no indication that survey data is needed
+
+General: "Our new caching layer reduced API latency dramatically"
+Specific: [Redis implementation: cache hit rates 94%, p99 latency down from 800ms to 120ms, eviction policies...]
+✓ General→Specific: "performance metrics for the API speed improvements"
+✓ Specific→General: "engineering summary of Redis cache results"
+✗ "Redis cache hit rate p99 latency" — retrieves specific directly, bypasses general
+✗ "new caching layer" — retrieves general, but no indication that implementation details are needed
+
+Return JSON with:
+- thoughts: Analysis of the relationship. State the relationship type found (or why none exists). If relationship exists, identify source vs target and the linking mechanism.
+- relationship_type: "explicit_reference" | "abstraction_levels" | "none"
+- direction: "A_to_B" | "B_to_A" | "bidirectional" | null
+- linking_info: Object describing the connection, or null if none. Structure depends on relationship_type:
+    - For explicit_reference: {{ reference_text, source ("A"|"B"), target ("A"|"B") }}
+    - For abstraction_levels: {{ general_chunk ("A"|"B"), specific_chunk ("A"|"B"), abstraction_link }}
+- qa_pairs: List of QA pairs, or null if no valid multi-hop questions can be formed. Each pair contains:
+    - question: Terse, keyword-focused multi-hop question
+    - answer: Answer requiring synthesis of both chunks
+    """
 
     related_chunk_user_template = """Generate search queries based on this chunk to find other relevant chunks:
 
@@ -321,6 +478,8 @@ Return JSON with: thoughts, relationship_type, direction, linking_info, qa_pairs
 {next_chunk_preview}
 </context_after>
 
+The before/after context is provided only as additional context. Queries should target content from the main chunk only.
+
 Return JSON with keys: keywords, confidence, queries
 """
 
@@ -328,27 +487,47 @@ Return JSON with keys: keywords, confidence, queries
 
 Connecting Queries: {connecting_queries}
 
+<chunk_a_context_before>
+{chunk_a_context_before}
+</chunk_a_context_before>
+
 <chunk_a>
 {chunk_a}
 </chunk_a>
+
+<chunk_a_context_after>
+{chunk_a_context_after}
+</chunk_a_context_after>
+
+---
+
+<chunk_b_context_before>
+{chunk_b_context_before}
+</chunk_b_context_before>
 
 <chunk_b>
 {chunk_b}
 </chunk_b>
 
+<chunk_b_context_after>
+{chunk_b_context_after}
+</chunk_b_context_after>
+
+Analyze whether there is a meaningful relationship between the chunks and whether multi-hop questions can be formed.
+
 Return JSON with keys: thoughts, relationship_type, direction, linking_info, qa_pairs
 """
 
-    related_system = render_template(related_chunk_system_template, corpus_context)
-    multi_hop_system = render_template(multi_hop_system_template, corpus_context)
+    related_chunk_system_prompt = render_template(related_chunk_system_template, corpus_context)
+    multi_hop_system_prompt = render_template(multi_hop_system_template, corpus_context)
 
     return generate_multi_hop_batch(
         collection=collection,
         client=client,
         model=model,
-        related_query_system_prompt=related_system,
+        related_query_system_prompt=related_chunk_system_prompt,
         related_query_user_template=related_chunk_user_template,
-        multi_hop_system_prompt=multi_hop_system,
+        multi_hop_system_prompt=multi_hop_system_prompt,
         multi_hop_user_template=multi_hop_user_template,
         corpus_client=corpus_client,
         corpus=corpus,

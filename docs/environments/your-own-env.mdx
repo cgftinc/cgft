@@ -32,24 +32,9 @@ class MyEnv(BaseEnv):
         """Score the model's completion. Return {reward_name: score}."""
         pass
 
-    # === dataset ===
-    def get_train_val_split(self, train_ratio: float = 0.7, seed: int = 42, **kwargs):
-        """Load and split your dataset. Return (train_dataset, val_dataset)."""
-        pass
-
     @classmethod
     def dataset_preprocess(cls, example: Any, **kwargs) -> StandardizedExample:
         """Convert dataset example to StandardizedExample format."""
-        pass
-
-    # === lifecycle (often no-ops) ===
-    async def init_rollout(self, rollout_id: str, **rollout_args) -> None:
-        pass
-
-    async def release_rollout(self, rollout_id: str) -> None:
-        pass
-
-    async def shutdown(self):
         pass
 ```
 
@@ -407,15 +392,6 @@ Answer on the final line as: <answer>your answer</answer>"""
             ground_truth=example["answer"],
             init_rollout_args={},
         )
-
-    async def init_rollout(self, rollout_id: str, **rollout_args) -> None:
-        pass
-
-    async def release_rollout(self, rollout_id: str) -> None:
-        pass
-
-    async def shutdown(self):
-        pass
 ```
 
 ## next steps
