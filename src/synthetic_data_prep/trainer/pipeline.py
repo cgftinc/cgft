@@ -114,6 +114,7 @@ def upload_env(
         env_class,
         pip_dependencies=pip_dependencies,
         local_modules=local_modules,
+        constructor_args=constructor_args,
     )
 
     if show_summary:
@@ -166,7 +167,7 @@ def upload_env(
         print(f"Env class uploaded successfully to {env_result['blobPath']}")
         print(f"Env metadata uploaded successfully to {env_meta_result['blobPath']}")
 
-    return env_result["blobPath"], env_meta_result["blobPath"]
+    return f"~/user-data/{env_result["blobPath"]}", f"~/user-data/{env_meta_result["blobPath"]}"
 
 
 def launch_job(
