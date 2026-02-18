@@ -131,8 +131,7 @@ async def chunk_overlap_reward(completion: str, ground_truth: str, **kwargs) -> 
 
 
 class SearchEnv(BaseEnv):
-    reward_funcs = [chunk_overlap_reward]  # list all reward functions
-
+    ...
     async def compute_reward(
         self, rollout_id: str, completion: str, ground_truth: Any, **kwargs
     ) -> dict[str, float]:
@@ -142,6 +141,7 @@ class SearchEnv(BaseEnv):
                 completion, ground_truth, **kwargs
             )
         }
+    ...
 ```
 
 **reward tips:**
@@ -190,21 +190,17 @@ class SearchEnv(BaseEnv):
 
 ## testing your environment
 
-### local testing
-
-test your environment locally before bundling:
+test your environment locally before launching:
 
 ```python
 import asyncio
 from my_envs import SearchEnv
 
 async def test_env():
-    # instantiate
     env = SearchEnv(
         api_key="test-key",
         corpus_id="test-corpus",
         base_url="http://localhost:8000",
-        dataset_path="data/qa-dataset.jsonl",
     )
 
     # test tools
@@ -219,15 +215,10 @@ async def test_env():
     )
     print(f"Search result: {result}")
 
-    # test dataset loading
-    train, val = env.get_train_val_split(train_ratio=0.8, seed=42)
-    print(f"Train size: {len(train)}, Val size: {len(val)}")
-
     # test reward computation
-    mock_completion = "retrieved some text here"
     reward = await env.compute_reward(
         rollout_id="test-123",
-        completion=mock_completion,
+        completion="retrieved some text here",
         ground_truth="expected answer",
         reference_chunks=[{"content": "some text"}],
     )
@@ -238,95 +229,40 @@ async def test_env():
 asyncio.run(test_env())
 ```
 
-### bundle and validate
-
-once your environment works locally, bundle it and run isolated validation:
-
-```python
-from benchmax.bundle.bundler import bundle_env
-from benchmax.bundle.validator import validate_payload
-from my_envs import SearchEnv
-
-# bundle environment class + dependencies
-payload = bundle_env(
-    SearchEnv,
-    pip_dependencies=["aiohttp"],  # list any pip packages you need
-    local_modules=[],  # list any local modules to include
-    extra_metadata={"description": "BM25 search environment"},
-)
-
-# validate in isolated environment (spawns subprocess with fresh python env)
-constructor_args = {
-    "api_key": "test-key",
-    "corpus_id": "test-corpus",
-    "base_url": "http://localhost:8000",
-    "dataset_path": "~/user-data/datasets/search/test-corpus/qa-dataset.jsonl",
-}
-
-warnings = validate_payload(
-    payload,
-    constructor_args=constructor_args,
-)
-
-if warnings:
-    print(f"⚠️  Validation warnings: {warnings}")
-else:
-    print("✅ Validation passed!")
-```
-
-**what validation checks:**
-- environment class can be instantiated with `constructor_args`
-- all required methods are implemented
-- tools can be listed and executed
-- dataset can be loaded and preprocessed
-- reward computation runs without errors
-- no missing dependencies
-
-**common validation errors:**
-- missing pip dependencies: add them to `pip_dependencies`
-- import errors: check that all imports are available in isolated env
-- missing methods: implement all required BaseEnv methods
-- dataset path issues: paths should be relative to `~/user-data/` for remote training
-
 ### get your api key
 
-before uploading and launching jobs, you need an API key from the cgft platform:
+before launching jobs, you need an API key from the cgft platform:
 
 1. sign up or log in at [app.cgft.io](https://app.cgft.io)
 2. navigate to **Settings** → **API Keys**
 3. click **Create API Key**
 4. copy the key (store it securely - you won't see it again)
 
-use this key for all `upload_env()` and `launch_job()` calls:
-
 ```python
 API_KEY = "your-api-key-here"  # or use os.getenv("CGFT_API_KEY")
 ```
 
-### upload and launch
+### launch training
 
 ```python
-from synthetic_data_prep.trainer.pipeline import upload_env, launch_job
+from synthetic_data_prep.trainer.pipeline import train
+from my_envs import SearchEnv
 
-# upload environment
-env_path, args_path = upload_env(
+experiment_id = train(
     env_class=SearchEnv,
-    constructor_args=constructor_args,
-    api_key=API_KEY,
-    pip_dependencies=["aiohttp"],
-    validate=True,  # runs validation before upload
-    show_summary=True,
-)
-
-# launch training job
-job = launch_job(
-    dataset_blob_path="datasets/search/test-corpus/qa-dataset.jsonl",
-    env_blob_path=env_path,
+    env_args={
+        "api_key": API_KEY,
+        "corpus_id": "test-corpus",
+        "base_url": "https://app.cgft.io",
+    },
+    dataset=my_dataset,  # list of dicts
     api_key=API_KEY,
 )
 
-print(f"Job launched: {job}")
+print(f"Experiment launched: {experiment_id}")
 ```
+
+`train()` handles everything automatically: uploads the dataset, bundles and validates your environment, launches the job, and returns the experiment ID.
 
 ## complete minimal example
 
@@ -398,7 +334,6 @@ Answer on the final line as: <answer>your answer</answer>"""
 
 1. implement your environment locally
 2. test with `asyncio.run(test_env())`
-3. bundle with `bundle_env()` and validate with `validate_payload()`
-4. upload with `upload_env()` and launch with `launch_job()`
+3. launch with `train()`
 
 see [SearchEnv](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/src/synthetic_data_prep/envs/search_env.py) for a full production example.
