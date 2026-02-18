@@ -2,7 +2,7 @@
 
 from .client import StorageClient, TrainerClient
 from .exceptions import AuthenticationError, JobLaunchError, TrainerError
-from .pipeline import launch_job, upload_dataset, upload_env
+from .pipeline import launch_job, upload_dataset, upload_env, train
 
 __all__ = [
     "StorageClient",
@@ -13,4 +13,5 @@ __all__ = [
     "upload_dataset",
     "upload_env",
     "launch_job",
+    "train"
 ]
