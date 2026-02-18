@@ -290,8 +290,6 @@ class SearchEnv(BaseEnv):
         _, tool_function = self._tools[tool_name]
         return await tool_function(**tool_args)
 
-    reward_funcs = [chunk_overlap_reward_function]
-
     async def compute_reward(
         self, rollout_id: str, completion: str, ground_truth: Any, **kwargs: Any
     ) -> dict[str, float]:
