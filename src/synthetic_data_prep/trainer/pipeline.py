@@ -26,12 +26,12 @@ For more control, you can use the lower-level functions:
 
 import hashlib
 import json
-from pathlib import Path
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any
 
-from synthetic_data_prep.trainer.client import StorageClient, TrainerClient
+from synthetic_data_prep.trainer.client import RolloutClient, StorageClient, TrainerClient
 
 
 def upload_dataset(
@@ -82,7 +82,7 @@ def upload_dataset(
     # Serialize to JSONL (one JSON object per line)
     jsonl_lines = [json.dumps(item, sort_keys=True) for item in dataset]
     content_str = "\n".join(jsonl_lines)
-    content_bytes = content_str.encode('utf-8')
+    content_bytes = content_str.encode("utf-8")
 
     # Auto-generate dataset_id from content hash if not provided
     if dataset_id is None:
@@ -168,7 +168,7 @@ def upload_env(
     from benchmax.bundle.validator import validate_bundle
 
     if pip_dependencies is None:
-        pip_dependencies = ["aiohttp"]
+        pip_dependencies = []
 
     if local_modules is None:
         local_modules = []
@@ -193,7 +193,9 @@ def upload_env(
     # Validate
     if validate:
         if show_summary:
-            print(f"\nValidating {env_class.__name__} in isolated environment (this may take ~1 min)...")
+            print(
+                f"\nBasic local validation {env_class.__name__} in isolated environment (this may take ~1 min)..."
+            )
 
         warnings = validate_bundle(bundle, constructor_args=constructor_args)
 
@@ -206,8 +208,8 @@ def upload_env(
     # Write bundle files
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
-        pickle_path = tmp_path / f"env-cls.pkl"
-        metadata_path = tmp_path / f"env-meta.json"
+        pickle_path = tmp_path / "env-cls.pkl"
+        metadata_path = tmp_path / "env-meta.json"
         write_bundle_files(bundle, pickle_path, metadata_path)
         env_cls_bytes = pickle_path.read_bytes()
         env_meta_bytes = metadata_path.read_bytes()
@@ -291,6 +293,7 @@ def train(
     pip_dependencies: list[str] | None = None,
     local_modules: list | None = None,
     validate_env: bool = True,
+    validate_env_remotely: bool = True,
     show_summary: bool = True,
 ) -> str:
     """Train a model - the simplest interface for launching training jobs.
@@ -298,8 +301,9 @@ def train(
     This is the recommended high-level function that handles everything:
     1. Uploads your dataset
     2. Bundles and uploads your environment
-    3. Launches the training job
-    4. Returns the experiment ID
+    3. Validates the environment remotely (optional)
+    4. Launches the training job
+    5. Returns the experiment ID
 
     Args:
         env_class: Environment class (e.g., SearchEnv, SummarizationEnv)
@@ -310,45 +314,15 @@ def train(
         base_url: Base URL for API (default: https://app.cgft.io)
         pip_dependencies: List of pip dependencies for the environment
         local_modules: List of local modules to include in environment bundle
-        validate_env: Whether to validate environment before upload. (default: True)
+        validate_env: Whether to validate environment locally before upload. (default: True)
+        validate_env_remotely: Whether to validate environment in a remote rollout server. (default: True)
         show_summary: Whether to print progress information (default: True)
 
     Returns:
         Experiment ID string
-
-    Examples:
-        >>> # Simple search training with auto-generated dataset ID
-        >>> experiment_id = train(
-        ...     env_class=SearchEnv,
-        ...     env_args={"api_key": "..."},
-        ...     dataset=[
-        ...         {"query": "What is Python?", "answer": "A programming language"},
-        ...         {"query": "What is ML?", "answer": "Machine Learning"}
-        ...     ],
-        ...     api_key="your-api-key"
-        ... )
-        Auto-generated dataset_id: dataset-a1b2c3d4
-        Uploading dataset (2 items, 128 bytes)...
-        Dataset uploaded to: datasets/dataset-a1b2c3d4/dataset.jsonl
-        Bundling SearchEnv...
-        Env uploaded to: ~/user-data/envs/e5f6g7h8/env-cls.pkl
-        Launching experiment...
-        Experiment launched! ID: exp_xyz789
-
-        >>> # With explicit dataset ID
-        >>> experiment_id = train(
-        ...     env_class=SearchEnv,
-        ...     env_args={"api_key": "..."},
-        ...     dataset=[...],
-        ...     api_key="your-api-key",
-        ...     dataset_id="qa-pairs-v1"
-        ... )
-        Uploading dataset (80 items, 45632 bytes)...
-        Dataset uploaded to: datasets/qa-pairs-v1/dataset.jsonl
-        ...
     """
 
-    # Step 1: Upload dataset
+    # Upload dataset
     dataset_blob_path = upload_dataset(
         dataset=dataset,
         api_key=api_key,
@@ -362,8 +336,7 @@ def train(
     if "dataset_path" not in env_args_with_dataset:
         env_args_with_dataset["dataset_path"] = f"~/user-data/{dataset_blob_path}"
 
-    # Step 2: Upload environment
-
+    # Upload environment
     # make sure local env modules are bundled
     if not local_modules:
         local_modules = []
@@ -381,7 +354,29 @@ def train(
         show_summary=show_summary,
     )
 
-    # Step 3: Launch training job
+    # Smoke-test the uploaded environment on the rollout server with a couple
+    # of raw examples before committing to a full training run.
+    if validate_env_remotely:
+        # env_blob_path has a "~/user-data/" prefix — strip it so the rollout
+        # server receives a plain blob path it can resolve against the user's
+        # container (same convention as build_env_blob() in the e2e tests).
+        def _strip_userdata(p: str) -> str:
+            prefix = "~/user-data/"
+            return p[len(prefix):] if p.startswith(prefix) else p
+
+        rollout_client = RolloutClient(api_key=api_key)
+        passed = rollout_client.validate_examples(
+            examples=dataset,
+            env_cls_path=_strip_userdata(env_blob_path),
+            env_meta_path=_strip_userdata(env_meta_blob_path),
+        )
+        if not passed:
+            raise RuntimeError(
+                "Remote environment validation failed. "
+                "Fix the errors above before retrying, or pass validate_env_remotely=False to skip."
+            )
+
+    # Launch training job
     experiment_id = launch_job(
         env_cls_blob_path=env_blob_path,
         env_metadata_blob_path=env_meta_blob_path,

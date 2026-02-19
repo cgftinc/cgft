@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,7 +14,7 @@ import httpx
 from .exceptions import AuthenticationError, JobLaunchError, TrainerError
 
 if TYPE_CHECKING:
-    from synthetic_data_prep.qa_generation.models import QADataset
+    pass
 
 
 # MIME type mappings for common file extensions
@@ -289,3 +291,215 @@ class TrainerClient:
         )
         self._handle_response_errors(response)
         return response.json()["experimentId"]
+
+
+ROLLOUT_SERVER_URL = "https://autobots.cgft.io"
+
+_VALIDATION_MODEL = "grok-4-fast-reasoning"
+_VALIDATION_LLM_BASE_URL = "https://app.cgft.io/api/llm"
+
+# ANSI colours
+_GREEN  = "\033[32m"
+_RED    = "\033[31m"
+_YELLOW = "\033[33m"
+_CYAN   = "\033[36m"
+_BOLD   = "\033[1m"
+_RESET  = "\033[0m"
+
+def _ok(msg: str)   -> str: return f"{_GREEN}✔  {msg}{_RESET}"
+def _err(msg: str)  -> str: return f"{_RED}✗  {msg}{_RESET}"
+def _info(msg: str) -> str: return f"{_CYAN}{msg}{_RESET}"
+def _hdr(msg: str)  -> str: return f"\n{_BOLD}{msg}{_RESET}"
+
+
+def _iter_sse(response: httpx.Response) -> Iterator[dict]:
+    """Yield parsed event dicts from a synchronous SSE response."""
+    for line in response.iter_lines():
+        if line.startswith("data: "):
+            try:
+                yield json.loads(line[len("data: "):])
+            except json.JSONDecodeError:
+                pass
+
+
+def _print_event(event: dict, idx: int) -> None:
+    """Print a single SSE event in a human-readable format."""
+    etype = event.get("event", "?")
+    prefix = f"  [ex {idx}]"
+
+    if etype == "rollout_started":
+        print(_info(f"{prefix} → rollout_started"))
+
+    elif etype == "message":
+        msg     = event.get("message", {})
+        role    = msg.get("role", "?")
+        content = msg.get("content", "")
+
+        # content may be a list of blocks (tool calls) or a plain string
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        preview = textwrap.shorten(block.get("text", ""), width=120, placeholder="…")
+                        print(f"{prefix} → message [{role}/text]: {preview}")
+                    elif btype == "tool_use":
+                        print(f"{prefix} → message [{role}/tool_use]: {block.get('name')}({json.dumps(block.get('input', {}))[:80]})")
+                    elif btype == "tool_result":
+                        preview = textwrap.shorten(str(block.get("content", "")), width=120, placeholder="…")
+                        print(f"{prefix} → message [{role}/tool_result]: {preview}")
+                    else:
+                        print(f"{prefix} → message [{role}/{btype}]")
+        else:
+            preview = textwrap.shorten(str(content), width=120, placeholder="…")
+            print(f"{prefix} → message [{role}]: {preview}")
+
+    elif etype == "reward":
+        print(f"{prefix} → reward: {event.get('rewards')}")
+
+    elif etype == "rollout_completed":
+        success = event.get("success")
+        status  = _ok("success") if success else _err("failed")
+        print(f"{prefix} → rollout_completed  {status}  "
+              f"rewards={event.get('rewards')}  error={event.get('error')}")
+
+    elif etype in ("worker_error", "error", "cancelled"):
+        print(_err(f"{prefix} → {etype}: {event.get('error')}"))
+
+
+class RolloutClient:
+    """Thin synchronous client for the /rollout/stream endpoint.
+
+    Args:
+        api_key:    Bearer token for the rollout server.
+        server_url: Base URL of the rollout server.
+        timeout:    Per-request timeout in seconds (default 300 — rollouts can be slow).
+    """
+
+    _TERMINAL = {"rollout_completed", "worker_error", "cancelled", "error"}
+
+    def __init__(
+        self,
+        api_key: str,
+        server_url: str = ROLLOUT_SERVER_URL,
+        timeout: float = 300.0,
+    ) -> None:
+        self._api_key    = api_key
+        self._server_url = server_url.rstrip("/")
+        self._timeout    = timeout
+
+    def stream_rollout(
+        self,
+        raw_example: dict[str, Any],
+        env_cls_path: str,
+        env_meta_path: str,
+        example_index: int = 0,
+        max_turns: int = 4,
+        max_tool_calls: int = 8,
+        max_completion_tokens: int = 1024,
+    ) -> dict[str, Any]:
+        """Run one rollout against the stream endpoint, printing events live.
+
+        Args:
+            raw_example:           Raw dataset row (passed as ``raw_example``).
+            env_cls_path:          Blob path to the uploaded env .pkl file.
+            env_meta_path:         Blob path to the uploaded env-meta .json file.
+            example_index:         Display index used in printed output.
+            max_turns:             Max conversation turns.
+            max_tool_calls:        Max tool calls per rollout.
+            max_completion_tokens: Max tokens per completion.
+
+        Returns:
+            The final ``rollout_completed`` event dict, or an error/cancelled event.
+
+        Raises:
+            RuntimeError: If the HTTP request itself fails or returns non-200.
+        """
+        payload = {
+            "standardized_example": None,
+            "raw_example":          raw_example,
+            "env": {
+                "env_cls_path":  env_cls_path,
+                "env_meta_path": env_meta_path,
+            },
+            "llm": {
+                "base_url": _VALIDATION_LLM_BASE_URL,
+                "api_key":  self._api_key,
+                "model":    _VALIDATION_MODEL,
+            },
+            "options": {
+                "max_turns":             max_turns,
+                "max_tool_calls":        max_tool_calls,
+                "max_completion_tokens": max_completion_tokens,
+            },
+        }
+
+        url = f"{self._server_url}/rollout/stream"
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+
+        with httpx.stream(
+            "POST",
+            url,
+            json=payload,
+            headers=headers,
+            timeout=self._timeout,
+        ) as response:
+            if response.status_code != 200:
+                body = response.read().decode()
+                raise RuntimeError(
+                    f"Rollout server returned HTTP {response.status_code}: {body[:300]}"
+                )
+
+            final: dict[str, Any] = {}
+            for event in _iter_sse(response):
+                _print_event(event, example_index)
+                if event.get("event") in self._TERMINAL:
+                    final = event
+                    break
+
+        return final
+
+    def validate_examples(
+        self,
+        examples: list[dict[str, Any]],
+        env_cls_path: str,
+        env_meta_path: str,
+        n: int = 2,
+    ) -> bool:
+        """Run rollouts on the first *n* examples and report pass/fail.
+
+        Args:
+            examples:     Full dataset (list of raw dicts).
+            env_cls_path: Blob path to the uploaded env .pkl file.
+            env_meta_path: Blob path to the uploaded env-meta .json file.
+            n:            Number of examples to validate (default 2).
+
+        Returns:
+            True if all sampled rollouts completed successfully, False otherwise.
+        """
+        sample = examples[:n]
+        print(_hdr(f"── Remote validation: {len(sample)} example(s) on {_VALIDATION_MODEL} ──"))
+
+        all_ok = True
+        for i, example in enumerate(sample):
+            print(_info(f"\n  Example {i} — {json.dumps(example)[:120]}"))
+            try:
+                final = self.stream_rollout(
+                    raw_example=example,
+                    env_cls_path=env_cls_path,
+                    env_meta_path=env_meta_path,
+                    example_index=i,
+                )
+                if not final.get("success"):
+                    all_ok = False
+            except RuntimeError as exc:
+                print(_err(f"  Example {i} failed: {exc}"))
+                all_ok = False
+
+        print()
+        if all_ok:
+            print(_ok("Remote validation passed"))
+        else:
+            print(_err("Remote validation failed — check output above before launching a full job"))
+
+        return all_ok
