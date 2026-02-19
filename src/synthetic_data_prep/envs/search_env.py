@@ -78,6 +78,7 @@ class SearchEnv(BaseEnv):
     """Search environment with BM25 corpus search tool."""
 
     system_prompt: str = SYSTEM_PROMPT
+    reward_funcs = [chunk_overlap_reward_function]
 
     def __init__(
         self,
