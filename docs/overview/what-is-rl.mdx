@@ -1,0 +1,115 @@
+# what is rl
+
+## overview
+
+rl trains models to get better at **tasks** by giving them scores (rewards) when they do well.
+
+instead of training on "here's the perfect answer" (supervised learning), you let the model try different approaches and reward it when it succeeds. over time, it figures out what works.
+
+## why this matters
+
+supervised finetuning teaches models to imitate answers. rl teaches them to **achieve outcomes**.
+
+this makes rl better for:
+- **agentic rag**: train models to search better, formulate better queries, and retrieve the right chunks
+- **code generation**: optimize for code that actually runs and passes tests (not just looks plausible)
+- **character/style**: tune for specific personas, tones, or formats that match your product needs
+- **tool use**: teach models when and how to use tools effectively
+
+the key difference: you directly optimize for what actually matters to your application.
+
+## key concepts
+
+**agent**: the llm making decisions (which tool to use, what query to write, what code to generate)
+
+**environment**: the system it interacts with (corpus search, code interpreter, APIs)
+
+**actions**: what the model does (tool calls, search queries, generated responses)
+
+**rewards**: scores you define based on task success (retrieval accuracy, test pass rate, user preferences)
+
+**training loop**: model tries task → gets scored → updates itself to do better next time
+
+that's it. no phd required.
+
+## environments
+
+an environment is where your model learns the task. it defines what tools the model can use and how you score its performance.
+
+### what you implement
+
+```python
+class SearchEnv(BaseEnv):
+    def __init__(self, corpus_id: str, dataset_path: str):
+        self.corpus = load_corpus(corpus_id)
+        self.dataset = load_dataset(dataset_path)
+
+    # define what tools the model can use
+    async def list_tools(self):
+        return [{
+            "name": "search_corpus",
+            "description": "Search the documentation corpus",
+            "parameters": {
+                "query": "search query string",
+                "limit": "max results (default: 10)"
+            }
+        }]
+
+    # implement how tools actually work
+    async def run_tool(self, tool_name: str, **args):
+        if tool_name == "search_corpus":
+            query = args["query"]
+            limit = args.get("limit", 10)
+            results = self.corpus.search(query, limit=limit)
+            return [{"chunk_id": r.id, "text": r.text} for r in results]
+
+    # define how to score the model's performance
+    async def compute_reward(self, completion, ground_truth):
+        # what chunks did the model retrieve?
+        retrieved_chunks = extract_chunk_ids(completion)
+
+        # what chunks should it have retrieved?
+        target_chunks = ground_truth["chunks"]
+
+        # compute overlap: 1.0 if perfect, 0.0 if no overlap
+        overlap = len(set(retrieved_chunks) & set(target_chunks))
+        return overlap / len(target_chunks)
+```
+
+three things you configure:
+
+**tools**: what actions the model can take
+- search your corpus
+- filter by metadata
+- chain multiple searches
+
+**rewards**: how you measure success
+- chunk overlap (did it find the right chunks?)
+- answer accuracy (is the final answer correct?)
+- efficiency (fewer tool calls = bonus points)
+
+**context**: what information the model sees
+- system instructions
+- tool outputs
+- conversation history
+
+### example: search environment
+
+```python
+SearchEnv(
+    api_key="...",
+    corpus_id="my-docs",
+    dataset_path="qa_dataset.jsonl",
+)
+```
+
+this gives your model a `search_corpus()` tool and rewards it based on chunk overlap with ground truth.
+
+**the training flow**:
+1. model gets a question from your dataset
+2. model tries different search queries
+3. model provides a final answer
+4. you compute reward based on retrieved chunks
+5. model updates to maximize reward next time
+
+that's the loop. repeat until performance plateaus.

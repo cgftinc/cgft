@@ -1,0 +1,44 @@
+# rl for agentic rag
+
+## why rl for agentic rag
+
+vanilla rag has two limitations
+- it only performs one search. if the initial retrieved results are bad, the final answer will be bad.
+- the user query is directly used. if the query is under-specified/doesn't quite match the document chunks, you'll likely miss relevant information.
+
+to get around this, claude code, windsurf & others rely on agentic rag, where you get an llm to iteratively call a search tool. this means two things:
+- the llm gets to write it's own queries based on the user prompt
+- it can iteratively search for new information based on what is included/missing from the first turn's response
+
+agentic rag with generic models like claude, gpt-5, etc. have a few shortcomings.
+- using a large model for searching adds much latency
+- generic models don't have the specific understanding of your corpus, style, jargon, etc.
+
+with rl-tuning, you can tune a much smaller model for lower latency search but with deeper knowledge of your data.
+
+here's how you can do it with cgft.
+
+## quickstart
+
+**prerequisites**: python 3.9+, api key from cgft.io
+
+```bash
+# Install the library
+pip install cgft
+```
+
+create an API key from the [console](https://app.cgft.io/account/api-keys). you'll then want to set the `CGFT_API_KEY` environment variable to your newly generated api key.
+```
+# Set API key
+export CGFT_API_KEY="your-api-key"
+```
+
+**5-minute workflow**:
+
+1. point to your corpus/data
+2. generate training Q&A pairs
+3. create search environment
+4. launch training job
+5. monitor and use trained model
+
+See full example in the [notebook](/notebooks/synthetic_rag_dataset_gen.ipynb).

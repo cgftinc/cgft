@@ -1,0 +1,60 @@
+# launching training
+
+once you have a dataset and an environment, one call launches the full training pipeline.
+
+## quickstart
+
+```python
+from synthetic_data_prep.trainer import train
+from synthetic_data_prep.envs.search_env import SearchEnv
+
+experiment_id = train(
+    env_class=SearchEnv,
+    env_args={
+        "api_key": API_KEY,
+        "corpus_id": corpus.id,
+        "base_url": BASE_URL,
+    },
+    dataset=dataset.to_list(),
+    api_key=API_KEY,
+)
+```
+
+`train()` returns an experiment ID. view it at `https://app.cgft.io/experiments/{experiment_id}`.
+
+see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full working example.
+
+## parameters
+
+```python
+experiment_id = train(
+    env_class=SearchEnv,          # your environment class
+    env_args={...},               # constructor args (api_key, corpus_id, etc.)
+    dataset=list_of_dicts,
+    api_key=API_KEY,
+)
+```
+
+`dataset_path` is injected into `env_args` automatically — you don't need to pass it manually.
+
+## monitoring training
+
+### what to expect early on
+
+rewards will fluctuate in the first few dozen steps — this is normal. the model is still unstable and learning basic patterns. give it time before drawing conclusions.
+
+**pass@k vs average reward**: ideally pass@k climbs first. this means the model is learning to solve more distinct prompts (breadth) before squeezing out higher rewards on known prompts (depth). if average reward shoots up while pass@k stays flat, the model is overfitting to a narrow set of easy examples.
+
+**healthy trajectory**: pass@k increases early → average reward follows with a lag → both plateau as the model saturates the training distribution.
+
+### warning signs
+
+- **pass@k flat, average reward increasing** — model is exploiting a narrow subset of prompts rather than building broad capability
+- **both metrics stagnate early** — training distribution may be too hard or reward signal too sparse; try more single-hop examples or a simpler reward function
+
+## next steps
+
+- see [env.mdx](env.mdx) to understand how the search environment and reward function work
+- see [synthetic_datagen.mdx](synthetic_datagen.mdx) to generate the dataset used for training
+- see [../environments/pipeline.mdx](../environments/pipeline.mdx) for how `train()` works under the hood
+- see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full end-to-end example

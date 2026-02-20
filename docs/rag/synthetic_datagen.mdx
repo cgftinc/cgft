@@ -1,0 +1,230 @@
+# synthetic data generation
+
+generating question-answer pairs automatically from your corpus for training search models. turns any collection of documents into a training dataset.
+
+## quickstart
+
+see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for how it's used and how to start a job.
+
+```python
+from synthetic_data_prep.corpus import prepare_corpus
+from synthetic_data_prep.qa_generation import generate_dataset
+from synthetic_data_prep.trainer import upload_dataset, upload_env, launch_job
+from synthetic_data_prep.envs import SearchEnv
+
+# 1. Point to dataset
+corpus, collection, corpus_client = prepare_corpus(
+    docs_path="./samples/posthog",
+    corpus_name="my-docs",
+    api_key=API_KEY,
+)
+
+# 2. Create synthetic QA
+dataset = generate_dataset(
+    corpus=corpus,
+    collection=collection,
+    corpus_client=corpus_client,
+    api_key=API_KEY,
+    corpus_description="Posthog documentation",
+    example_queries=["how to feature flag", "setup reverse proxy"],
+    num_single_hop=40,
+    num_multi_hop=5,
+)
+
+# 3. Upload dataset and create env
+dataset_path = upload_dataset(dataset, corpus, API_KEY)
+env_path, _ = upload_env(SearchEnv, {...}, API_KEY)
+
+# 4. Run training job
+job = launch_job(dataset_path, env_path, API_KEY)
+```
+
+for detailed explanations and customization, continue reading below or see the [full notebook](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/synthetic_rag_dataset_gen.ipynb).
+
+## getting sample data
+
+### download from notion
+
+download your notion workspace or pages as markdown:
+
+1. in notion, click the **•••** menu → **Export**
+2. select **Markdown & CSV** format
+3. check **Include subpages** if you want nested content
+4. click **Export** and unzip the downloaded file
+
+point `docs_path` to the unzipped folder:
+```python
+corpus, collection, corpus_client = prepare_corpus(
+    docs_path="./notion-export/My-Workspace-abc123",
+    corpus_name="my-notion-docs",
+    api_key=API_KEY,
+)
+```
+
+### online sample datasets
+
+try these ready-to-use markdown datasets:
+
+- **[posthog docs](https://github.com/PostHog/posthog/tree/master/docs)** — product analytics documentation
+- **[langchain docs](https://github.com/langchain-ai/docs)** — llm framework docs
+- **awesome-readme** — clone any github repo with good markdown READMEs
+
+clone and point to the docs folder:
+```python
+corpus, collection, corpus_client = prepare_corpus(
+    docs_path="./posthog.com/contents/docs",
+    corpus_name="posthog-docs",
+    api_key=API_KEY,
+)
+```
+
+### other markdown sources
+
+- **confluence/github wikis** — export as markdown via settings
+- **gitbook/docusaurus sites** — clone the repo, markdown is usually in `/docs`
+- **markdown note-taking apps** — obsidian, logseq, bear (export as markdown)
+
+## how it works
+
+the process samples chunks from your corpus and uses an LLM to generate realistic search queries that could only be answered by that chunk. this creates `<question, answer, reference_chunks>` triplets for training.
+
+**two question types**:
+
+1. **single-hop** — answer found in one chunk
+   - "postgres jsonb index syntax" → finds SQL reference doc
+   - simpler, faster to generate (1 LLM call per chunk)
+
+2. **multi-hop** — requires information from multiple chunks
+   - "k8s pod limits in production setup" → needs k8s docs + production guide
+   - more realistic search behavior (2 LLM calls: find related chunks, then validate connection)
+
+## generation process
+
+### corpus context
+first, build corpus-level context to help the LLM generate realistic queries:
+
+```python
+from synthetic_data_prep.qa_generation.helpers import render_template
+from synthetic_data_prep.qa_generation.response_parsers import parse_corpus_summary_response
+
+# Provide your own context
+YOUR_DESCRIPTION = "Posthog documentation including docs, company policy, etc."
+EXAMPLE_QUERIES = [
+    "how to feature flag",
+    "setup reverse proxy to avoid ad blockers",
+    "posthog install nextjs",
+]
+
+# Sample chunks and generate corpus summary
+top_level_chunks = collection.get_top_level_chunks()
+random_chunks = random.sample(collection.chunks, 4)
+
+# LLM analyzes samples + your context to generate corpus summary + more example queries
+# (see notebook for full prompt templates)
+corpus_summary, example_queries = parse_corpus_summary_response(llm_response)
+```
+
+providing your own description and example queries helps the LLM understand your corpus theme, domain, user personas, and typical search patterns. the LLM then expands on these to generate more diverse examples.
+
+### single-hop generation
+
+```python
+from synthetic_data_prep.qa_generation.helpers import generate_single_hop_batch
+from synthetic_data_prep.qa_generation.response_parsers import parse_single_hop_response
+
+dataset = generate_single_hop_batch(
+    collection=collection,
+    client=openai_client,
+    model="grok-4-fast-non-reasoning",
+    system_prompt=single_hop_system_prompt,  # includes corpus context
+    user_template=single_hop_user_template,  # chunk + context template
+    num_samples=40,
+    response_parser=parse_single_hop_response,
+    max_questions=2,  # limit questions per chunk for diversity
+)
+
+print(dataset.summary())
+# QADataset: 67 total data points
+#   Single-hop: 67
+#   Multi-hop: 0
+```
+
+the LLM sees the chunk with before/after context and generates keyword-focused queries like real search behavior.
+
+### multi-hop generation
+
+multi-hop requires finding chunks with meaningful relationships:
+
+```python
+from synthetic_data_prep.qa_generation.helpers import generate_multi_hop_batch
+
+dataset = generate_multi_hop_batch(
+    collection=collection,
+    client=openai_client,
+    model="grok-4-fast-non-reasoning",
+    related_query_system_prompt=related_query_prompt,
+    related_query_user_template=related_query_template,
+    multi_hop_system_prompt=multi_hop_prompt,
+    multi_hop_user_template=multi_hop_template,
+    corpus_client=corpus_client,
+    corpus=corpus,
+    num_samples=15,
+    related_query_parser=parse_related_queries_response,
+    multi_hop_parser=parse_multi_hop_validation_response,
+    top_k_bm25=5,  # candidates per query
+    top_related_chunks=3,  # chunks to validate per source
+)
+```
+
+**step 1**: for each chunk, LLM generates BM25 queries to find related chunks (targeting entity names, references, abstractions)
+
+**step 2**: search corpus with those queries, filter adjacent chunks
+
+**step 3**: validate chunk pairs have real dependency (explicit reference or abstraction levels), generate multi-hop questions
+
+multi-hop questions test real search behavior — the initial query finds the first chunk, but that chunk references or relates to information in a second chunk. the model must recognize it needs more context and search again.
+
+## output format
+
+```python
+# Save in multiple formats
+from synthetic_data_prep.qa_generation.storage import save_qa_dataset, save_qa_dataset_jsonl
+
+# YAML (human-readable)
+save_qa_dataset(dataset, "outputs/qa_dataset.yaml")
+
+# JSONL (HuggingFace-compatible)
+save_qa_dataset_jsonl(dataset, "outputs/qa_dataset.jsonl")
+```
+
+dataset structure:
+```json
+{
+  "question": "k8s pod memory limits",
+  "answer": "Set resource limits in pod spec...",
+  "reference_chunks": [
+    {
+      "id": "abc123...",
+      "metadata": {"file": "k8s-docs.md", "headers": ["Resources"]},
+      "content": "To configure memory limits..."
+    }
+  ],
+  "qa_type": "single_hop"
+}
+```
+
+## quality tips
+
+- **chunk size matters**: 1024-2048 chars works well (too small = low context, too big = noisy)
+- **corpus diversity**: sample different doc types for broader question coverage
+- **limit questions per chunk**: use `max_questions=2` to avoid over-concentrating on few chunks
+- **review samples**: inspect a few generated Q&As before batch processing
+- **multi-hop is expensive**: fewer samples (10-20) can still create diverse questions
+
+## next steps
+
+once you have a dataset, you're ready to set up your environment and kick off training.
+
+- see [env.mdx](env.mdx) to create the search environment that defines tools and rewards for training
+- see [train.mdx](train.mdx) to launch a training job using your environment and dataset
+- see [notebooks/synthetic_rag_dataset_gen.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/synthetic_rag_dataset_gen.ipynb) for a full working example
