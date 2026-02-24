@@ -5,8 +5,8 @@ from pathlib import Path
 from synthetic_data_prep.chunkers.inspector import ChunkInspector
 from synthetic_data_prep.chunkers.markdown import MarkdownChunker
 from synthetic_data_prep.chunkers.models import ChunkCollection
-from synthetic_data_prep.corpus.client import CorpusClient
-from synthetic_data_prep.corpus.models import Corpus
+from synthetic_data_prep.corpus.corpora.client import CorpusClient
+from synthetic_data_prep.corpus.corpora.models import Corpus
 
 
 def prepare_corpus(

@@ -6,8 +6,8 @@ from pathlib import Path
 from openai import OpenAI
 
 from synthetic_data_prep.chunkers.models import ChunkCollection
-from synthetic_data_prep.corpus.client import CorpusClient
-from synthetic_data_prep.corpus.models import Corpus
+from synthetic_data_prep.corpus.corpora.client import CorpusClient
+from synthetic_data_prep.corpus.corpora.models import Corpus
 from synthetic_data_prep.qa_generation.helpers import (
     filter_chunks_by_length,
     generate_multi_hop_batch,
