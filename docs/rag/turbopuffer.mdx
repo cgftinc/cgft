@@ -1,0 +1,112 @@
+# turbopuffer integration
+
+use an existing Turbopuffer namespace as the corpus backend for synthetic data generation and RL training — no CGFT corpus API required.
+
+## when to use this
+
+- you already store documents in Turbopuffer
+- you want BM25 full-text search (optionally combined with vector embeddings)
+- you want to bring your own corpus infrastructure
+
+## install
+
+```bash
+pip install synthetic-data-prep turbopuffer
+```
+
+## quickstart
+
+see [notebooks/turbopuffer_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/turbopuffer_pipeline.ipynb) for a full working example.
+
+```python
+import synthetic_data_prep
+from synthetic_data_prep.corpus.turbopuffer import TpufChunkSource
+from synthetic_data_prep.qa_generation import generate_dataset
+from synthetic_data_prep.envs.tpuf_search_env import TpufSearchEnv
+from synthetic_data_prep.trainer.pipeline import train
+
+# 1. Point to dataset
+source = TpufChunkSource(
+    api_key=TURBOPUFFER_API_KEY,
+    namespace="my-docs",
+    region="aws-us-east-1",
+)
+source.populate_from_folder("./samples/posthog")
+
+# 2. Create synthetic QA
+dataset = generate_dataset(
+    source=source,
+    api_key=API_KEY,
+    corpus_description="Posthog documentation",
+    example_queries=["how to feature flag", "setup reverse proxy"],
+)
+
+# 3. Launch training
+experiment_id = train(
+    env_class=TpufSearchEnv,
+    env_args={
+        "turbopuffer_api_key": TURBOPUFFER_API_KEY,
+        "namespace": "my-docs",
+        "region": "aws-us-east-1",
+    },
+    dataset=dataset.to_list(),
+    api_key=API_KEY,
+    local_modules=[synthetic_data_prep],
+    pip_dependencies=["turbopuffer"],
+)
+```
+
+## using an existing namespace
+
+if you already have documents in Turbopuffer, skip `populate_from_folder`:
+
+```python
+source = TpufChunkSource(
+    api_key=TURBOPUFFER_API_KEY,
+    namespace="my-existing-namespace",
+)
+
+# skip source.populate_from_folder() — use existing data
+dataset = generate_dataset(source=source, api_key=API_KEY, ...)
+```
+
+## vector embeddings (optional)
+
+by default, `TpufChunkSource` uses BM25 full-text search only. to also store vector embeddings alongside BM25:
+
+```python
+def embed_fn(texts: list[str]) -> list[list[float]]:
+    # your embedding function (e.g. OpenAI, Azure OpenAI, etc.)
+    response = openai_client.embeddings.create(model="text-embedding-3-small", input=texts)
+    return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+
+source.populate_from_folder("./samples", embed_fn=embed_fn)
+```
+
+## custom field names
+
+by default, `TpufChunkSource` reads from and searches over a field called `content`. if your namespace uses different field names, specify them with `content_attr`:
+
+```python
+source = TpufChunkSource(
+    api_key=TURBOPUFFER_API_KEY,
+    namespace="my-docs",
+    content_attr=["title", "body"],  # search over these fields
+)
+```
+
+pass the same `content_attr` to `TpufSearchEnv` so training matches data generation:
+
+```python
+env_args={
+    "turbopuffer_api_key": TURBOPUFFER_API_KEY,
+    "namespace": "my-docs",
+    "content_attr": ["title", "body"],
+}
+```
+
+## next steps
+
+- see [synthetic_datagen.mdx](synthetic_datagen.mdx) for details on the QA generation process
+- see [train.mdx](train.mdx) for training parameters and monitoring guidance
+- see [env.mdx](env.mdx) to write a custom search environment

@@ -4,26 +4,22 @@ generating question-answer pairs automatically from your corpus for training sea
 
 ## quickstart
 
-see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for how it's used and how to start a job.
+see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full working example.
 
 ```python
-from synthetic_data_prep.corpus import prepare_corpus
+from synthetic_data_prep.corpus import CorporaChunkSource
 from synthetic_data_prep.qa_generation import generate_dataset
-from synthetic_data_prep.trainer import upload_dataset, upload_env, launch_job
-from synthetic_data_prep.envs import SearchEnv
+from synthetic_data_prep.envs import CorporaSearchEnv
+from synthetic_data_prep.trainer.pipeline import train
+import synthetic_data_prep
 
 # 1. Point to dataset
-corpus, collection, corpus_client = prepare_corpus(
-    docs_path="./samples/posthog",
-    corpus_name="my-docs",
-    api_key=API_KEY,
-)
+source = CorporaChunkSource(api_key=API_KEY, corpus_name="my-docs", base_url=BASE_URL)
+source.populate_from_folder("./samples/posthog")
 
 # 2. Create synthetic QA
 dataset = generate_dataset(
-    corpus=corpus,
-    collection=collection,
-    corpus_client=corpus_client,
+    source=source,
     api_key=API_KEY,
     corpus_description="Posthog documentation",
     example_queries=["how to feature flag", "setup reverse proxy"],
@@ -31,15 +27,21 @@ dataset = generate_dataset(
     num_multi_hop=5,
 )
 
-# 3. Upload dataset and create env
-dataset_path = upload_dataset(dataset, corpus, API_KEY)
-env_path, _ = upload_env(SearchEnv, {...}, API_KEY)
-
-# 4. Run training job
-job = launch_job(dataset_path, env_path, API_KEY)
+# 3. Launch training
+experiment_id = train(
+    env_class=CorporaSearchEnv,
+    env_args={
+        "api_key": API_KEY,
+        "corpus_id": source.corpus_id,
+        "base_url": BASE_URL,
+    },
+    dataset=dataset.to_list(),
+    api_key=API_KEY,
+    local_modules=[synthetic_data_prep],
+)
 ```
 
-for detailed explanations and customization, continue reading below or see the [full notebook](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/synthetic_rag_dataset_gen.ipynb).
+for detailed explanations and customization, continue reading below or see the [full notebook](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/synthetic_rag_dataset_gen.ipynb).
 
 ## getting sample data
 
@@ -54,11 +56,8 @@ download your notion workspace or pages as markdown:
 
 point `docs_path` to the unzipped folder:
 ```python
-corpus, collection, corpus_client = prepare_corpus(
-    docs_path="./notion-export/My-Workspace-abc123",
-    corpus_name="my-notion-docs",
-    api_key=API_KEY,
-)
+source = CorporaChunkSource(api_key=API_KEY, corpus_name="my-notion-docs", base_url=BASE_URL)
+source.populate_from_folder("./notion-export/My-Workspace-abc123")
 ```
 
 ### online sample datasets
@@ -71,11 +70,8 @@ try these ready-to-use markdown datasets:
 
 clone and point to the docs folder:
 ```python
-corpus, collection, corpus_client = prepare_corpus(
-    docs_path="./posthog.com/contents/docs",
-    corpus_name="posthog-docs",
-    api_key=API_KEY,
-)
+source = CorporaChunkSource(api_key=API_KEY, corpus_name="posthog-docs", base_url=BASE_URL)
+source.populate_from_folder("./posthog.com/contents/docs")
 ```
 
 ### other markdown sources
@@ -115,12 +111,8 @@ EXAMPLE_QUERIES = [
     "posthog install nextjs",
 ]
 
-# Sample chunks and generate corpus summary
-top_level_chunks = collection.get_top_level_chunks()
-random_chunks = random.sample(collection.chunks, 4)
-
-# LLM analyzes samples + your context to generate corpus summary + more example queries
-# (see notebook for full prompt templates)
+# generate_dataset() handles this automatically, but you can inspect it manually:
+# LLM analyzes sampled chunks + your context to generate corpus summary + more example queries
 corpus_summary, example_queries = parse_corpus_summary_response(llm_response)
 ```
 
@@ -133,7 +125,7 @@ from synthetic_data_prep.qa_generation.helpers import generate_single_hop_batch
 from synthetic_data_prep.qa_generation.response_parsers import parse_single_hop_response
 
 dataset = generate_single_hop_batch(
-    collection=collection,
+    source=source,
     client=openai_client,
     model="grok-4-fast-non-reasoning",
     system_prompt=single_hop_system_prompt,  # includes corpus context
@@ -159,15 +151,13 @@ multi-hop requires finding chunks with meaningful relationships:
 from synthetic_data_prep.qa_generation.helpers import generate_multi_hop_batch
 
 dataset = generate_multi_hop_batch(
-    collection=collection,
+    source=source,
     client=openai_client,
     model="grok-4-fast-non-reasoning",
     related_query_system_prompt=related_query_prompt,
     related_query_user_template=related_query_template,
     multi_hop_system_prompt=multi_hop_prompt,
     multi_hop_user_template=multi_hop_template,
-    corpus_client=corpus_client,
-    corpus=corpus,
     num_samples=15,
     related_query_parser=parse_related_queries_response,
     multi_hop_parser=parse_multi_hop_validation_response,
@@ -227,4 +217,5 @@ once you have a dataset, you're ready to set up your environment and kick off tr
 
 - see [env.mdx](env.mdx) to create the search environment that defines tools and rewards for training
 - see [train.mdx](train.mdx) to launch a training job using your environment and dataset
-- see [notebooks/synthetic_rag_dataset_gen.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/synthetic_rag_dataset_gen.ipynb) for a full working example
+- see [turbopuffer.mdx](turbopuffer.mdx) if you want to use an existing Turbopuffer namespace instead of the CGFT corpus API
+- see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full working example
