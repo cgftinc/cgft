@@ -38,6 +38,8 @@ source = TpufChunkSource(
     namespace="my-docs",
     region="aws-us-east-1",
 )
+
+# Skip this step if your documents are already in stored in Turbopuffer.
 source.populate_from_folder("./samples/posthog")
 
 # 2. Create synthetic QA
@@ -61,20 +63,6 @@ experiment_id = train(
     local_modules=[synthetic_data_prep],
     pip_dependencies=["turbopuffer"],
 )
-```
-
-## Using an existing namespace
-
-if you already have documents in Turbopuffer, skip `populate_from_folder`:
-
-```python
-source = TpufChunkSource(
-    api_key=TURBOPUFFER_API_KEY,
-    namespace="my-existing-namespace",
-)
-
-# skip source.populate_from_folder() — use existing data
-dataset = generate_dataset(source=source, api_key=API_KEY, ...)
 ```
 
 ## Specify content attributes
