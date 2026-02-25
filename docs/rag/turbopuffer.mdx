@@ -1,20 +1,27 @@
 # turbopuffer integration
 
-use an existing Turbopuffer namespace as the corpus backend for synthetic data generation and RL training — no CGFT corpus API required.
+If your data is already in Turbopuffer, we allow you to supply a Turbopuffer namespace as the corpus backend for synthetic data generation and RL training.
 
-## when to use this
 
-- you already store documents in Turbopuffer
-- you want BM25 full-text search (optionally combined with vector embeddings)
-- you want to bring your own corpus infrastructure
+## Turbopuffer Setup Requirements
+- Your corpus must be in a single namespace as Turbopuffer does not support querying across multiple.
+- Your corpus must already be stored as chunks. i.e. each Turbopuffer document is a single chunk of ~1024-2048 chars.
+- You'll need to specifiy which Turbopuffer doc attribute(s) contain the searchable contents (default is "content")
 
-## install
+## Limitations
+- There is no implicit file system awareness in Turbopuffer, so synthetic data gen may be less optimal compared to the default approach of uploading your own corpus. In the future, we may allow you to specify doc attributes that store this information.
+    - cannot retrieve top-level chunks, so initial summary/query generation will be affected
+    - cannot retrieve neighboring chunks, so generating relevant queries for QA gen will be affected
+
+- We do not yet support vector or hybrid search, and just default to BM25 search for both synthetic data gen and RL training.
+
+## Install
 
 ```bash
 pip install synthetic-data-prep turbopuffer
 ```
 
-## quickstart
+## Quickstart
 
 see [notebooks/turbopuffer_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/turbopuffer_pipeline.ipynb) for a full working example.
 
@@ -56,7 +63,7 @@ experiment_id = train(
 )
 ```
 
-## using an existing namespace
+## Using an existing namespace
 
 if you already have documents in Turbopuffer, skip `populate_from_folder`:
 
@@ -70,22 +77,9 @@ source = TpufChunkSource(
 dataset = generate_dataset(source=source, api_key=API_KEY, ...)
 ```
 
-## vector embeddings (optional)
+## Specify content attributes
 
-by default, `TpufChunkSource` uses BM25 full-text search only. to also store vector embeddings alongside BM25:
-
-```python
-def embed_fn(texts: list[str]) -> list[list[float]]:
-    # your embedding function (e.g. OpenAI, Azure OpenAI, etc.)
-    response = openai_client.embeddings.create(model="text-embedding-3-small", input=texts)
-    return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
-
-source.populate_from_folder("./samples", embed_fn=embed_fn)
-```
-
-## custom field names
-
-by default, `TpufChunkSource` reads from and searches over a field called `content`. if your namespace uses different field names, specify them with `content_attr`:
+By default, `TpufChunkSource` reads from and searches over an attribute called `content`. if your namespace uses different attributes, specify them with `content_attr`:
 
 ```python
 source = TpufChunkSource(
@@ -95,7 +89,7 @@ source = TpufChunkSource(
 )
 ```
 
-pass the same `content_attr` to `TpufSearchEnv` so training matches data generation:
+Pass the same `content_attr` to `TpufSearchEnv` so training matches data generation:
 
 ```python
 env_args={
@@ -103,6 +97,21 @@ env_args={
     "namespace": "my-docs",
     "content_attr": ["title", "body"],
 }
+```
+
+## Vector embeddings (optional)
+
+Currently, only BM-25 search is supported. To add hybrid BM25 + ANN search, you'd need to modify `search_related` in `TpufChunkSource` (for data generation) and subclass `SearchEnv` with a custom `search_corpus` tool (for training) — see [../bring-your-env/your-own-env.mdx](../bring-your-env/your-own-env.mdx) and Turbopuffer's [vector and hybrid query API](https://turbopuffer.com/docs/query#vector-search).
+
+This assumes your Turbopuffer corpus already has vector embeddings stored in a "vector" attribute. If you are uploading your own corpus using `populate_from_folder`, you can supply an embedding function as shown below.
+
+```python
+def embed_fn(texts: list[str]) -> list[list[float]]:
+    # your embedding function (e.g. OpenAI, Azure OpenAI, etc.)
+    response = openai_client.embeddings.create(model="text-embedding-3-small", input=texts)
+    return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+
+source.populate_from_folder("./samples", embed_fn=embed_fn)
 ```
 
 ## next steps
