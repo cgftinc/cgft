@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..chunkers.models import Chunk, ChunkCollection
+    from ..corpus.source import ChunkSource
     from .models import QADataset
 
 # ============================================================================
@@ -207,7 +208,7 @@ def print_sections(*sections: tuple[str, str]) -> None:
 # ============================================================================
 
 def generate_single_hop_batch(
-    collection: ChunkCollection,
+    source: ChunkSource,
     client: Any,
     model: str,
     system_prompt: str,
@@ -225,7 +226,7 @@ def generate_single_hop_batch(
     """Generate single-hop QA pairs in batch using parallel LLM calls.
 
     Args:
-        collection: ChunkCollection to sample from
+        source: ChunkSource backend to sample chunks from
         client: OpenAI client instance
         model: Model name to use
         system_prompt: System prompt for single-hop generation
@@ -250,7 +251,7 @@ def generate_single_hop_batch(
         from synthetic_data_prep.qa_generation.response_parsers import parse_single_hop_response
 
         dataset = generate_single_hop_batch(
-            collection=collection,
+            source=source,
             client=client,
             model="gpt-4",
             system_prompt=single_hop_system_prompt,
@@ -265,13 +266,12 @@ def generate_single_hop_batch(
     from .models import QADataPoint, QADataset, ReferenceChunk
 
     # 1. Sample chunks
-    eligible_chunks = filter_chunks_by_length(collection.chunks, min_chars=min_chunk_chars)
-    sampled_chunks = random.sample(eligible_chunks, min(num_samples, len(eligible_chunks)))
+    sampled_chunks = source.sample_chunks(num_samples, min_chars=min_chunk_chars)
 
     # 2. Build prompts for each chunk
     prompts = []
     for chunk in sampled_chunks:
-        ctx = collection.get_chunk_with_context(chunk, context_max_chars=context_preview_chars)
+        ctx = source.get_chunk_with_context(chunk, max_chars=context_preview_chars)
         prompt = render_template(user_template, ctx)
         prompts.append(prompt)
 
@@ -319,15 +319,13 @@ def generate_single_hop_batch(
 
 
 def generate_multi_hop_batch(
-    collection: ChunkCollection,
+    source: ChunkSource,
     client: Any,
     model: str,
     related_query_system_prompt: str,
     related_query_user_template: str,
     multi_hop_system_prompt: str,
     multi_hop_user_template: str,
-    corpus_client: Any,
-    corpus: Any,
     num_samples: int,
     related_query_parser: Any,
     multi_hop_parser: Any,
@@ -349,15 +347,13 @@ def generate_multi_hop_batch(
        and validate connections to generate QA pairs (parallelized)
 
     Args:
-        collection: ChunkCollection to sample from
+        source: ChunkSource backend to sample chunks from and search related chunks
         client: OpenAI client instance
         model: Model name to use
         related_query_system_prompt: System prompt for generating related queries
         related_query_user_template: User template for related query generation
         multi_hop_system_prompt: System prompt for multi-hop QA validation
         multi_hop_user_template: User template for multi-hop QA validation
-        corpus_client: CorpusClient for BM25 search
-        corpus: Corpus object with .id attribute
         num_samples: Number of chunks to sample and process
         related_query_parser: Function to parse related query response,
             returns (confidence, queries)
@@ -378,15 +374,13 @@ def generate_multi_hop_batch(
     Example:
         ```python
         dataset = generate_multi_hop_batch(
-            collection=collection,
+            source=source,
             client=client,
             model="gpt-4",
             related_query_system_prompt=related_chunk_system_prompt,
             related_query_user_template=related_chunk_user_template,
             multi_hop_system_prompt=multi_hop_system_prompt,
             multi_hop_user_template=multi_hop_user_template,
-            corpus_client=corpus_client,
-            corpus=corpus,
             num_samples=15,
             related_query_parser=parse_related_queries_response,
             multi_hop_parser=parse_multi_hop_validation_response,
@@ -397,8 +391,7 @@ def generate_multi_hop_batch(
     from .models import QADataPoint, QADataset, ReferenceChunk
 
     # 1. Sample chunks
-    eligible_chunks = filter_chunks_by_length(collection.chunks, min_chars=min_chunk_chars)
-    sampled_chunks = random.sample(eligible_chunks, min(num_samples, len(eligible_chunks)))
+    sampled_chunks = source.sample_chunks(num_samples, min_chars=min_chunk_chars)
 
     if show_progress:
         print(f"Step 1: Generating related queries for {len(sampled_chunks)} chunks...")
@@ -406,7 +399,7 @@ def generate_multi_hop_batch(
     # 2. Build prompts for related query generation
     related_prompts = []
     for chunk in sampled_chunks:
-        ctx = collection.get_chunk_with_context(chunk, context_max_chars=context_preview_chars)
+        ctx = source.get_chunk_with_context(chunk, max_chars=context_preview_chars)
         prompt = render_template(related_query_user_template, ctx)
         related_prompts.append(prompt)
 
@@ -433,9 +426,7 @@ def generate_multi_hop_batch(
             continue
 
         # Search for related chunks using BM25
-        search_results = search_related_chunks(
-            chunk_a, queries, corpus_client, corpus, collection, top_k_bm25
-        )
+        search_results = source.search_related(chunk_a, queries, top_k=top_k_bm25)
 
         # Take top related chunks
         for result in search_results[:top_related_chunks]:
@@ -454,8 +445,8 @@ def generate_multi_hop_batch(
     # 5. Build prompts for multi-hop validation
     multi_hop_prompts = []
     for chunk_a, chunk_b, connecting_queries in chunk_pairs:
-        ctx_a = collection.get_chunk_with_context(chunk_a, context_max_chars=context_preview_chars)
-        ctx_b = collection.get_chunk_with_context(chunk_b, context_max_chars=context_preview_chars)
+        ctx_a = source.get_chunk_with_context(chunk_a, max_chars=context_preview_chars)
+        ctx_b = source.get_chunk_with_context(chunk_b, max_chars=context_preview_chars)
 
         prompt = render_template(
             multi_hop_user_template,

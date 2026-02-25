@@ -1,11 +1,9 @@
 """Corpus module for document chunking and corpus management."""
 
-from .client import CorpusClient
-from .models import Corpus
-from .pipeline import prepare_corpus
+from .source import ChunkSource
+from .corpora import CorporaChunkSource
 
 __all__ = [
-    "CorpusClient",
-    "Corpus",
-    "prepare_corpus",
+    "ChunkSource",
+    "CorporaChunkSource",
 ]
