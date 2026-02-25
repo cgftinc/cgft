@@ -5,11 +5,8 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from synthetic_data_prep.chunkers.models import ChunkCollection
-from synthetic_data_prep.corpus.corpora.client import CorpusClient
-from synthetic_data_prep.corpus.corpora.models import Corpus
+from synthetic_data_prep.corpus.source import ChunkSource
 from synthetic_data_prep.qa_generation.helpers import (
-    filter_chunks_by_length,
     generate_multi_hop_batch,
     generate_single_hop_batch,
     render_template,
@@ -25,9 +22,7 @@ from synthetic_data_prep.qa_generation.storage import save_qa_dataset, save_qa_d
 
 
 def generate_dataset(
-    corpus: Corpus,
-    collection: ChunkCollection,
-    corpus_client: CorpusClient,
+    source: ChunkSource,
     api_key: str,
     corpus_description: str,
     example_queries: list[str],
@@ -48,9 +43,7 @@ def generate_dataset(
     4. Merge and save datasets
 
     Args:
-        corpus: Corpus object from prepare_corpus
-        collection: ChunkCollection from prepare_corpus
-        corpus_client: CorpusClient from prepare_corpus
+        source: ChunkSource backend (e.g. CorporaChunkSource, TpufChunkSource)
         api_key: API key for LLM service
         corpus_description: Short description of corpus (e.g., "Posthog documentation")
         example_queries: Example queries users might search for
@@ -67,9 +60,7 @@ def generate_dataset(
 
     Example:
         >>> dataset = generate_dataset(
-        ...     corpus=corpus,
-        ...     collection=collection,
-        ...     corpus_client=corpus_client,
+        ...     source=source,
         ...     api_key="your-api-key",
         ...     corpus_description="Posthog documentation",
         ...     example_queries=["how to feature flag", "setup reverse proxy"],
@@ -91,7 +82,7 @@ def generate_dataset(
         print("Generating corpus summary and example queries...")
 
     corpus_context = _generate_corpus_context(
-        collection, corpus_description, example_queries, client, model
+        source, corpus_description, example_queries, client, model
     )
 
     # Generate single-hop QA
@@ -99,7 +90,7 @@ def generate_dataset(
         print(f"\nGenerating {num_single_hop} single-hop QA pairs...")
 
     single_hop_dataset = _generate_single_hop(
-        collection, client, model, corpus_context, num_single_hop, max_questions_per_chunk
+        source, client, model, corpus_context, num_single_hop, max_questions_per_chunk
     )
 
     if show_summary:
@@ -110,9 +101,7 @@ def generate_dataset(
         print(f"\nGenerating {num_multi_hop} multi-hop QA pairs...")
 
     multi_hop_dataset = _generate_multi_hop(
-        collection,
-        corpus_client,
-        corpus,
+        source,
         client,
         model,
         corpus_context,
@@ -147,7 +136,7 @@ def generate_dataset(
 
 
 def _generate_corpus_context(
-    collection: ChunkCollection,
+    source: ChunkSource,
     description: str,
     example_queries: list[str],
     client: OpenAI,
@@ -204,10 +193,9 @@ Return JSON with:
 Return your analysis as JSON with keys: thoughts, summary, example_queries
 """
 
-    all_chunks = filter_chunks_by_length(collection.chunks, min_chars=400)
-    top_level = collection.get_top_level_chunks()
+    top_level = source.get_top_level_chunks()
     sampled_top_level = random.sample(top_level, min(4, len(top_level)))
-    sampled_random = random.sample(all_chunks, min(4, len(all_chunks)))
+    sampled_random = source.sample_chunks(4, min_chars=400)
 
     variables = {
         "user_context": f"Description: {description}\nExample queries provided by user: {', '.join(example_queries)}",
@@ -233,7 +221,7 @@ Return your analysis as JSON with keys: thoughts, summary, example_queries
 
 
 def _generate_single_hop(
-    collection: ChunkCollection,
+    source: ChunkSource,
     client: OpenAI,
     model: str,
     corpus_context: dict[str, str],
@@ -288,7 +276,7 @@ Return JSON with keys: keywords, confidence, qa_pairs
     single_hop_system_prompt = render_template(single_hop_system_template, corpus_context)
 
     return generate_single_hop_batch(
-        collection=collection,
+        source=source,
         client=client,
         model=model,
         system_prompt=single_hop_system_prompt,
@@ -301,9 +289,7 @@ Return JSON with keys: keywords, confidence, qa_pairs
 
 
 def _generate_multi_hop(
-    collection: ChunkCollection,
-    corpus_client: CorpusClient,
-    corpus: Corpus,
+    source: ChunkSource,
     client: OpenAI,
     model: str,
     corpus_context: dict[str, str],
@@ -522,15 +508,13 @@ Return JSON with keys: thoughts, relationship_type, direction, linking_info, qa_
     multi_hop_system_prompt = render_template(multi_hop_system_template, corpus_context)
 
     return generate_multi_hop_batch(
-        collection=collection,
+        source=source,
         client=client,
         model=model,
         related_query_system_prompt=related_chunk_system_prompt,
         related_query_user_template=related_chunk_user_template,
         multi_hop_system_prompt=multi_hop_system_prompt,
         multi_hop_user_template=multi_hop_user_template,
-        corpus_client=corpus_client,
-        corpus=corpus,
         num_samples=num_samples,
         related_query_parser=parse_related_queries_response,
         multi_hop_parser=parse_multi_hop_validation_response,

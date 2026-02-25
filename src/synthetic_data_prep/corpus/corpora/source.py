@@ -1,0 +1,176 @@
+"""CorporaChunkSource — ChunkSource implementation backed by the Corpora API."""
+
+from __future__ import annotations
+
+import random
+from typing import TYPE_CHECKING
+
+from .client import CorpusClient
+from synthetic_data_prep.chunkers.inspector import ChunkInspector
+from synthetic_data_prep.chunkers.markdown import MarkdownChunker
+from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
+
+if TYPE_CHECKING:
+    from .models import Corpus
+
+
+class CorporaChunkSource:
+    """ChunkSource backed by local ChunkCollection + Corpora API BM25 search.
+
+    Chunks are stored locally in a ChunkCollection and uploaded to the Corpora
+    API to enable BM25 search. The collection is exposed as a public attribute
+    for advanced users who want to leverage file-structure awareness directly.
+
+    Args:
+        api_key: Corpora API key
+        corpus_name: Name of the corpus to create or reuse
+        base_url: Corpora API base URL
+
+    Example:
+        >>> source = CorporaChunkSource(
+        ...     api_key="sk_...",
+        ...     corpus_name="my-docs",
+        ...     base_url="https://app.cgft.io",
+        ... )
+        >>> source.populate_from_folder("./docs")
+        >>> chunks = source.sample_chunks(n=10, min_chars=400)
+    """
+
+    def __init__(self, api_key: str, corpus_name: str, base_url: str) -> None:
+        self._client = CorpusClient(api_key=api_key, base_url=base_url)
+        self._corpus_name = corpus_name
+        self._corpus: Corpus | None = None
+        self.collection: ChunkCollection | None = None  # exposed publicly for advanced users
+
+    def populate_from_folder(
+        self,
+        docs_path: str,
+        min_chars: int = 1024,
+        max_chars: int = 2048,
+        overlap_chars: int = 128,
+        file_extensions: list[str] | None = None,
+        batch_size: int = 100,
+        show_summary: bool = True,
+    ) -> None:
+        """Chunk documents in a folder and upload them to the Corpora API.
+
+        Chunks the documents, creates or reuses the named corpus, and uploads
+        all chunks for BM25 search. Sets self.collection after chunking.
+
+        Args:
+            docs_path: Path to the folder containing documents to chunk
+            min_chars: Minimum characters per chunk (default 1024)
+            max_chars: Maximum characters per chunk (default 2048)
+            overlap_chars: Character overlap between adjacent chunks (default 128)
+            file_extensions: File types to process (default [".md", ".mdx"])
+            batch_size: Number of chunks per upload batch (default 100)
+            show_summary: Print chunking summary and upload progress (default True)
+        """
+        if file_extensions is None:
+            file_extensions = [".md", ".mdx"]
+
+        if show_summary:
+            print(f"Chunking documents from {docs_path}...")
+
+        chunker = MarkdownChunker(min_char=min_chars, max_char=max_chars, chunk_overlap=overlap_chars)
+        self.collection = chunker.chunk_folder(docs_path, file_extensions=file_extensions)
+
+        if show_summary:
+            inspector = ChunkInspector(self.collection)
+            inspector.summary(max_depth=3, max_files_per_folder=4)
+
+        self._corpus = self._client.get_or_create_corpus(self._corpus_name, on_limit="prompt")
+
+        if show_summary:
+            print(f"\nUsing corpus: {self._corpus.name} (ID: {self._corpus.id})")
+            print(f"Uploading {len(self.collection)} chunks to corpus...")
+
+        upload_result = self._client.upload_chunks(
+            corpus_id=self._corpus.id,
+            collection=self.collection,
+            batch_size=batch_size,
+            show_progress=show_summary,
+        )
+
+        if show_summary:
+            print(f"\nUpload complete! Inserted: {upload_result.inserted_count}")
+
+    def _assert_ready(self) -> None:
+        if self.collection is None or self._corpus is None:
+            raise RuntimeError("Corpus is not ready — no data has been loaded.")
+
+    @property
+    def corpus_id(self) -> str:
+        """Return the corpus ID. Available after populate_from_folder() is called."""
+        self._assert_ready()
+        return self._corpus.id
+
+    def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
+        """Return n randomly sampled chunks, optionally filtered by minimum length."""
+        self._assert_ready()
+        eligible = [c for c in self.collection.chunks if len(c) >= min_chars]
+        return random.sample(eligible, min(n, len(eligible)))
+
+    def get_chunk_with_context(self, chunk: Chunk, max_chars: int = 200) -> dict:
+        """Return a chunk with truncated previews of its neighbors in the same file.
+
+        Returns:
+            Dict with keys: chunk_content, prev_chunk_preview, next_chunk_preview
+        """
+        self._assert_ready()
+        return self.collection.get_chunk_with_context(chunk, context_max_chars=max_chars)
+
+    def get_top_level_chunks(self) -> list[Chunk]:
+        """Return chunks from files at the shallowest directory depth in the corpus."""
+        self._assert_ready()
+        return self.collection.get_top_level_chunks()
+
+    def search_related(self, source: Chunk, queries: list[str], top_k: int = 5) -> list[dict]:
+        """Search for chunks related to source using BM25 queries via the Corpora API.
+
+        Runs each query, deduplicates results by chunk hash, skips the source chunk
+        and its immediate neighbors in the same file, and aggregates scores across queries.
+
+        Returns:
+            List of dicts sorted by relevance (num matching queries DESC, cross-file first,
+            max BM25 score DESC), each containing: chunk, queries, same_file, max_score
+        """
+        self._assert_ready()
+        related_map: dict[str, dict] = {}
+
+        for query in queries:
+            matched_chunks = self._client.search_with_chunks(
+                corpus_id=self._corpus.id, query=query, collection=self.collection, limit=top_k
+            )
+
+            for result_chunk, score in matched_chunks[:top_k]:
+                if result_chunk.hash == source.hash:
+                    continue
+
+                is_same_file = result_chunk.get_metadata("file") == source.get_metadata("file")
+                if is_same_file:
+                    index_diff = abs(
+                        result_chunk.get_metadata("index", 0) - source.get_metadata("index", 0)
+                    )
+                    if index_diff <= 1:
+                        continue
+
+                if result_chunk.hash not in related_map:
+                    related_map[result_chunk.hash] = {
+                        "chunk": result_chunk,
+                        "queries": [],
+                        "same_file": is_same_file,
+                        "max_score": score,
+                    }
+                else:
+                    related_map[result_chunk.hash]["max_score"] = max(
+                        related_map[result_chunk.hash]["max_score"], score
+                    )
+
+                related_map[result_chunk.hash]["queries"].append(query)
+
+        return sorted(
+            related_map.values(),
+            key=lambda x: (len(x["queries"]), not x["same_file"], x["max_score"]),
+            reverse=True,
+        )
