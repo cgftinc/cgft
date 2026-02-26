@@ -65,6 +65,13 @@ class CorporaSearchEnv(SearchEnv):
             search_tool_definition.name: (search_tool_definition, self._search_corpus_tool)
         }
 
+        # Optional init of parent class to log reward computation
+        super().__init__(
+            experiment_id=kwargs.get("experiment_id"),
+            api_key=kwargs.get("api_key"),
+            **{k: v for k, v in kwargs.items() if k not in ("experiment_id", "api_key")},
+        )
+
     async def _search_corpus_tool(
         self,
         query: str,

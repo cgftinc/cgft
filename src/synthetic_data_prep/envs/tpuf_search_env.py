@@ -34,7 +34,9 @@ class TpufSearchEnv(SearchEnv):
     ):
         import turbopuffer
 
-        self._ns = turbopuffer.Turbopuffer(api_key=turbopuffer_api_key, region=region).namespace(namespace)
+        self._ns = turbopuffer.Turbopuffer(api_key=turbopuffer_api_key, region=region).namespace(
+            namespace
+        )
         self._fields: list[str] = content_attr if content_attr is not None else ["content"]
         self._dataset_path = dataset_path
 
@@ -60,6 +62,13 @@ class TpufSearchEnv(SearchEnv):
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {
             search_tool_definition.name: (search_tool_definition, self._search_corpus_tool)
         }
+
+        # Optional init of parent class to log reward computation
+        super().__init__(
+            experiment_id=kwargs.get("experiment_id"),
+            api_key=kwargs.get("api_key"),
+            **{k: v for k, v in kwargs.items() if k not in ("experiment_id", "api_key")},
+        )
 
     def _build_rank_by(self, query: str) -> Any:
         """Build the rank_by argument for a BM25 Turbopuffer query."""
@@ -102,9 +111,7 @@ class TpufSearchEnv(SearchEnv):
             if len(self._fields) == 1:
                 content = str(getattr(row, self._fields[0], ""))
             else:
-                content = json.dumps(
-                    {f: getattr(row, f, "") for f in self._fields}, default=str
-                )
+                content = json.dumps({f: getattr(row, f, "") for f in self._fields}, default=str)
             lines.append(f"{i}. {score_str}\n   Content: {content}")
 
         return "\n".join(lines)

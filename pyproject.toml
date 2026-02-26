@@ -16,7 +16,7 @@ dependencies = [
     "openai>=2.15.0",
     "nest-asyncio>=1.5.0",
     "aiohttp>=3.13.3",
-    "benchmax>=0.1.1.dev8",
+    "benchmax>=0.1.2.dev16",
 ]
 
 [project.optional-dependencies]
@@ -56,4 +56,5 @@ strict_optional = true
 [dependency-groups]
 dev = [
     "jedi-language-server>=0.46.0",
+    "jupyter>=1.1.1",
 ]
