@@ -1,0 +1,109 @@
+# turbopuffer integration
+
+If your data is already in Turbopuffer, we allow you to supply a Turbopuffer namespace as the corpus backend for synthetic data generation and RL training.
+
+
+## Turbopuffer Setup Requirements
+- Your corpus must be in a single namespace as Turbopuffer does not support querying across multiple.
+- Your corpus must already be stored as chunks. i.e. each Turbopuffer document is a single chunk of ~1024-2048 chars.
+- You'll need to specifiy which Turbopuffer doc attribute(s) contain the searchable contents (default is "content")
+
+## Limitations
+- There is no implicit file system awareness in Turbopuffer, so synthetic data gen may be less optimal compared to the default approach of uploading your own corpus. In the future, we may allow you to specify doc attributes that store this information.
+    - cannot retrieve top-level chunks, so initial summary/query generation will be affected
+    - cannot retrieve neighboring chunks, so generating relevant queries for QA gen will be affected
+
+- We do not yet support vector or hybrid search, and just default to BM25 search for both synthetic data gen and RL training.
+
+## Install
+
+```bash
+pip install synthetic-data-prep turbopuffer
+```
+
+## Quickstart
+
+see [notebooks/turbopuffer_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/turbopuffer_pipeline.ipynb) for a full working example.
+
+```python
+import synthetic_data_prep
+from synthetic_data_prep.corpus.turbopuffer.source import TpufChunkSource
+from synthetic_data_prep.qa_generation import generate_dataset
+from synthetic_data_prep.envs.tpuf_search_env import TpufSearchEnv
+from synthetic_data_prep.trainer.pipeline import train
+
+# 1. Point to dataset
+source = TpufChunkSource(
+    api_key=TURBOPUFFER_API_KEY,
+    namespace="my-docs",
+    region="aws-us-east-1",
+)
+
+# Skip this step if your documents are already in stored in Turbopuffer.
+source.populate_from_folder("./samples/posthog")
+
+# 2. Create synthetic QA
+dataset = generate_dataset(
+    source=source,
+    api_key=API_KEY,
+    corpus_description="Posthog documentation",
+    example_queries=["how to feature flag", "setup reverse proxy"],
+)
+
+# 3. Launch training
+experiment_id = train(
+    env_class=TpufSearchEnv,
+    env_args={
+        "turbopuffer_api_key": TURBOPUFFER_API_KEY,
+        "namespace": "my-docs",
+        "region": "aws-us-east-1",
+    },
+    dataset=dataset.to_list(),
+    api_key=API_KEY,
+    local_modules=[synthetic_data_prep],
+    pip_dependencies=["turbopuffer"],
+)
+```
+
+## Specify content attributes
+
+By default, `TpufChunkSource` reads from and searches over an attribute called `content`. if your namespace uses different attributes, specify them with `content_attr`:
+
+```python
+source = TpufChunkSource(
+    api_key=TURBOPUFFER_API_KEY,
+    namespace="my-docs",
+    content_attr=["title", "body"],  # search over these fields
+)
+```
+
+Pass the same `content_attr` to `TpufSearchEnv` so training matches data generation:
+
+```python
+env_args={
+    "turbopuffer_api_key": TURBOPUFFER_API_KEY,
+    "namespace": "my-docs",
+    "content_attr": ["title", "body"],
+}
+```
+
+## Vector embeddings (optional)
+
+Currently, only BM-25 search is supported. To add hybrid BM25 + ANN search, you'd need to modify `search_related` in `TpufChunkSource` (for data generation) and subclass `SearchEnv` with a custom `search_corpus` tool (for training) — see [../bring-your-env/your-own-env.mdx](../bring-your-env/your-own-env.mdx) and Turbopuffer's [vector and hybrid query API](https://turbopuffer.com/docs/query#vector-search).
+
+This assumes your Turbopuffer corpus already has vector embeddings stored in a "vector" attribute. If you are uploading your own corpus using `populate_from_folder`, you can supply an embedding function as shown below.
+
+```python
+def embed_fn(texts: list[str]) -> list[list[float]]:
+    # your embedding function (e.g. OpenAI, Azure OpenAI, etc.)
+    response = openai_client.embeddings.create(model="text-embedding-3-small", input=texts)
+    return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+
+source.populate_from_folder("./samples", embed_fn=embed_fn)
+```
+
+## next steps
+
+- see [synthetic_datagen.mdx](synthetic_datagen.mdx) for details on the QA generation process
+- see [train.mdx](train.mdx) for training parameters and monitoring guidance
+- see [env.mdx](env.mdx) to write a custom search environment
