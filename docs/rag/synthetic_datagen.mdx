@@ -7,9 +7,9 @@ generating question-answer pairs automatically from your corpus for training sea
 see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full working example.
 
 ```python
-from synthetic_data_prep.corpus import CorporaChunkSource
+from synthetic_data_prep.corpus.corpora.source import CorporaChunkSource
 from synthetic_data_prep.qa_generation import generate_dataset
-from synthetic_data_prep.envs import CorporaSearchEnv
+from synthetic_data_prep.envs.corpora_search_env import CorporaSearchEnv
 from synthetic_data_prep.trainer.pipeline import train
 import synthetic_data_prep
 
