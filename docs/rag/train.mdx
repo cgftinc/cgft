@@ -5,33 +5,36 @@ once you have a dataset and an environment, one call launches the full training 
 ## quickstart
 
 ```python
-from synthetic_data_prep.trainer import train
-from synthetic_data_prep.envs.search_env import SearchEnv
+import synthetic_data_prep
+from synthetic_data_prep.envs.corpora_search_env import CorporaSearchEnv
+from synthetic_data_prep.trainer.pipeline import train
 
 experiment_id = train(
-    env_class=SearchEnv,
+    env_class=CorporaSearchEnv,
     env_args={
         "api_key": API_KEY,
-        "corpus_id": corpus.id,
+        "corpus_id": source.corpus_id,
         "base_url": BASE_URL,
     },
     dataset=dataset.to_list(),
     api_key=API_KEY,
+    local_modules=[synthetic_data_prep],
 )
 ```
 
 `train()` returns an experiment ID. view it at `https://app.cgft.io/experiments/{experiment_id}`.
 
-see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full working example.
+see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full working example.
 
 ## parameters
 
 ```python
 experiment_id = train(
-    env_class=SearchEnv,          # your environment class
-    env_args={...},               # constructor args (api_key, corpus_id, etc.)
+    env_class=CorporaSearchEnv,       # your environment class
+    env_args={...},                   # constructor args (api_key, corpus_id, etc.)
     dataset=list_of_dicts,
     api_key=API_KEY,
+    local_modules=[synthetic_data_prep],
 )
 ```
 
@@ -56,5 +59,6 @@ rewards will fluctuate in the first few dozen steps — this is normal. the mode
 
 - see [env.mdx](env.mdx) to understand how the search environment and reward function work
 - see [synthetic_datagen.mdx](synthetic_datagen.mdx) to generate the dataset used for training
+- see [turbopuffer.mdx](turbopuffer.mdx) to use a Turbopuffer namespace instead of the CGFT corpus API
 - see [../environments/pipeline.mdx](../environments/pipeline.mdx) for how `train()` works under the hood
-- see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgft-io/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full end-to-end example
+- see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full end-to-end example
