@@ -35,8 +35,7 @@ def _get_mime_type(path: Path) -> str:
     mime_type = _MIME_TYPES.get(suffix)
     if mime_type is None:
         raise ValueError(
-            f"Unsupported file type: {suffix}. "
-            f"Supported: {', '.join(_MIME_TYPES.keys())}"
+            f"Unsupported file type: {suffix}. Supported: {', '.join(_MIME_TYPES.keys())}"
         )
     return mime_type
 
@@ -299,17 +298,28 @@ _VALIDATION_MODEL = "grok-4-fast-reasoning"
 _VALIDATION_LLM_BASE_URL = "https://app.cgft.io/api/llm"
 
 # ANSI colours
-_GREEN  = "\033[32m"
-_RED    = "\033[31m"
+_GREEN = "\033[32m"
+_RED = "\033[31m"
 _YELLOW = "\033[33m"
-_CYAN   = "\033[36m"
-_BOLD   = "\033[1m"
-_RESET  = "\033[0m"
+_CYAN = "\033[36m"
+_BOLD = "\033[1m"
+_RESET = "\033[0m"
 
-def _ok(msg: str)   -> str: return f"{_GREEN}✔  {msg}{_RESET}"
-def _err(msg: str)  -> str: return f"{_RED}✗  {msg}{_RESET}"
-def _info(msg: str) -> str: return f"{_CYAN}{msg}{_RESET}"
-def _hdr(msg: str)  -> str: return f"\n{_BOLD}{msg}{_RESET}"
+
+def _ok(msg: str) -> str:
+    return f"{_GREEN}✔  {msg}{_RESET}"
+
+
+def _err(msg: str) -> str:
+    return f"{_RED}✗  {msg}{_RESET}"
+
+
+def _info(msg: str) -> str:
+    return f"{_CYAN}{msg}{_RESET}"
+
+
+def _hdr(msg: str) -> str:
+    return f"\n{_BOLD}{msg}{_RESET}"
 
 
 def _iter_sse(response: httpx.Response) -> Iterator[dict]:
@@ -317,7 +327,7 @@ def _iter_sse(response: httpx.Response) -> Iterator[dict]:
     for line in response.iter_lines():
         if line.startswith("data: "):
             try:
-                yield json.loads(line[len("data: "):])
+                yield json.loads(line[len("data: ") :])
             except json.JSONDecodeError:
                 pass
 
@@ -331,8 +341,8 @@ def _print_event(event: dict, idx: int) -> None:
         print(_info(f"{prefix} → rollout_started"))
 
     elif etype == "message":
-        msg     = event.get("message", {})
-        role    = msg.get("role", "?")
+        msg = event.get("message", {})
+        role = msg.get("role", "?")
         content = msg.get("content", "")
 
         # content may be a list of blocks (tool calls) or a plain string
@@ -341,12 +351,18 @@ def _print_event(event: dict, idx: int) -> None:
                 if isinstance(block, dict):
                     btype = block.get("type", "")
                     if btype == "text":
-                        preview = textwrap.shorten(block.get("text", ""), width=120, placeholder="…")
+                        preview = textwrap.shorten(
+                            block.get("text", ""), width=120, placeholder="…"
+                        )
                         print(f"{prefix} → message [{role}/text]: {preview}")
                     elif btype == "tool_use":
-                        print(f"{prefix} → message [{role}/tool_use]: {block.get('name')}({json.dumps(block.get('input', {}))[:80]})")
+                        print(
+                            f"{prefix} → message [{role}/tool_use]: {block.get('name')}({json.dumps(block.get('input', {}))[:80]})"
+                        )
                     elif btype == "tool_result":
-                        preview = textwrap.shorten(str(block.get("content", "")), width=120, placeholder="…")
+                        preview = textwrap.shorten(
+                            str(block.get("content", "")), width=120, placeholder="…"
+                        )
                         print(f"{prefix} → message [{role}/tool_result]: {preview}")
                     else:
                         print(f"{prefix} → message [{role}/{btype}]")
@@ -359,9 +375,11 @@ def _print_event(event: dict, idx: int) -> None:
 
     elif etype == "rollout_completed":
         success = event.get("success")
-        status  = _ok("success") if success else _err("failed")
-        print(f"{prefix} → rollout_completed  {status}  "
-              f"rewards={event.get('rewards')}  error={event.get('error')}")
+        status = _ok("success") if success else _err("failed")
+        print(
+            f"{prefix} → rollout_completed  {status}  "
+            f"rewards={event.get('rewards')}  error={event.get('error')}"
+        )
 
     elif etype in ("worker_error", "error", "cancelled"):
         print(_err(f"{prefix} → {etype}: {event.get('error')}"))
@@ -384,15 +402,15 @@ class RolloutClient:
         server_url: str = ROLLOUT_SERVER_URL,
         timeout: float = 300.0,
     ) -> None:
-        self._api_key    = api_key
+        self._api_key = api_key
         self._server_url = server_url.rstrip("/")
-        self._timeout    = timeout
+        self._timeout = timeout
 
     def stream_rollout(
         self,
         raw_example: dict[str, Any],
         env_cls_path: str,
-        env_meta_path: str,
+        env_metadata_path: str,
         example_index: int = 0,
         max_turns: int = 4,
         max_tool_calls: int = 8,
@@ -403,7 +421,7 @@ class RolloutClient:
         Args:
             raw_example:           Raw dataset row (passed as ``raw_example``).
             env_cls_path:          Blob path to the uploaded env .pkl file.
-            env_meta_path:         Blob path to the uploaded env-meta .json file.
+            env_metadata_path:         Blob path to the uploaded env-meta .json file.
             example_index:         Display index used in printed output.
             max_turns:             Max conversation turns.
             max_tool_calls:        Max tool calls per rollout.
@@ -417,19 +435,19 @@ class RolloutClient:
         """
         payload = {
             "standardized_example": None,
-            "raw_example":          raw_example,
+            "raw_example": raw_example,
             "env": {
-                "env_cls_path":  env_cls_path,
-                "env_meta_path": env_meta_path,
+                "env_cls_path": env_cls_path,
+                "env_metadata_path": env_metadata_path,
             },
             "llm": {
                 "base_url": _VALIDATION_LLM_BASE_URL,
-                "api_key":  self._api_key,
-                "model":    _VALIDATION_MODEL,
+                "api_key": self._api_key,
+                "model": _VALIDATION_MODEL,
             },
             "options": {
-                "max_turns":             max_turns,
-                "max_tool_calls":        max_tool_calls,
+                "max_turns": max_turns,
+                "max_tool_calls": max_tool_calls,
                 "max_completion_tokens": max_completion_tokens,
             },
         }
@@ -463,7 +481,7 @@ class RolloutClient:
         self,
         examples: list[dict[str, Any]],
         env_cls_path: str,
-        env_meta_path: str,
+        env_metadata_path: str,
         n: int = 2,
     ) -> bool:
         """Run rollouts on the first *n* examples and report pass/fail.
@@ -471,7 +489,7 @@ class RolloutClient:
         Args:
             examples:     Full dataset (list of raw dicts).
             env_cls_path: Blob path to the uploaded env .pkl file.
-            env_meta_path: Blob path to the uploaded env-meta .json file.
+            env_metadata_path: Blob path to the uploaded env-meta .json file.
             n:            Number of examples to validate (default 2).
 
         Returns:
@@ -487,7 +505,7 @@ class RolloutClient:
                 final = self.stream_rollout(
                     raw_example=example,
                     env_cls_path=env_cls_path,
-                    env_meta_path=env_meta_path,
+                    env_metadata_path=env_metadata_path,
                     example_index=i,
                 )
                 if not final.get("success"):

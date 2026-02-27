@@ -227,9 +227,9 @@ def upload_env(
         mime_type="application/octet-stream",
     )
 
-    env_meta_path = f"envs/{content_hash}/env-meta.json"
+    env_metadata_path = f"envs/{content_hash}/env-meta.json"
     env_meta_result = storage_client.upload_file(
-        path=env_meta_path,
+        path=env_metadata_path,
         content=env_meta_bytes,
         mime_type="application/json",
     )
@@ -362,13 +362,13 @@ def train(
         # container (same convention as build_env_blob() in the e2e tests).
         def _strip_userdata(p: str) -> str:
             prefix = "~/user-data/"
-            return p[len(prefix):] if p.startswith(prefix) else p
+            return p[len(prefix) :] if p.startswith(prefix) else p
 
         rollout_client = RolloutClient(api_key=api_key)
         passed = rollout_client.validate_examples(
             examples=dataset,
             env_cls_path=_strip_userdata(env_blob_path),
-            env_meta_path=_strip_userdata(env_meta_blob_path),
+            env_metadata_path=_strip_userdata(env_meta_blob_path),
         )
         if not passed:
             raise RuntimeError(
