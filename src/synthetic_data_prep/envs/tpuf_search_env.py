@@ -17,7 +17,6 @@ class TpufSearchEnv(SearchEnv):
     Args:
         turbopuffer_api_key: Turbopuffer API key
         namespace: Turbopuffer namespace name
-        dataset_path: Path to dataset JSONL file
         region: Turbopuffer region (default ``"aws-us-east-1"``)
         content_attr: List of attribute names to search over via BM25.
             Defaults to ["content"].
@@ -27,7 +26,6 @@ class TpufSearchEnv(SearchEnv):
         self,
         turbopuffer_api_key: str,
         namespace: str,
-        dataset_path: str,
         region: str = "aws-us-east-1",
         content_attr: list[str] | None = None,
         **kwargs,
@@ -38,11 +36,10 @@ class TpufSearchEnv(SearchEnv):
             namespace
         )
         self._fields: list[str] = content_attr if content_attr is not None else ["content"]
-        self._dataset_path = dataset_path
 
         search_tool_definition = ToolDefinition(
-            name="search_corpus",
-            description="Search the corpus using BM25 full-text search.",
+            name="search",
+            description="Search using BM25 full-text search.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -60,10 +57,9 @@ class TpufSearchEnv(SearchEnv):
         )
 
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {
-            search_tool_definition.name: (search_tool_definition, self._search_corpus_tool)
+            search_tool_definition.name: (search_tool_definition, self._search_tool)
         }
 
-        # Optional init of parent class to log reward computation
         super().__init__(
             experiment_id=kwargs.get("experiment_id"),
             api_key=kwargs.get("api_key"),
@@ -79,7 +75,7 @@ class TpufSearchEnv(SearchEnv):
             tuple(("Product", 1, (f, "BM25", query)) for f in self._fields),
         )
 
-    async def _search_corpus_tool(self, query: str, limit: int = 10, **kwargs) -> str:
+    async def _search_tool(self, query: str, limit: int = 10, **kwargs) -> str:
         """Search the Turbopuffer namespace using BM25.
 
         Args:

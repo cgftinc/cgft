@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from benchmax.envs.base_env import BaseEnv
 from benchmax.envs.types import StandardizedExample, ToolDefinition
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 SYSTEM_PROMPT = """Please use the search tool provided to find relevant information from the corpus.
 Formulate effective search queries to retrieve the most relevant chunks.
@@ -77,67 +79,18 @@ async def chunk_overlap_reward_function(completion: str, ground_truth: str, **kw
 class SearchEnv(BaseEnv):
     """Base search environment with shared logic for corpus-backed RL training.
 
-    Subclasses must set ``self._dataset_path`` and ``self._tools`` in their
-    ``__init__``, then implement ``_search_corpus_tool``.
+    Subclasses must set ``self._tools`` in their ``__init__`` as a dict mapping
+    tool name to a tuple of ``(ToolDefinition, Callable)``, e.g.::
 
-    See ``CorporaSearchEnv`` and ``TpufSearchEnv`` for concrete implementations.
+        self._tools = {
+            "search": (tool_definition, self._search_tool)
+        }
+
+    See ``CgftSearchEnv`` and ``TpufSearchEnv`` for concrete implementations.
     """
 
     system_prompt: str = SYSTEM_PROMPT
-    reward_funcs = [chunk_overlap_reward_function]
-
-    def get_train_val_split(self, train_ratio: float = 0.7, seed: int = 42, **kwargs):
-        """Load the dataset and return stratified train/validation splits by qa_type.
-
-        Args:
-            train_ratio: Fraction of data to use for training (default 0.7)
-            seed: Random seed for reproducibility
-            **kwargs: Additional arguments passed to load_dataset
-
-        Returns:
-            Tuple of (train_dataset, val_dataset) with stratified splits
-        """
-        from datasets import concatenate_datasets
-        from datasets import load_dataset as hf_load_dataset
-
-        ds = hf_load_dataset(
-            "json", data_files=str(Path(self._dataset_path).expanduser().absolute())
-        )
-        dataset = ds["train"]
-
-        # Get unique qa_types
-        qa_types = set(dataset["qa_type"])
-
-        train_splits = []
-        val_splits = []
-
-        for qa_type in qa_types:
-            # Filter dataset by qa_type
-            type_indices = [i for i, t in enumerate(dataset["qa_type"]) if t == qa_type]
-            type_subset = dataset.select(type_indices)
-
-            # Shuffle and split
-            type_subset = type_subset.shuffle(seed=seed)
-            split_idx = int(len(type_subset) * train_ratio)
-
-            # Handle edge cases
-            if split_idx == 0 and len(type_subset) > 0:
-                split_idx = 1
-            elif split_idx == len(type_subset) and len(type_subset) > 1:
-                split_idx = len(type_subset) - 1
-
-            train_splits.append(type_subset.select(range(split_idx)))
-            val_splits.append(type_subset.select(range(split_idx, len(type_subset))))
-
-        # Concatenate all splits
-        train_dataset = concatenate_datasets(train_splits)
-        val_dataset = concatenate_datasets(val_splits)
-
-        # Shuffle to mix qa_types
-        train_dataset = train_dataset.shuffle(seed=seed)
-        val_dataset = val_dataset.shuffle(seed=seed)
-
-        return train_dataset, val_dataset
+    _tools: dict[str, tuple[ToolDefinition, Callable]] = {}
 
     @classmethod
     def dataset_preprocess(cls, example: Any, **kwargs) -> StandardizedExample:
@@ -175,31 +128,3 @@ class SearchEnv(BaseEnv):
                 completion, ground_truth, **kwargs
             )
         }
-
-    async def init_rollout(self, rollout_id: str, **rollout_args) -> None:
-        """Initialize rollout (no-op for stateless environment)."""
-        pass
-
-    async def release_rollout(self, rollout_id: str) -> None:
-        """Release rollout (no-op for stateless environment)."""
-        pass
-
-    async def copy_to_workspace(
-        self, rollout_id: str, src_path: Path, dst_filename: str | None = None
-    ) -> None:
-        """Not needed for this environment."""
-        pass
-
-    async def copy_content_to_workspace(
-        self, rollout_id: str, src_content: str | bytes, dst_filename: str
-    ) -> None:
-        """Not needed for this environment."""
-        pass
-
-    async def copy_from_workspace(self, rollout_id: str, src_filename: str, dst_path: Path) -> None:
-        """Not needed for this environment."""
-        pass
-
-    async def shutdown(self):
-        """Cleanup (no-op for this environment)."""
-        pass

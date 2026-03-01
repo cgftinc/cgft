@@ -262,18 +262,24 @@ class TrainerClient:
         raise JobLaunchError(message, response.status_code)
 
     def launch_experiment(
-        self, experiment_type: str, env_cls_path: str, env_metadata_path: str
+        self,
+        experiment_type: str,
+        env_cls_path: str,
+        env_metadata_path: str,
+        train_dataset_path: str,
+        eval_dataset_path: str,
+        name: str | None = None,
     ) -> str:
         """Launch a new experiment from a job template.
-
         Args:
             experiment_type: Type of experiment to launch (e.g. "search")
             env_cls_path: Path to the environment class bundle (.bmxp file)
             env_metadata_path: Path to the environment kwargs JSON file
-
+            train_dataset_path: Path to the training dataset
+            eval_dataset_path: Path to the evaluation dataset
+            name: Optional name for the experiment
         Returns:
             The experiment ID.
-
         Raises:
             AuthenticationError: If API key is invalid
             JobLaunchError: If experiment launch fails
@@ -282,9 +288,12 @@ class TrainerClient:
             "/api/experiments/launch",
             json={
                 "type": experiment_type,
+                "name": name,
                 "args": {
                     "env_cls_path": env_cls_path,
                     "env_metadata_path": env_metadata_path,
+                    "train_dataset_path": train_dataset_path,
+                    "eval_dataset_path": eval_dataset_path,
                 },
             },
         )

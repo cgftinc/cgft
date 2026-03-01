@@ -1,4 +1,4 @@
-"""CorporaSearchEnv — SearchEnv backed by the Corpora HTTP API."""
+"""CgftSearchEnv — SearchEnv backed by the CGFT HTTP API using BM25 search."""
 
 from __future__ import annotations
 
@@ -11,14 +11,13 @@ from benchmax.envs.types import ToolDefinition
 from .search_env import SearchEnv
 
 
-class CorporaSearchEnv(SearchEnv):
-    """Search environment backed by the Corpora HTTP corpus API.
+class CgftSearchEnv(SearchEnv):
+    """Search environment backed by the CGFT HTTP API using BM25 search.
 
     Args:
-        api_key: API key for the corpus service
+        api_key: API key for the search service
         corpus_id: ID of the corpus to search
-        base_url: Base URL for the corpus API
-        dataset_path: Path to dataset JSONL file
+        base_url: Base URL for the API
     """
 
     def __init__(
@@ -26,17 +25,15 @@ class CorporaSearchEnv(SearchEnv):
         api_key: str,
         corpus_id: str,
         base_url: str,
-        dataset_path: str,
         **kwargs,
     ):
         self._api_key = api_key
         self._corpus_id = corpus_id
         self._base_url = base_url.rstrip("/")
-        self._dataset_path = dataset_path
 
         search_tool_definition = ToolDefinition(
-            name="search_corpus",
-            description="Search the corpus using BM25 with optional metadata and filename filtering.",
+            name="search",
+            description="Search using BM25 with optional metadata and filename filtering.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -62,17 +59,16 @@ class CorporaSearchEnv(SearchEnv):
         )
 
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {
-            search_tool_definition.name: (search_tool_definition, self._search_corpus_tool)
+            search_tool_definition.name: (search_tool_definition, self._search_tool)
         }
 
-        # Optional init of parent class to log reward computation
         super().__init__(
             experiment_id=kwargs.get("experiment_id"),
             api_key=kwargs.get("api_key"),
             **{k: v for k, v in kwargs.items() if k not in ("experiment_id", "api_key")},
         )
 
-    async def _search_corpus_tool(
+    async def _search_tool(
         self,
         query: str,
         metadata: dict[str, Any] | None = None,
@@ -80,7 +76,7 @@ class CorporaSearchEnv(SearchEnv):
         limit: int = 10,
         **kwargs,
     ) -> str:
-        """Search the corpus using BM25.
+        """Search using BM25.
 
         Args:
             query: Search query string
@@ -94,14 +90,12 @@ class CorporaSearchEnv(SearchEnv):
         if not query:
             return "Error: Missing required parameter: 'query'"
 
-        # Build request body
         request_body = {"query": query, "limit": limit}
         if metadata:
             request_body["metadata"] = metadata
         if filename:
             request_body["filename"] = filename
 
-        # Build URL
         url = f"{self._base_url}/api/corpora/{self._corpus_id}/search"
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -128,7 +122,6 @@ class CorporaSearchEnv(SearchEnv):
             if not results:
                 return "No results found."
 
-            # Format results
             lines = []
             for i, item in enumerate(results, start=1):
                 filename_val = item.get("filename", "—")

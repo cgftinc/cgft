@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import random
 from typing import TYPE_CHECKING, Any
+
+from .models import QADataPoint, ReferenceChunk
 
 if TYPE_CHECKING:
     from ..chunkers.models import Chunk, ChunkCollection
     from ..corpus.source import ChunkSource
-    from .models import QADataset
 
 # ============================================================================
 # Template Rendering and Parsing
@@ -32,6 +32,7 @@ def render_template(template: str, variables: dict[str, Any]) -> str:
 # ============================================================================
 # Chunk Filtering and Sampling
 # ============================================================================
+
 
 def filter_chunks_by_length(
     chunk_list: list[Chunk],
@@ -67,6 +68,7 @@ def filter_chunks_by_length(
                 filtered.append(chunk)
 
     return filtered
+
 
 # ============================================================================
 # Corpus Search Helpers
@@ -207,6 +209,7 @@ def print_sections(*sections: tuple[str, str]) -> None:
 # Batch Generation Helpers
 # ============================================================================
 
+
 def generate_single_hop_batch(
     source: ChunkSource,
     client: Any,
@@ -222,7 +225,7 @@ def generate_single_hop_batch(
     timeout: float = 120.0,
     show_progress: bool = True,
     max_questions: int | None = None,
-) -> QADataset:
+) -> list[QADataPoint]:
     """Generate single-hop QA pairs in batch using parallel LLM calls.
 
     Args:
@@ -243,27 +246,9 @@ def generate_single_hop_batch(
         max_questions: Maximum number of questions to keep per chunk (default None for no limit)
 
     Returns:
-        QADataset with generated QA pairs
-
-    Example:
-        ```python
-        from synthetic_data_prep.qa_generation.helpers import generate_single_hop_batch
-        from synthetic_data_prep.qa_generation.response_parsers import parse_single_hop_response
-
-        dataset = generate_single_hop_batch(
-            source=source,
-            client=client,
-            model="gpt-4",
-            system_prompt=single_hop_system_prompt,
-            user_template=single_hop_user_template,
-            num_samples=40,
-            response_parser=parse_single_hop_response,
-        )
-        print(dataset.summary())
-        ```
+        List of QADataPoints with generated single-hop QA pairs
     """
     from .batch_processor import batch_process_sync
-    from .models import QADataPoint, QADataset, ReferenceChunk
 
     # 1. Sample chunks
     sampled_chunks = source.sample_chunks(num_samples, min_chars=min_chunk_chars)
@@ -288,7 +273,7 @@ def generate_single_hop_batch(
     )
 
     # 4. Parse responses and collect QA pairs
-    dataset = QADataset()
+    dataset: list[QADataPoint] = []
     for i, response in enumerate(result.responses):
         chunk = sampled_chunks[i]
         confidence, qa_pairs = response_parser(response.answer)
@@ -296,24 +281,24 @@ def generate_single_hop_batch(
         if confidence.lower() == "low":
             continue
 
-        # Limit questions if max_questions is set
         if max_questions is not None:
             qa_pairs = qa_pairs[:max_questions]
 
         for qa in qa_pairs:
-            data_point = QADataPoint(
-                question=qa["query"],
-                answer=qa["answer"],
-                reference_chunks=[
-                    ReferenceChunk(
-                        id=chunk.hash,
-                        metadata=chunk.metadata_dict,
-                        content=chunk.content,
-                    )
-                ],
-                qa_type="single_hop",
+            dataset.append(
+                QADataPoint(
+                    question=qa["query"],
+                    answer=qa["answer"],
+                    reference_chunks=[
+                        ReferenceChunk(
+                            id=chunk.hash,
+                            metadata=chunk.metadata_dict,
+                            content=chunk.content,
+                        )
+                    ],
+                    qa_type="single_hop",
+                )
             )
-            dataset.add(data_point)
 
     return dataset
 
@@ -338,7 +323,7 @@ def generate_multi_hop_batch(
     timeout: float = 120.0,
     show_progress: bool = True,
     max_questions: int | None = None,
-) -> QADataset:
+) -> list[QADataPoint]:
     """Generate multi-hop QA pairs in batch using parallel LLM calls.
 
     Multi-hop generation is a two-step process:
@@ -369,26 +354,9 @@ def generate_multi_hop_batch(
         max_questions: Maximum number of questions to keep per chunk pair (default None for no limit)
 
     Returns:
-        QADataset with generated multi-hop QA pairs
-
-    Example:
-        ```python
-        dataset = generate_multi_hop_batch(
-            source=source,
-            client=client,
-            model="gpt-4",
-            related_query_system_prompt=related_chunk_system_prompt,
-            related_query_user_template=related_chunk_user_template,
-            multi_hop_system_prompt=multi_hop_system_prompt,
-            multi_hop_user_template=multi_hop_user_template,
-            num_samples=15,
-            related_query_parser=parse_related_queries_response,
-            multi_hop_parser=parse_multi_hop_validation_response,
-        )
-        ```
+        List of QADataPoints with generated multi-hop QA pairs
     """
     from .batch_processor import batch_process_sync
-    from .models import QADataPoint, QADataset, ReferenceChunk
 
     # 1. Sample chunks
     sampled_chunks = source.sample_chunks(num_samples, min_chars=min_chunk_chars)
@@ -425,10 +393,8 @@ def generate_multi_hop_batch(
         if confidence.lower() == "low" or not queries:
             continue
 
-        # Search for related chunks using BM25
         search_results = source.search_related(chunk_a, queries, top_k=top_k_bm25)
 
-        # Take top related chunks
         for result in search_results[:top_related_chunks]:
             chunk_b = result["chunk"]
             connecting_queries = result["queries"]
@@ -437,7 +403,7 @@ def generate_multi_hop_batch(
     if not chunk_pairs:
         if show_progress:
             print("No valid chunk pairs found for multi-hop generation.")
-        return QADataset()
+        return []
 
     if show_progress:
         print(f"\nStep 2: Validating {len(chunk_pairs)} chunk pairs for multi-hop QA...")
@@ -475,7 +441,7 @@ def generate_multi_hop_batch(
     )
 
     # 7. Parse responses and collect QA pairs
-    dataset = QADataset()
+    dataset: list[QADataPoint] = []
     for i, response in enumerate(multi_hop_result.responses):
         chunk_a, chunk_b, _ = chunk_pairs[i]
         qa_pairs = multi_hop_parser(response.answer)
@@ -483,29 +449,28 @@ def generate_multi_hop_batch(
         if not qa_pairs:
             continue
 
-        # Limit questions if max_questions is set
         if max_questions is not None:
             qa_pairs = qa_pairs[:max_questions]
 
         for qa in qa_pairs:
-            data_point = QADataPoint(
-                question=qa["question"],
-                answer=qa["answer"],
-                reference_chunks=[
-                    ReferenceChunk(
-                        id=chunk_a.hash,
-                        metadata=chunk_a.metadata_dict,
-                        content=chunk_a.content,
-                    ),
-                    ReferenceChunk(
-                        id=chunk_b.hash,
-                        metadata=chunk_b.metadata_dict,
-                        content=chunk_b.content,
-                    ),
-                ],
-                qa_type="multi_hop",
+            dataset.append(
+                QADataPoint(
+                    question=qa["question"],
+                    answer=qa["answer"],
+                    reference_chunks=[
+                        ReferenceChunk(
+                            id=chunk_a.hash,
+                            metadata=chunk_a.metadata_dict,
+                            content=chunk_a.content,
+                        ),
+                        ReferenceChunk(
+                            id=chunk_b.hash,
+                            metadata=chunk_b.metadata_dict,
+                            content=chunk_b.content,
+                        ),
+                    ],
+                    qa_type="multi_hop",
+                )
             )
-            dataset.add(data_point)
 
     return dataset
-

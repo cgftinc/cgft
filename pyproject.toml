@@ -57,4 +57,5 @@ strict_optional = true
 dev = [
     "jedi-language-server>=0.46.0",
     "jupyter>=1.1.1",
+    "turbopuffer>=1.16.2",
 ]

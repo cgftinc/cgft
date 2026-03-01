@@ -17,6 +17,7 @@ experiment_id = train(
         "base_url": BASE_URL,
     },
     dataset=dataset.to_list(),
+    prefix="cgft-search",
     api_key=API_KEY,
     local_modules=[synthetic_data_prep],
 )
@@ -33,6 +34,7 @@ experiment_id = train(
     env_class=CorporaSearchEnv,       # your environment class
     env_args={...},                   # constructor args (api_key, corpus_id, etc.)
     dataset=list_of_dicts,
+    prefix="cgft-search",             # namespace prefix for upload paths
     api_key=API_KEY,
     local_modules=[synthetic_data_prep],
 )

@@ -11,7 +11,7 @@ from synthetic_data_prep.qa_generation.helpers import (
     generate_single_hop_batch,
     render_template,
 )
-from synthetic_data_prep.qa_generation.models import QADataset
+from synthetic_data_prep.qa_generation.models import QADataPoint
 from synthetic_data_prep.qa_generation.response_parsers import (
     parse_corpus_summary_response,
     parse_multi_hop_validation_response,
@@ -31,9 +31,10 @@ def generate_dataset(
     model: str = "grok-4-fast-non-reasoning",
     model_endpoint: str = "http://app.cgft.io/api/llm",
     output_dir: str = "outputs",
-    max_questions_per_chunk: int = 2,
+    max_questions_per_chunk: int = 1,
+    train_ratio: float = 0.7,
     show_summary: bool = True,
-) -> QADataset:
+) -> tuple[list[QADataPoint], list[QADataPoint]]:
     """Generate synthetic QA dataset from corpus in one step.
 
     This function handles the complete QA generation pipeline:
@@ -53,13 +54,14 @@ def generate_dataset(
         model_endpoint: LLM API endpoint (default: "http://localhost:3000/api/llm")
         output_dir: Directory to save outputs (default: "outputs")
         max_questions_per_chunk: Max questions per chunk for diversity (default: 2)
+        train_ratio: Ratio of train-eval split
         show_summary: Whether to print summary information (default: True)
 
     Returns:
-        Combined QADataset with single-hop and multi-hop questions
+        Tuple of (train_dataset, eval_dataset) as lists of dicts (QADataPoint typed dict)
 
     Example:
-        >>> dataset = generate_dataset(
+        >>> train_dataset, eval_dataset = generate_dataset(
         ...     source=source,
         ...     api_key="your-api-key",
         ...     corpus_description="Posthog documentation",
@@ -67,12 +69,6 @@ def generate_dataset(
         ...     num_single_hop=40,
         ...     num_multi_hop=5
         ... )
-        Generating corpus summary and example queries...
-        Generating 40 single-hop QA pairs...
-        QADataset: 67 total data points
-        Generating 5 multi-hop QA pairs...
-        QADataset: 13 total data points
-        Combined dataset: 80 total data points
     """
     # Setup LLM client
     client = OpenAI(base_url=model_endpoint, api_key=api_key)
@@ -94,7 +90,7 @@ def generate_dataset(
     )
 
     if show_summary:
-        print(single_hop_dataset.summary())
+        print(f"Single-hop: {len(single_hop_dataset)} data points")
 
     # Generate multi-hop QA
     if show_summary:
@@ -110,26 +106,84 @@ def generate_dataset(
     )
 
     if show_summary:
-        print(multi_hop_dataset.summary())
+        print(f"Multi-hop: {len(multi_hop_dataset)} data points")
 
-    # Combine datasets
-    combined = single_hop_dataset.merge(multi_hop_dataset)
+    # Combine datasets and convert to dicts for saving
+    combined = [dp for dp in single_hop_dataset + multi_hop_dataset]
 
     if show_summary:
-        print(f"\nCombined dataset: {combined.summary()}")
+        print(f"\nCombined dataset: {len(combined)} total data points")
+
+    # Split into train/eval
+    train_dataset, eval_dataset = _train_eval_split(combined, train_ratio=train_ratio)
 
     # Save to files
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    yaml_path = f"{output_dir}/qa_dataset.yaml"
-    jsonl_path = f"{output_dir}/qa_dataset.jsonl"
 
-    save_qa_dataset(combined, yaml_path)
-    save_qa_dataset_jsonl(combined, jsonl_path)
+    train_yaml_path = f"{output_dir}/train_dataset.yaml"
+    train_jsonl_path = f"{output_dir}/train_dataset.jsonl"
+    eval_yaml_path = f"{output_dir}/eval_dataset.yaml"
+    eval_jsonl_path = f"{output_dir}/eval_dataset.jsonl"
+
+    save_qa_dataset(train_dataset, train_yaml_path)
+    save_qa_dataset_jsonl(train_dataset, train_jsonl_path)
+    save_qa_dataset(eval_dataset, eval_yaml_path)
+    save_qa_dataset_jsonl(eval_dataset, eval_jsonl_path)
 
     if show_summary:
-        print(f"\nSaved datasets:\n  YAML: {yaml_path}\n  JSONL: {jsonl_path}")
+        print(
+            f"\nSaved datasets:"
+            f"\n  Train ({len(train_dataset)}): {train_yaml_path}, {train_jsonl_path}"
+            f"\n  Eval ({len(eval_dataset)}):  {eval_yaml_path}, {eval_jsonl_path}"
+        )
 
-    return combined
+    return train_dataset, eval_dataset
+
+
+def _train_eval_split(
+    dataset: list[QADataPoint],
+    train_ratio: float = 0.7,
+    seed: int = 42,
+) -> tuple[list[QADataPoint], list[QADataPoint]]:
+    """Split a QA dataset into stratified train/validation sets by qa_type.
+
+    Args:
+        dataset: List of dicts (e.g. from QADataset.to_list())
+        train_ratio: Fraction of data to use for training (default 0.7)
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (train_dataset, val_dataset) as lists of dicts
+    """
+    rng = random.Random(seed)
+
+    # Group by qa_type
+    by_type: dict[str, list[QADataPoint]] = {}
+    for item in dataset:
+        qa_type = item.get("qa_type", "unknown")
+        by_type.setdefault(qa_type, []).append(item)
+
+    train_items: list[QADataPoint] = []
+    val_items: list[QADataPoint] = []
+
+    for _qa_type, items in by_type.items():
+        rng.shuffle(items)
+        split_idx = int(len(items) * train_ratio)
+
+        # Prevent empty splits
+        if split_idx == 0 and len(items) > 0:
+            split_idx = 1
+        elif split_idx == len(items) and len(items) > 1:
+            split_idx = len(items) - 1
+
+        train_items.extend(items[:split_idx])
+        val_items.extend(items[split_idx:])
+
+    # Shuffle to mix qa_types
+    rng.shuffle(train_items)
+    rng.shuffle(val_items)
+
+    return train_items, val_items
 
 
 # Internal helper functions
@@ -227,7 +281,7 @@ def _generate_single_hop(
     corpus_context: dict[str, str],
     num_samples: int,
     max_questions: int,
-) -> QADataset:
+) -> list[QADataPoint]:
     """Generate single-hop QA pairs."""
     single_hop_system_template = """You are generating realistic search queries for a RAG system.
 
@@ -295,7 +349,7 @@ def _generate_multi_hop(
     corpus_context: dict[str, str],
     num_samples: int,
     max_questions: int,
-) -> QADataset:
+) -> list[QADataPoint]:
     """Generate multi-hop QA pairs."""
 
     # Prompt for finding related chunks

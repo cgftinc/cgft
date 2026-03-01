@@ -1,19 +1,18 @@
 """This module provides a clean, high-level interface for launching training jobs:
 
-    from synthetic_data_prep.trainer.pipeline_new import train
+    from synthetic_data_prep.trainer.pipeline import train
 
     experiment_id = train(
         env_class=SearchEnv,
         env_args={"api_key": "..."},
-        dataset=[
-            {"query": "What is Python?", "answer": "A programming language"},
-            {"query": "What is ML?", "answer": "Machine Learning"}
-        ],
+        train_dataset=[...],
+        eval_dataset=[...],
+        prefix="my-search",
         api_key="your-api-key" # get from https://app.cgft.io/account/api-keys
     )
 
 The train() function handles everything automatically:
-- Uploads your dataset (as list of dicts)
+- Uploads your train and val datasets
 - Bundles and uploads your environment
 - Launches the training job
 - Returns the experiment ID
@@ -36,10 +35,11 @@ from synthetic_data_prep.trainer.client import RolloutClient, StorageClient, Tra
 
 def upload_dataset(
     dataset: list[dict[str, Any]],
+    prefix: str,
     api_key: str,
-    dataset_id: str | None = None,
     base_url: str = "https://app.cgft.io",
     dataset_name: str = "dataset.jsonl",
+    content_hash: str | None = None,
     show_summary: bool = True,
 ) -> str:
     """Upload dataset to storage for training.
@@ -49,33 +49,26 @@ def upload_dataset(
 
     Args:
         dataset: List of dicts representing the dataset
-        dataset_id: Unique identifier for this dataset. If None, auto-generates from dataset hash.
+        prefix: Namespace prefix for the upload path (e.g., "cgft-search", "tpuf-search")
         api_key: API key for storage service
         base_url: Base URL for API (default: https://app.cgft.io)
         dataset_name: Filename for the dataset (default: "dataset.jsonl")
+        content_hash: Optional pre-computed hash for the path. If None, auto-generated from dataset content.
         show_summary: Whether to print summary information (default: True)
 
     Returns:
         Blob path of uploaded dataset
 
     Examples:
-        >>> # Upload with auto-generated ID
         >>> upload_dataset(
         ...     dataset=[
         ...         {"query": "What is Python?", "answer": "A programming language"},
         ...         {"query": "What is ML?", "answer": "Machine Learning"}
         ...     ],
+        ...     prefix="cgft-search",
         ...     api_key="your-api-key"
         ... )
-        Dataset uploaded to: datasets/dataset-a1b2c3d4/dataset.jsonl
-
-        >>> # Upload with explicit ID
-        >>> upload_dataset(
-        ...     dataset=[...],
-        ...     dataset_id="qa-pairs-v1",
-        ...     api_key="your-api-key"
-        ... )
-        Dataset uploaded to: datasets/qa-pairs-v1/dataset.jsonl
+        Dataset uploaded to: datasets/cgft-search/a1b2c3d4/dataset.jsonl
     """
     storage_client = StorageClient(api_key=api_key, base_url=base_url)
 
@@ -84,18 +77,14 @@ def upload_dataset(
     content_str = "\n".join(jsonl_lines)
     content_bytes = content_str.encode("utf-8")
 
-    # Auto-generate dataset_id from content hash if not provided
-    if dataset_id is None:
+    if content_hash is None:
         content_hash = hashlib.sha256(content_bytes).hexdigest()[:8]
-        dataset_id = f"dataset-{content_hash}"
-        if show_summary:
-            print(f"Auto-generated dataset_id: {dataset_id}")
 
     if show_summary:
         print(f"Uploading dataset ({len(dataset)} items, {len(content_bytes)} bytes)...")
 
     # Construct path and upload
-    dataset_path = f"datasets/{dataset_id}/{dataset_name}"
+    dataset_path = f"datasets/{prefix}/{content_hash}/{dataset_name}"
 
     result = storage_client.upload_file(
         path=dataset_path,
@@ -112,6 +101,7 @@ def upload_dataset(
 def upload_env(
     env_class: type,
     constructor_args: dict[str, Any],
+    prefix: str,
     api_key: str,
     base_url: str = "https://app.cgft.io",
     pip_dependencies: list[str] | None = None,
@@ -124,6 +114,7 @@ def upload_env(
     Args:
         env_class: Environment class (e.g., SearchEnv, SummarizationEnv)
         constructor_args: Arguments to pass to env class constructor
+        prefix: Namespace prefix for the upload path (e.g., "cgft-search", "tpuf-search")
         api_key: API key for storage service
         base_url: Base URL for API (default: https://app.cgft.io)
         pip_dependencies: List of pip dependencies (default: ["aiohttp"])
@@ -135,34 +126,14 @@ def upload_env(
         Tuple of (env_blob_path, env_metadata_blob_path)
 
     Examples:
-        >>> # Auto-infers "search" from SearchEnv
-        >>> from my_envs import SearchEnv
         >>> env_path, meta_path = upload_env(
         ...     env_class=SearchEnv,
-        ...     constructor_args={"api_key": "...", "dataset_path": "..."},
+        ...     constructor_args={"api_key": "..."},
+        ...     prefix="cgft-search",
         ...     api_key="your-api-key"
         ... )
-        Bundling SearchEnv (type: search)...
-        Env uploaded to: ~/user-data/envs/search/a1b2c3d4/search-env-cls.pkl
-
-        >>> # Auto-infers "summarization" from SummarizationEnv
-        >>> from my_envs import SummarizationEnv
-        >>> env_path, meta_path = upload_env(
-        ...     env_class=SummarizationEnv,
-        ...     constructor_args={"model": "gpt-4"},
-        ...     api_key="your-api-key"
-        ... )
-        Bundling SummarizationEnv (type: summarization)...
-        Env uploaded to: ~/user-data/envs/summarization/e5f6g7h8/summarization-env-cls.pkl
-
-        >>> # Custom environment type
-        >>> env_path, meta_path = upload_env(
-        ...     env_class=MyTaskEnv,
-        ...     constructor_args={},
-        ...     api_key="your-api-key"
-        ... )
-        Bundling MyTaskEnv (type: custom_task)...
-        Env uploaded to: ~/user-data/envs/custom_task/i9j0k1l2/custom_task-env-cls.pkl
+        Bundling SearchEnv...
+        Env uploaded to: envs/cgft-search/a1b2c3d4/env-cls.pkl
     """
     from benchmax.bundle.bundler import bundle_env, write_bundle_files
     from benchmax.bundle.validator import validate_bundle
@@ -209,7 +180,7 @@ def upload_env(
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         pickle_path = tmp_path / "env-cls.pkl"
-        metadata_path = tmp_path / "env-meta.json"
+        metadata_path = tmp_path / "env-metadata.json"
         write_bundle_files(bundle, pickle_path, metadata_path)
         env_cls_bytes = pickle_path.read_bytes()
         env_meta_bytes = metadata_path.read_bytes()
@@ -220,14 +191,14 @@ def upload_env(
     # Upload to storage
     storage_client = StorageClient(api_key=api_key, base_url=base_url)
 
-    env_path = f"envs/{content_hash}/env-cls.pkl"
+    env_path = f"envs/{prefix}/{content_hash}/env-cls.pkl"
     env_result = storage_client.upload_file(
         path=env_path,
         content=env_cls_bytes,
         mime_type="application/octet-stream",
     )
 
-    env_metadata_path = f"envs/{content_hash}/env-meta.json"
+    env_metadata_path = f"envs/{prefix}/{content_hash}/env-metadata.json"
     env_meta_result = storage_client.upload_file(
         path=env_metadata_path,
         content=env_meta_bytes,
@@ -235,60 +206,21 @@ def upload_env(
     )
 
     if show_summary:
-        print(f"Env uploaded to: ~/user-data/{env_result['blobPath']}")
+        print(f"Env uploaded to: {env_result['blobPath']}")
 
-    return f"~/user-data/{env_result['blobPath']}", f"~/user-data/{env_meta_result['blobPath']}"
-
-
-def launch_job(
-    env_cls_blob_path: str,
-    env_metadata_blob_path: str,
-    api_key: str,
-    base_url: str = "https://app.cgft.io",
-    experiment_type: str = "simple",
-    show_summary: bool = True,
-) -> str:
-    """Launch training experiment from uploaded environment paths.
-
-    Low-level function for launching when you've already uploaded the environment.
-    For most use cases, use train() instead for a simpler interface.
-
-    Args:
-        env_cls_blob_path: Blob path to uploaded environment class (.pkl file)
-        env_metadata_blob_path: Blob path to uploaded environment metadata (.json file)
-        api_key: API key for trainer service
-        base_url: Base URL for API (default: https://app.cgft.io)
-        experiment_type: Type of experiment. If None, inferred from env path.
-        show_summary: Whether to print summary information (default: True)
-
-    Returns:
-        Experiment ID string
-    """
-
-    if show_summary:
-        print(f"Launching experiment (type: {experiment_type})...")
-
-    trainer_client = TrainerClient(api_key=api_key, base_url=base_url)
-    experiment_id = trainer_client.launch_experiment(
-        experiment_type=experiment_type,
-        env_cls_path=env_cls_blob_path,
-        env_metadata_path=env_metadata_blob_path,
-    )
-
-    if show_summary:
-        print(f"Experiment launched! ID: {experiment_id}")
-        print(f"View experiment: {base_url}/experiments/{experiment_id}")
-
-    return experiment_id
+    return env_result["blobPath"], env_meta_result["blobPath"]
 
 
 def train(
     env_class: type,
     env_args: dict[str, Any],
-    dataset: list[dict[str, Any]],
+    train_dataset: list[dict],
+    eval_dataset: list[dict],
+    prefix: str,
     api_key: str,
-    dataset_id: str | None = None,
     base_url: str = "https://app.cgft.io",
+    experiment_type: str = "simple",
+    experiment_name: str | None = None,
     # Optional customization
     pip_dependencies: list[str] | None = None,
     local_modules: list | None = None,
@@ -299,7 +231,7 @@ def train(
     """Train a model - the simplest interface for launching training jobs.
 
     This is the recommended high-level function that handles everything:
-    1. Uploads your dataset
+    1. Uploads your train and val datasets
     2. Bundles and uploads your environment
     3. Validates the environment remotely (optional)
     4. Launches the training job
@@ -308,10 +240,13 @@ def train(
     Args:
         env_class: Environment class (e.g., SearchEnv, SummarizationEnv)
         env_args: Constructor arguments for the environment
-        dataset: List of dicts representing the dataset
+        train_dataset: List of dicts for the training split
+        eval_dataset: List of dicts for the validation split
+        prefix: Namespace prefix for upload paths (e.g., "cgft-search", "tpuf-search")
         api_key: API key for the service
-        dataset_id: Unique identifier for the dataset. If None, auto-generates from dataset hash.
         base_url: Base URL for API (default: https://app.cgft.io)
+        experiment_type: Type of experiment (default: "simple")
+        experiment_name: Optional name for the experiment (default: None)
         pip_dependencies: List of pip dependencies for the environment
         local_modules: List of local modules to include in environment bundle
         validate_env: Whether to validate environment locally before upload. (default: True)
@@ -322,22 +257,38 @@ def train(
         Experiment ID string
     """
 
-    # Upload dataset
-    dataset_blob_path = upload_dataset(
-        dataset=dataset,
+    # Compute shared hash from combined dataset
+    combined_lines = [json.dumps(item, sort_keys=True) for item in train_dataset + eval_dataset]
+    dataset_hash = hashlib.sha256("\n".join(combined_lines).encode("utf-8")).hexdigest()[:8]
+
+    # Upload train dataset
+    train_blob_path = upload_dataset(
+        dataset=train_dataset,
+        prefix=prefix,
         api_key=api_key,
-        dataset_id=dataset_id,
+        dataset_name="train_dataset.jsonl",
+        content_hash=dataset_hash,
         base_url=base_url,
         show_summary=show_summary,
     )
 
-    # Update env_args to include dataset path
+    # Upload val dataset
+    eval_blob_path = upload_dataset(
+        dataset=eval_dataset,
+        prefix=prefix,
+        api_key=api_key,
+        dataset_name="eval_dataset.jsonl",
+        content_hash=dataset_hash,
+        base_url=base_url,
+        show_summary=show_summary,
+    )
+
+    # Update env_args to include dataset paths
     env_args_with_dataset = env_args.copy()
-    if "dataset_path" not in env_args_with_dataset:
-        env_args_with_dataset["dataset_path"] = f"~/user-data/{dataset_blob_path}"
+    env_args_with_dataset["train_dataset_path"] = f"~/user-data/{train_blob_path}"
+    env_args_with_dataset["val_dataset_path"] = f"~/user-data/{eval_blob_path}"
 
     # Upload environment
-    # make sure local env modules are bundled
     if not local_modules:
         local_modules = []
     env_module = sys.modules[env_class.__module__]
@@ -346,6 +297,7 @@ def train(
     env_blob_path, env_meta_blob_path = upload_env(
         env_class=env_class,
         constructor_args=env_args_with_dataset,
+        prefix=prefix,
         api_key=api_key,
         base_url=base_url,
         pip_dependencies=pip_dependencies,
@@ -354,21 +306,13 @@ def train(
         show_summary=show_summary,
     )
 
-    # Smoke-test the uploaded environment on the rollout server with a couple
-    # of raw examples before committing to a full training run.
+    # Smoke-test the uploaded environment on the rollout server
     if validate_env_remotely:
-        # env_blob_path has a "~/user-data/" prefix — strip it so the rollout
-        # server receives a plain blob path it can resolve against the user's
-        # container (same convention as build_env_blob() in the e2e tests).
-        def _strip_userdata(p: str) -> str:
-            prefix = "~/user-data/"
-            return p[len(prefix) :] if p.startswith(prefix) else p
-
         rollout_client = RolloutClient(api_key=api_key)
         passed = rollout_client.validate_examples(
-            examples=dataset,
-            env_cls_path=_strip_userdata(env_blob_path),
-            env_metadata_path=_strip_userdata(env_meta_blob_path),
+            examples=eval_dataset,
+            env_cls_path=env_blob_path,
+            env_metadata_path=env_meta_blob_path,
         )
         if not passed:
             raise RuntimeError(
@@ -377,12 +321,21 @@ def train(
             )
 
     # Launch training job
-    experiment_id = launch_job(
-        env_cls_blob_path=env_blob_path,
-        env_metadata_blob_path=env_meta_blob_path,
-        api_key=api_key,
-        base_url=base_url,
-        show_summary=show_summary,
+    if show_summary:
+        print(f"Launching experiment (type: {experiment_type})...")
+
+    trainer_client = TrainerClient(api_key=api_key, base_url=base_url)
+    experiment_id = trainer_client.launch_experiment(
+        experiment_type=experiment_type,
+        env_cls_path=env_blob_path,
+        env_metadata_path=env_meta_blob_path,
+        train_dataset_path=train_blob_path,
+        eval_dataset_path=eval_blob_path,
+        name=experiment_name,
     )
+
+    if show_summary:
+        print(f"Experiment launched! ID: {experiment_id}")
+        print(f"View experiment: {base_url}/experiments/{experiment_id}")
 
     return experiment_id

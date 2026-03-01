@@ -7,18 +7,18 @@ generating question-answer pairs automatically from your corpus for training sea
 see [notebooks/simple_rag_pipeline.ipynb](https://github.com/cgftinc/synthetic-data-prep-lib/blob/main/notebooks/simple_rag_pipeline.ipynb) for a full working example.
 
 ```python
+import synthetic_data_prep
 from synthetic_data_prep.corpus.corpora.source import CorporaChunkSource
-from synthetic_data_prep.qa_generation import generate_dataset
+from synthetic_data_prep.qa_generation.pipeline import generate_dataset
 from synthetic_data_prep.envs.corpora_search_env import CorporaSearchEnv
 from synthetic_data_prep.trainer.pipeline import train
-import synthetic_data_prep
 
 # 1. Point to dataset
 source = CorporaChunkSource(api_key=API_KEY, corpus_name="my-docs", base_url=BASE_URL)
 source.populate_from_folder("./samples/posthog")
 
 # 2. Create synthetic QA
-dataset = generate_dataset(
+train_data, val_data  = generate_dataset(
     source=source,
     api_key=API_KEY,
     corpus_description="Posthog documentation",
@@ -35,7 +35,9 @@ experiment_id = train(
         "corpus_id": source.corpus_id,
         "base_url": BASE_URL,
     },
-    dataset=dataset.to_list(),
+    train_dataset=train_data,
+    val_dataset=val_data,
+    prefix="cgft-search",
     api_key=API_KEY,
     local_modules=[synthetic_data_prep],
 )

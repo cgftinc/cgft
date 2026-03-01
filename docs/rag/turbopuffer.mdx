@@ -43,7 +43,7 @@ source = TpufChunkSource(
 source.populate_from_folder("./samples/posthog")
 
 # 2. Create synthetic QA
-dataset = generate_dataset(
+train_data, eval_data = generate_dataset(
     source=source,
     api_key=API_KEY,
     corpus_description="Posthog documentation",
@@ -58,7 +58,9 @@ experiment_id = train(
         "namespace": "my-docs",
         "region": "aws-us-east-1",
     },
-    dataset=dataset.to_list(),
+    train_dataset=train_data,
+    val_dataset=eval_data,
+    prefix="tpuf-search",
     api_key=API_KEY,
     local_modules=[synthetic_data_prep],
     pip_dependencies=["turbopuffer"],

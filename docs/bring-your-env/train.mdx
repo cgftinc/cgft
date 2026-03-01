@@ -23,6 +23,7 @@ experiment_id = train(
     env_class=ReverseEnv,   # your BaseEnv subclass — defines tools, reward, and dataset loading
     env_args={},            # constructor args passed to ReverseEnv(...); omit dataset_path, it's injected automatically
     dataset=dataset,        # dataset is expected to be a list of dicts; it will be serialized to JSONL and uploaded to blob storage
+    prefix="reverse",       # namespace prefix for upload paths (e.g., datasets/reverse/<hash>/...)
     api_key=API_KEY,        # from https://app.cgft.io/account/api-keys
 )
 ```
@@ -35,7 +36,7 @@ see [notebooks/reverse_env.ipynb](https://github.com/cgft-io/synthetic-data-prep
 
 **1. upload dataset**
 
-serializes your dataset to JSONL (one JSON object per line) and uploads it to blob storage. if you don't pass a `dataset_id`, one is auto-generated from a hash of the content — so the same dataset always gets the same ID and won't be re-uploaded unnecessarily.
+serializes your dataset to JSONL (one JSON object per line) and uploads it to blob storage under `datasets/{prefix}/{content_hash}/`. the path is auto-generated from a hash of the content — so the same dataset always gets the same path and won't be re-uploaded unnecessarily.
 
 **2. bundle and upload environment**
 
