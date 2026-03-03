@@ -14,6 +14,9 @@ build/
 venv/
 ENV/
 
+# Local environment variables
+.env.local
+
 # uv
 uv.lock
 
