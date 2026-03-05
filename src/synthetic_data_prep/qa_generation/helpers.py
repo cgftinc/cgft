@@ -275,6 +275,9 @@ def generate_single_hop_batch(
     # 4. Parse responses and collect QA pairs
     dataset: list[QADataPoint] = []
     for i, response in enumerate(result.responses):
+        if response is None:
+            continue
+
         chunk = sampled_chunks[i]
         confidence, qa_pairs = response_parser(response.answer)
 
@@ -387,6 +390,9 @@ def generate_multi_hop_batch(
     chunk_pairs = []  # List of (chunk_a, chunk_b, connecting_queries)
 
     for i, response in enumerate(related_result.responses):
+        if response is None:
+            continue
+
         chunk_a = sampled_chunks[i]
         confidence, queries = related_query_parser(response.answer)
 
@@ -443,6 +449,9 @@ def generate_multi_hop_batch(
     # 7. Parse responses and collect QA pairs
     dataset: list[QADataPoint] = []
     for i, response in enumerate(multi_hop_result.responses):
+        if response is None:
+            continue
+
         chunk_a, chunk_b, _ = chunk_pairs[i]
         qa_pairs = multi_hop_parser(response.answer)
 
