@@ -136,7 +136,7 @@ class CgftSearchEnv(SearchEnv):
                     lines.append(f"   Metadata: {metadata_val}")
 
             lines.append(f"\nTotal: {total} results")
-            return "\n".join(lines)
+            return self._truncate_tool_output("\n".join(lines))
 
         except aiohttp.ClientError as e:
             return f"Error: Network error: {str(e)}"

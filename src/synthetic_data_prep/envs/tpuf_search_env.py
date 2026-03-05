@@ -110,4 +110,4 @@ class TpufSearchEnv(SearchEnv):
                 content = json.dumps({f: getattr(row, f, "") for f in self._fields}, default=str)
             lines.append(f"{i}. {score_str}\n   Content: {content}")
 
-        return "\n".join(lines)
+        return self._truncate_tool_output("\n".join(lines))
