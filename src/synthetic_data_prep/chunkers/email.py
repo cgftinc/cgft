@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
-from synthetic_data_prep.preprocess.email.schema import validate_rows
+from synthetic_data_prep.preprocess.email.schema import date_yyyy_mm_dd, extract_participants, validate_rows
 
 SHARED_PREFIX_THRESHOLD = 4
 CONTEXT_TAIL_FOR_BRANCH = 3
@@ -35,7 +35,7 @@ def _format_address(address: dict) -> str:
 
 def _format_email_block(email_message: dict, reply_chain_message_index: int | None = None) -> str:
     """Format a single email as a text block for chunk content."""
-    date_str = (email_message.get("date") or "")[:10] or "unknown date"
+    date_str = date_yyyy_mm_dd(email_message.get("date")) or "unknown date"
 
     from_address = email_message.get("from") if isinstance(email_message.get("from"), dict) else {}
     from_str = _format_address(from_address)
@@ -54,29 +54,6 @@ def _format_email_block(email_message: dict, reply_chain_message_index: int | No
 
     body = (email_message.get("body") or "").strip()
     return f"{header}\n{body}"
-
-
-def _unique_participants(email_messages: list[dict]) -> str:
-    """Return stable comma-separated participant list across a sequence."""
-    seen: set[str] = set()
-    participants: list[str] = []
-
-    for email_message in email_messages:
-        from_address = email_message.get("from") if isinstance(email_message.get("from"), dict) else {}
-        from_name = (from_address.get("name") or from_address.get("email") or "").strip()
-        if from_name and from_name not in seen:
-            seen.add(from_name)
-            participants.append(from_name)
-
-        to_addresses = email_message.get("to") if isinstance(email_message.get("to"), list) else []
-        cc_addresses = email_message.get("cc") if isinstance(email_message.get("cc"), list) else []
-        for address in to_addresses + cc_addresses:
-            address_name = (address.get("name") or address.get("email") or "").strip()
-            if address_name and address_name not in seen:
-                seen.add(address_name)
-                participants.append(address_name)
-
-    return ", ".join(participants)
 
 
 def _coerce_date_sort_key(date_value: object, message_id: str) -> tuple[int, str, str]:
@@ -644,11 +621,13 @@ class EmailChunker:
                 window_message_orders = [message_order for message_order, _ in window_messages]
                 window_start_order = min(window_message_orders)
                 window_end_order = max(window_message_orders)
-                participants = _unique_participants(window_only_messages)
-                date_start = (window_only_messages[0].get("date") or "")[:10]
-                date_end = (window_only_messages[-1].get("date") or "")[:10]
+                participant_info = extract_participants(window_only_messages)
+                participants_display = str(participant_info["display"])
+                participants = list(participant_info["tokens"])
+                date_start = date_yyyy_mm_dd(window_only_messages[0].get("date"))
+                date_end = date_yyyy_mm_dd(window_only_messages[-1].get("date"))
 
-                content = f"Thread: {subject}\n\n" + "\n\n".join(blocks)
+                content = f"Thread: {subject}\nParticipants: {participants_display}\n\n" + "\n\n".join(blocks)
                 chunk_id = f"{chain_key}-{chunk_index_in_path + 1}"
                 path_chunk_descriptors.append(
                     {
@@ -660,6 +639,7 @@ class EmailChunker:
                         "date_start": date_start,
                         "date_end": date_end,
                         "participants": participants,
+                        "thread_message_count": len(path_messages),
                         "email_count": len(window_messages),
                     }
                 )
@@ -695,6 +675,7 @@ class EmailChunker:
                     ("date_start", descriptor["date_start"]),
                     ("date_end", descriptor["date_end"]),
                     ("participants", descriptor["participants"]),
+                    ("thread_message_count", descriptor["thread_message_count"]),
                     ("email_count", descriptor["email_count"]),
                 )
                 chunks.append(Chunk(content=str(descriptor["content"]), metadata=metadata))
