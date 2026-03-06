@@ -36,3 +36,6 @@ htmlcov/
 notebooks/.ipynb_checkpoints/
 notebooks/samples/
 notebooks/outputs/
+
+# Working Demo
+demo*/
