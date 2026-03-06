@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from synthetic_data_prep.chunkers.models import Chunk
+    from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
+
 
 
 @runtime_checkable
@@ -32,6 +33,16 @@ class ChunkSource(Protocol):
     ) -> None:
         """Chunk documents in a folder and upload to the backend corpus."""
         ...
+
+    def populate_from_chunks(
+        self,
+        collection: "ChunkCollection",
+        batch_size: int = 100,
+        show_summary: bool = True,
+    ) -> None:
+        """Upload a pre-built ChunkCollection to the Corpora API.
+        """
+
 
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
         """Return n randomly sampled chunks, filtered by minimum character length."""

@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 
 from synthetic_data_prep.chunkers.inspector import ChunkInspector
 from synthetic_data_prep.chunkers.markdown import MarkdownChunker
-from synthetic_data_prep.chunkers.models import Chunk
+from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
 
 
 class TpufChunkSource:
@@ -139,11 +139,36 @@ class TpufChunkSource:
 
         chunker = MarkdownChunker(min_char=min_chars, max_char=max_chars, chunk_overlap=overlap_chars)
         collection = chunker.chunk_folder(docs_path, file_extensions=file_extensions)
-        all_chunks = list(collection)
 
         if show_summary:
             inspector = ChunkInspector(collection)
             inspector.summary(max_depth=3, max_files_per_folder=4)
+        self.populate_from_chunks(
+            collection=collection,
+            embed_fn=embed_fn,
+            batch_size=batch_size,
+            show_summary=show_summary,
+        )
+
+    def populate_from_chunks(
+        self,
+        collection: ChunkCollection,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+        batch_size: int = 100,
+        show_summary: bool = True,
+    ) -> None:
+        """Upload a pre-built ChunkCollection to Turbopuffer.
+
+        Args:
+            collection: ChunkCollection produced by any chunker.
+            embed_fn: Optional callable that maps list[str] -> list[list[float]].
+                      If provided, vector embeddings are stored alongside text.
+            batch_size: Number of chunks per upload batch (default 100).
+            show_summary: Print upload progress (default True).
+        """
+        all_chunks = list(collection)
+
+        if show_summary:
             print(f"\nUploading {len(all_chunks)} chunks to Turbopuffer namespace...")
 
         for batch_start in tqdm(
@@ -168,10 +193,12 @@ class TpufChunkSource:
                 }
                 for i, chunk in enumerate(batch)
             ]
-            
 
-            write_kwargs: dict = {"upsert_rows": upsert_rows, "schema": {"content": {"type": "string", "full_text_search": True}}}
-            
+            write_kwargs: dict = {
+                "upsert_rows": upsert_rows,
+                "schema": {"content": {"type": "string", "full_text_search": True}},
+            }
+
             # Inject vectors and add distance metric if an embedding function was provided
             if embed_fn:
                 for row, v in zip(upsert_rows, embed_fn([chunk.content for chunk in batch])):
