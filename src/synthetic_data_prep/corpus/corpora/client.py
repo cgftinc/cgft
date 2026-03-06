@@ -275,6 +275,7 @@ class CorpusClient:
         limit: int = 10,
         offset: int = 0,
         metadata: dict[str, Any] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> SearchResult:
         """BM25 search within a corpus.
 
@@ -284,6 +285,14 @@ class CorpusClient:
             limit: Maximum results to return
             offset: Pagination offset
             metadata: Optional metadata filter
+            filters: Optional structured filter DSL.
+                Example:
+                {
+                    "and": [
+                        {"field": "date_start", "op": "gte", "value": "2017-01-01"},
+                        {"field": "participants", "op": "contains_any", "value": ["angel"]},
+                    ]
+                }
 
         Returns:
             SearchResult with results and total count
@@ -291,6 +300,8 @@ class CorpusClient:
         payload: dict[str, Any] = {"query": query, "limit": limit, "offset": offset}
         if metadata:
             payload["metadata"] = metadata
+        if filters:
+            payload["filters"] = filters
 
         response = self._http_client.post(f"/api/corpora/{corpus_id}/search", json=payload)
         self._handle_response_errors(response)
@@ -314,6 +325,8 @@ class CorpusClient:
         query: str,
         collection: ChunkCollection,
         limit: int = 10,
+        metadata: dict[str, Any] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[tuple[Chunk, float]]:
         """Search and return matching local Chunk objects with scores.
 
@@ -324,11 +337,19 @@ class CorpusClient:
             query: Search query
             collection: Local ChunkCollection
             limit: Max results
+            metadata: Optional exact-match metadata filter
+            filters: Optional structured filter DSL
 
         Returns:
             List of (Chunk, score) tuples
         """
-        result = self.search(corpus_id, query, limit=limit)
+        result = self.search(
+            corpus_id=corpus_id,
+            query=query,
+            limit=limit,
+            metadata=metadata,
+            filters=filters,
+        )
 
         matched: list[tuple[Chunk, float]] = []
         for corpus_chunk in result.results:

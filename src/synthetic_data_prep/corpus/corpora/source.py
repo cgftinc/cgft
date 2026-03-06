@@ -6,9 +6,20 @@ import random
 from typing import TYPE_CHECKING
 
 from .client import CorpusClient
+from .filter_mapper import to_corpora_filters
 from synthetic_data_prep.chunkers.inspector import ChunkInspector
 from synthetic_data_prep.chunkers.markdown import MarkdownChunker
 from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
+from synthetic_data_prep.corpus.search_schema.search_exceptions import (
+    InvalidSearchSpecError,
+    UnsupportedSearchModeError,
+)
+from synthetic_data_prep.corpus.search_schema.search_types import (
+    FilterPredicate,
+    SearchCapabilities,
+    SearchSpec,
+    validate_search_spec_shape,
+)
 
 if TYPE_CHECKING:
     from .models import Corpus
@@ -41,6 +52,17 @@ class CorporaChunkSource:
         self._corpus_name = corpus_name
         self._corpus: Corpus | None = None
         self.collection: ChunkCollection | None = None  # exposed publicly for advanced users
+        self._search_capabilities: SearchCapabilities = {
+            "backend": "corpora",
+            "modes": {"lexical"},
+            "filter_ops": {
+                "field": {"eq", "in", "gte", "lte", "contains_any", "contains_all"},
+                "logical": {"and", "or", "not"},
+            },
+            "ranking": {"bm25"},
+            "constraints": {"max_top_k": 1000},
+            "graph_expansion": True,
+        }
 
     def populate_from_folder(
         self,
@@ -192,3 +214,48 @@ class CorporaChunkSource:
             key=lambda x: (len(x["queries"]), not x["same_file"], x["max_score"]),
             reverse=True,
         )
+
+    def search(self, spec: SearchSpec) -> list[Chunk]:
+        """Search chunks using a structured search spec."""
+        mode = spec.get("mode")
+        supported_modes = set(self._search_capabilities.get("modes", set()))
+        if mode not in supported_modes:
+            raise UnsupportedSearchModeError(
+                backend=str(self._search_capabilities.get("backend", "unknown")),
+                mode=str(mode),
+                supported_modes={str(m) for m in supported_modes},
+            )
+
+        shape_errors = validate_search_spec_shape(spec)
+        if shape_errors:
+            raise InvalidSearchSpecError(
+                backend=str(self._search_capabilities.get("backend", "unknown")),
+                message="; ".join(shape_errors),
+                spec=spec,
+            )
+
+        self._assert_ready()
+        filters = to_corpora_filters(spec.get("filter"), self._search_capabilities)
+        matched = self._client.search_with_chunks(
+            corpus_id=self._corpus.id,
+            query=str(spec.get("text_query") or ""),
+            collection=self.collection,
+            limit=int(spec.get("top_k", 10)),
+            filters=filters,
+        )
+        return [chunk for chunk, _score in matched]
+
+    def search_text(
+        self,
+        text_query: str,
+        top_k: int = 10,
+        filter: FilterPredicate | None = None,
+    ) -> list[Chunk]:
+        """Search chunks with a text query and optional filter."""
+        return self.search(
+            SearchSpec(mode="lexical", text_query=text_query, top_k=top_k, filter=filter)
+        )
+
+    def get_search_capabilities(self) -> SearchCapabilities:
+        """Return search capabilities for Corpora backend."""
+        return self._search_capabilities
