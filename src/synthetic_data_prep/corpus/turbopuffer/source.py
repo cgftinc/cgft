@@ -76,7 +76,7 @@ class TpufChunkSource:
                 "logical": {"and", "or", "not"},
             },
             "ranking": {"bm25"},
-            "constraints": {"max_top_k": 1000, "vector_dimensions": None},
+            "constraints": {"max_top_k": 10000, "vector_dimensions": None},
             "graph_expansion": False,
         }
 
