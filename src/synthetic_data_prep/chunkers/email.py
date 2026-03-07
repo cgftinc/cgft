@@ -56,6 +56,20 @@ def _format_email_block(email_message: dict, reply_chain_message_index: int | No
     return f"{header}\n{body}"
 
 
+def _compact_participants_display(display_text: str, max_names: int = 3) -> str:
+    """Return a short participants summary for the chunk header."""
+    names = [name.strip() for name in display_text.split(",") if name.strip()]
+    if not names:
+        return "unknown"
+
+    visible = names[:max_names]
+    remainder = len(names) - len(visible)
+    summary = ", ".join(visible)
+    if remainder > 0:
+        summary = f"{summary} (+{remainder} more)"
+    return summary
+
+
 def _coerce_date_sort_key(date_value: object, message_id: str) -> tuple[int, str, str]:
     """Return a deterministic date sort key.
 
@@ -622,12 +636,22 @@ class EmailChunker:
                 window_start_order = min(window_message_orders)
                 window_end_order = max(window_message_orders)
                 participant_info = extract_participants(window_only_messages)
-                participants_display = str(participant_info["display"])
+                participants_display = _compact_participants_display(str(participant_info["display"]))
                 participants = list(participant_info["tokens"])
                 date_start = date_yyyy_mm_dd(window_only_messages[0].get("date"))
                 date_end = date_yyyy_mm_dd(window_only_messages[-1].get("date"))
+                date_range_display = (
+                    f"{date_start} to {date_end}"
+                    if date_start and date_end
+                    else date_start or date_end or "unknown"
+                )
 
-                content = f"Thread: {subject}\nParticipants: {participants_display}\n\n" + "\n\n".join(blocks)
+                content = (
+                    f"Subject: {subject or 'unknown'}\n"
+                    f"Date: {date_range_display}\n"
+                    f"Participants: {participants_display}\n\n"
+                    + "\n\n".join(blocks)
+                )
                 chunk_id = f"{chain_key}-{chunk_index_in_path + 1}"
                 path_chunk_descriptors.append(
                     {
@@ -640,7 +664,6 @@ class EmailChunker:
                         "date_end": date_end,
                         "participants": participants,
                         "thread_message_count": len(path_messages),
-                        "email_count": len(window_messages),
                     }
                 )
 
@@ -676,7 +699,6 @@ class EmailChunker:
                     ("date_end", descriptor["date_end"]),
                     ("participants", descriptor["participants"]),
                     ("thread_message_count", descriptor["thread_message_count"]),
-                    ("email_count", descriptor["email_count"]),
                 )
                 chunks.append(Chunk(content=str(descriptor["content"]), metadata=metadata))
 
