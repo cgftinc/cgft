@@ -41,20 +41,31 @@ class CgftSearchEnv(SearchEnv):
                         "type": "string",
                         "description": "Search query string.",
                     },
-                    "metadata": {
+                    "filters": {
                         "type": "object",
-                        "description": "Optional metadata filters (e.g., {'ticker': 'DDOG', 'year': 2024}).",
+                        "description": (
+                            "Optional structured filter object using domain-specific query language (DSL). "
+                            "Field condition shape: "
+                            "{\"field\":\"<name>\",\"op\":\"eq|in|gte|lte|contains_any|contains_all\",\"value\":...}. "
+                            "Logical shape: {\"and\":[...]} or {\"or\":[...]} or {\"not\":{...}}. "
+                            "Example: "
+                            "{\"and\":[{\"field\":\"metadata_name\",\"op\":\"eq\",\"value\":\"example_value\"},"
+                            "{\"field\":\"metadata_name_2\",\"op\":\"gte\",\"value\":123}]}"
+                        ),
                     },
                     "filename": {
                         "type": "string",
-                        "description": "Optional filename filter. Simple string for substring match (e.g., 'config') or regex pattern (e.g., '.*\\.json$').",
+                        "description": (
+                            "Optional filename filter. Simple string for substring match "
+                            "(e.g., 'config') or regex pattern (e.g., '.*\\.json$')."
+                        ),
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Max number of results to return (default 10).",
                     },
                 },
-                "required": ["query"],
+                "required": ["query"]
             },
         )
 
@@ -71,7 +82,7 @@ class CgftSearchEnv(SearchEnv):
     async def _search_tool(
         self,
         query: str,
-        metadata: dict[str, Any] | None = None,
+        filters: dict[str, Any] | None = None,
         filename: str | None = None,
         limit: int = 10,
         **kwargs,
@@ -80,7 +91,7 @@ class CgftSearchEnv(SearchEnv):
 
         Args:
             query: Search query string
-            metadata: Optional metadata filters
+            filters: Optional structured filter object
             filename: Optional filename filter (substring or regex)
             limit: Maximum number of results
 
@@ -90,9 +101,9 @@ class CgftSearchEnv(SearchEnv):
         if not query:
             return "Error: Missing required parameter: 'query'"
 
-        request_body = {"query": query, "limit": limit}
-        if metadata:
-            request_body["metadata"] = metadata
+        request_body: dict[str, Any] = {"query": query, "limit": limit}
+        if filters:
+            request_body["filters"] = filters
         if filename:
             request_body["filename"] = filename
 
