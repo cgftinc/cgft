@@ -172,6 +172,7 @@ RUBRIC_EVALUATION_PROMPT = """You are evaluating a response against a specific q
 **Criterion Description**: {description}
 
 **Question**: {question}
+{ground_truth_block}
 
 **Response to Evaluate**: {response}
 
@@ -380,6 +381,7 @@ async def generate_instance_wise_adaptive_rubrics(
 async def evaluate_single_rubric(
     rubric: Rubric,
     question: str,
+    ground_truth: Optional[str],
     response: str,
     model_name: str,
     base_url: str,
@@ -392,6 +394,9 @@ async def evaluate_single_rubric(
     Args:
         rubric: Rubric with title, description, and type
         question: The original question
+        ground_truth: Optional reference answer to ground evaluation
+            - For generated rubrics, this may not be needed as the generation
+            should capture relevant information from the ground truth already
         response: The response to evaluate
         model_name: Model to use for evaluation
         base_url: API base URL
@@ -401,11 +406,19 @@ async def evaluate_single_rubric(
     Returns:
         Dict with "score" (0 or 1) and "reasoning"
     """
+    ground_truth_text = str(ground_truth or "").strip()
+    ground_truth_block = (
+        f"**Ground Truth (Optional)**: {ground_truth_text}\n"
+        if ground_truth_text
+        else ""
+    )
+
     prompt = RUBRIC_EVALUATION_PROMPT.format(
         rubric_type=rubric.type,
         title=rubric.title,
         description=rubric.description,
         question=question,
+        ground_truth_block=ground_truth_block,
         response=response,
     )
 
