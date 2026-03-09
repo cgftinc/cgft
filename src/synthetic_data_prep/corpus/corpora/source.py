@@ -95,13 +95,93 @@ class CorporaChunkSource:
         if show_summary:
             print(f"\nUpload complete! Inserted: {upload_result.inserted_count}")
 
+    def populate_from_existing_corpus(
+        self,
+        corpus_id: str,
+        page_size: int = 500,
+        show_summary: bool = True,
+    ) -> None:
+        """Load an existing corpus by ID into a local ChunkCollection.
+
+        Unlike populate_from_folder(), this does not upload anything.
+
+        Args:
+            corpus_id: Existing corpus ID to load
+            page_size: Number of chunks to fetch per API page (default 500)
+            show_summary: Print load summary (default True)
+        """
+        self._corpus = self._client.get_corpus(corpus_id)
+        self._corpus_name = self._corpus.name
+
+        if show_summary:
+            print(f"Loading chunks from corpus: {self._corpus.name} (ID: {self._corpus.id})")
+
+        chunks: list[Chunk] = []
+        offset = 0
+        while True:
+            page = self._client.list_corpus_chunks(
+                corpus_id=corpus_id,
+                limit=page_size,
+                offset=offset,
+            )
+            if not page.results:
+                break
+
+            for row in page.results:
+                metadata = dict(row.metadata or {})
+                metadata.pop("_local_hash", None)
+                chunks.append(
+                    Chunk(
+                        content=row.content,
+                        metadata=tuple(metadata.items()),
+                        hash=row.id,
+                    )
+                )
+
+            offset += len(page.results)
+            if offset >= page.total:
+                break
+
+        self.collection = ChunkCollection(chunks)
+
+        if show_summary:
+            inspector = ChunkInspector(self.collection)
+            inspector.summary(max_depth=3, max_files_per_folder=4)
+            print(f"\nLoaded {len(self.collection)} chunks from existing corpus.")
+
+    def populate_from_existing_corpus_name(
+        self,
+        corpus_name: str | None = None,
+        page_size: int = 500,
+        show_summary: bool = True,
+    ) -> None:
+        """Load an existing corpus by name into a local ChunkCollection.
+
+        Args:
+            corpus_name: Existing corpus name to load. Defaults to constructor value.
+            page_size: Number of chunks to fetch per API page (default 500)
+            show_summary: Print load summary (default True)
+        """
+        target_name = corpus_name or self._corpus_name
+        matched = [c for c in self._client.list_corpora() if c.name == target_name]
+        if not matched:
+            raise ValueError(f"Could not find existing corpus named '{target_name}'.")
+
+        # Keep behavior deterministic if duplicate names exist.
+        selected = sorted(matched, key=lambda c: c.created_at)[-1]
+        self.populate_from_existing_corpus(
+            corpus_id=selected.id,
+            page_size=page_size,
+            show_summary=show_summary,
+        )
+
     def _assert_ready(self) -> None:
         if self.collection is None or self._corpus is None:
             raise RuntimeError("Corpus is not ready — no data has been loaded.")
 
     @property
     def corpus_id(self) -> str:
-        """Return the corpus ID. Available after populate_from_folder() is called."""
+        """Return corpus ID. Available after loading data into this source."""
         self._assert_ready()
         return self._corpus.id
 

@@ -59,12 +59,10 @@ class TpufSearchEnv(SearchEnv):
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {
             search_tool_definition.name: (search_tool_definition, self._search_tool)
         }
-
-        super().__init__(
-            experiment_id=kwargs.get("experiment_id"),
-            api_key=kwargs.get("api_key"),
-            **{k: v for k, v in kwargs.items() if k not in ("experiment_id", "api_key")},
-        )
+        # BaseEnv does not define __init__, so keep optional kwargs as attributes
+        # instead of forwarding them to object.__init__.
+        self._experiment_id = kwargs.get("experiment_id")
+        self._rollout_api_key = kwargs.get("api_key")
 
     def _build_rank_by(self, query: str) -> Any:
         """Build the rank_by argument for a BM25 Turbopuffer query."""

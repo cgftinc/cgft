@@ -32,6 +32,40 @@ from typing import Any
 from tqdm.auto import tqdm
 
 
+def _chat_completion_with_token_fallback(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    timeout: float,
+):
+    """Call chat completions with both token params, then fallback by error hint.
+
+    Some providers only accept ``max_tokens`` while others only accept
+    ``max_completion_tokens``. Start by sending both and retry once with the
+    unsupported one removed if needed.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
+        "timeout": timeout,
+    }
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "unsupported parameter" in msg and "max_tokens" in msg:
+            kwargs.pop("max_tokens", None)
+            return client.chat.completions.create(**kwargs)
+        if "unsupported parameter" in msg and "max_completion_tokens" in msg:
+            kwargs.pop("max_completion_tokens", None)
+            return client.chat.completions.create(**kwargs)
+        raise
+
+
 @dataclass
 class BatchResponse:
     """Response from a single LLM call.
@@ -126,7 +160,8 @@ async def call_openai_async(
     loop = asyncio.get_event_loop()
     completion = await loop.run_in_executor(
         None,
-        lambda: client.chat.completions.create(
+        lambda: _chat_completion_with_token_fallback(
+            client,
             model=model,
             messages=messages,
             max_tokens=max_tokens,

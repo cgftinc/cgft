@@ -39,6 +39,13 @@ class CorpusClient:
 
     def __post_init__(self) -> None:
         """Initialize HTTP client with auth headers."""
+        normalized_api_key = self.api_key.strip()
+        if not normalized_api_key:
+            raise AuthenticationError(
+                "Missing Corpora API key. Pass a non-empty `api_key` to CorporaChunkSource/CorpusClient."
+            )
+
+        self.api_key = normalized_api_key
         self._http_client = httpx.Client(
             base_url=self.base_url,
             headers={
@@ -112,6 +119,23 @@ class CorpusClient:
         response = self._http_client.get("/api/corpora")
         self._handle_response_errors(response)
         return [Corpus.from_api_response(c) for c in response.json()]
+
+    def get_corpus(self, corpus_id: str) -> Corpus:
+        """Get a corpus by ID from the authenticated user's corpus list.
+
+        Args:
+            corpus_id: Corpus ID to resolve
+
+        Returns:
+            The matching Corpus object
+
+        Raises:
+            CorpusNotFoundError: If no corpus matches the given ID
+        """
+        for corpus in self.list_corpora():
+            if corpus.id == corpus_id:
+                return corpus
+        raise CorpusNotFoundError(corpus_id)
 
     def delete_corpus(self, corpus_id: str) -> bool:
         """Delete a corpus and all its chunks.
@@ -267,6 +291,46 @@ class CorpusClient:
         )
 
     # === Search ===
+
+    def list_corpus_chunks(
+        self,
+        corpus_id: str,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> SearchResult:
+        """List chunks from a corpus using paginated retrieval.
+
+        Args:
+            corpus_id: Corpus to read chunks from
+            limit: Maximum results to return
+            offset: Pagination offset
+
+        Returns:
+            SearchResult with chunk rows and total count
+        """
+        response = self._http_client.get(
+            f"/api/corpora/{corpus_id}/chunks",
+            params={"limit": limit, "offset": offset},
+        )
+        self._handle_response_errors(response)
+
+        data = response.json()
+        rows = data.get("results") or data.get("chunks") or []
+        results = [
+            CorpusChunk(
+                id=r["id"],
+                content=r["content"],
+                metadata=r.get("metadata") or {},
+                score=r.get("score"),
+            )
+            for r in rows
+        ]
+
+        return SearchResult(
+            results=results,
+            total=data.get("total", len(results)),
+            query="",
+        )
 
     def search(
         self,

@@ -1,0 +1,202 @@
+"""Shared style-control utilities for QA generation pipelines.
+
+This module centralizes style constants, distribution math, style
+classification, and metadata helpers so multiple generators/pipelines can
+reuse one implementation.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass, field
+from typing import Any, Mapping, cast
+
+from synthetic_data_prep.qa_generation.generated_qa import GeneratedQA
+
+QUERY_STYLE_KEYWORD = "keyword"
+QUERY_STYLE_NATURAL = "natural"
+QUERY_STYLE_EXPERT = "expert"
+QUERY_STYLE_KEYS = [QUERY_STYLE_KEYWORD, QUERY_STYLE_NATURAL, QUERY_STYLE_EXPERT]
+
+DEFAULT_QUERY_STYLE_DISTRIBUTION = {
+    QUERY_STYLE_KEYWORD: 0.6,
+    QUERY_STYLE_NATURAL: 0.3,
+    QUERY_STYLE_EXPERT: 0.1,
+}
+
+
+@dataclass
+class StyleControlConfig:
+    """Shared style-control configuration."""
+
+    enabled: bool = True
+    distribution: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_QUERY_STYLE_DISTRIBUTION)
+    )
+
+
+def zero_style_counts() -> dict[str, int]:
+    """Create an empty style-count map."""
+    return {key: 0 for key in QUERY_STYLE_KEYS}
+
+
+def normalize_style_distribution(raw_distribution: Any) -> dict[str, float]:
+    """Normalize an arbitrary style distribution into a probability map."""
+    dist = dict(DEFAULT_QUERY_STYLE_DISTRIBUTION)
+    if isinstance(raw_distribution, dict):
+        for key in QUERY_STYLE_KEYS:
+            if key in raw_distribution:
+                try:
+                    value = float(raw_distribution[key])
+                except (TypeError, ValueError):
+                    continue
+                if value >= 0:
+                    dist[key] = value
+
+    total = sum(dist.values())
+    if total <= 0:
+        dist = dict(DEFAULT_QUERY_STYLE_DISTRIBUTION)
+        total = sum(dist.values())
+    return {key: dist[key] / total for key in QUERY_STYLE_KEYS}
+
+
+def allocate_largest_remainder(
+    total: int,
+    distribution: Mapping[str, float],
+) -> dict[str, int]:
+    """Allocate integer style counts with largest-remainder rounding."""
+    if total <= 0:
+        return zero_style_counts()
+
+    normalized = normalize_style_distribution(dict(distribution))
+    raw = {key: normalized[key] * total for key in QUERY_STYLE_KEYS}
+    base = {key: int(math.floor(value)) for key, value in raw.items()}
+    remainder = total - sum(base.values())
+    if remainder > 0:
+        fractional = sorted(
+            QUERY_STYLE_KEYS,
+            key=lambda key: (raw[key] - base[key], normalized[key]),
+            reverse=True,
+        )
+        for key in fractional[:remainder]:
+            base[key] += 1
+    return base
+
+
+def style_sequence_from_counts(style_counts: Mapping[str, int]) -> list[str]:
+    """Expand counts into a deterministic ordered style sequence."""
+    sequence: list[str] = []
+    for style in QUERY_STYLE_KEYS:
+        sequence.extend([style] * max(0, int(style_counts.get(style, 0))))
+    return sequence
+
+
+def classify_query_style(question: str) -> str:
+    """Classify a question into keyword, natural, or expert style."""
+    text = question.strip()
+    lower = text.lower()
+    tokens = re.findall(r"[a-z0-9$_.:/-]+", lower)
+    token_count = len(tokens)
+
+    if token_count == 0:
+        return QUERY_STYLE_KEYWORD
+
+    starts_interrogative = lower.startswith(
+        (
+            "how ",
+            "what ",
+            "why ",
+            "when ",
+            "where ",
+            "who ",
+            "which ",
+            "can ",
+            "should ",
+            "does ",
+            "is ",
+            "are ",
+            "do ",
+            "did ",
+        )
+    )
+    has_question_mark = "?" in text
+    expert_terms = {
+        "troubleshoot",
+        "debug",
+        "error",
+        "failed",
+        "failure",
+        "timeout",
+        "mismatch",
+        "incident",
+        "fix",
+        "compare",
+        "comparison",
+        "tradeoff",
+        "versus",
+        "vs",
+        "difference",
+        "why",
+        "root",
+        "cause",
+        "optimize",
+        "prerequisite",
+    }
+    expert_hits = sum(1 for token in tokens if token in expert_terms)
+    has_expert_pattern = bool(
+        re.search(
+            r"\b(vs|versus|root cause|best practice|why .* fail|how to fix|troubleshoot)\b",
+            lower,
+        )
+    )
+
+    if expert_hits >= 2 or (has_expert_pattern and token_count >= 5):
+        return QUERY_STYLE_EXPERT
+    if has_question_mark or starts_interrogative or token_count >= 9:
+        return QUERY_STYLE_NATURAL
+    if token_count <= 7 and lower == text:
+        return QUERY_STYLE_KEYWORD
+    return QUERY_STYLE_NATURAL
+
+
+def get_item_question(item: GeneratedQA) -> str:
+    """Return the normalized question string from a GeneratedQA item."""
+    return str(item.qa.get("question", "")).strip()
+
+
+def get_item_style_target(item: GeneratedQA) -> str:
+    """Read style target from generation metadata or eval_scores."""
+    target = str(item.generation_metadata.get("query_style_target", "")).strip()
+    if target in QUERY_STYLE_KEYS:
+        return target
+    eval_scores = item.qa.get("eval_scores", {}) or {}
+    target = str(eval_scores.get("query_style_target", "")).strip()
+    return target if target in QUERY_STYLE_KEYS else ""
+
+
+def set_item_style_target(item: GeneratedQA, target: str) -> None:
+    """Persist style target in both generation metadata and eval_scores."""
+    if target not in QUERY_STYLE_KEYS:
+        return
+    item.generation_metadata["query_style_target"] = target
+    eval_scores = cast(dict[str, Any], dict(item.qa.get("eval_scores", {}) or {}))
+    eval_scores["query_style_target"] = target
+    item.qa["eval_scores"] = eval_scores
+
+
+def set_item_style_observed(item: GeneratedQA, observed: str) -> None:
+    """Persist observed style in both generation metadata and eval_scores."""
+    if observed not in QUERY_STYLE_KEYS:
+        return
+    item.generation_metadata["query_style_observed"] = observed
+    eval_scores = cast(dict[str, Any], dict(item.qa.get("eval_scores", {}) or {}))
+    eval_scores["query_style_observed"] = observed
+    item.qa["eval_scores"] = eval_scores
+
+
+def annotate_item_style_observed(item: GeneratedQA) -> str:
+    """Classify and store observed question style for the item."""
+    observed = classify_query_style(get_item_question(item))
+    set_item_style_observed(item, observed)
+    return observed
