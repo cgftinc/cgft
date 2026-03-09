@@ -389,6 +389,12 @@ def _print_event(event: dict, idx: int) -> None:
             f"{prefix} → rollout_completed  {status}  "
             f"rewards={event.get('rewards')}  error={event.get('error')}"
         )
+        # Print captured stdout from remote worker
+        stdout = event.get("stdout")
+        if stdout:
+            print(f"{prefix} [stdout]")
+            for line in stdout.splitlines():
+                print(f"    {line}")
 
     elif etype in ("worker_error", "error", "cancelled"):
         print(_err(f"{prefix} → {etype}: {event.get('error')}"))
