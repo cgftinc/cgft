@@ -14,6 +14,9 @@ from synthetic_data_prep.qa_generation.anchor_selector import (
 )
 from synthetic_data_prep.qa_generation.corpus_capabilities import CorpusCapabilities
 from synthetic_data_prep.qa_generation.generated_qa import GeneratedQA
+from synthetic_data_prep.qa_generation.generators.sage_common import (
+    _build_reference_chunks_from_anchor,
+)
 from synthetic_data_prep.qa_generation.models import QADataPoint
 from synthetic_data_prep.qa_generation.sage_utils import (
     QuestionGenEnv,
@@ -60,9 +63,7 @@ class SageGenerator:
         cfg = self.cfg
 
         # 1. Sample chunks
-        sample_chunks = self.source.sample_chunks(
-            cfg.num_samples, min_chars=cfg.min_chunk_chars
-        )
+        sample_chunks = self.source.sample_chunks(cfg.num_samples, min_chars=cfg.min_chunk_chars)
         chunk_texts = [str(c) for c in sample_chunks]
         if not chunk_texts:
             logger.warning("No eligible chunks found in corpus.")
@@ -161,9 +162,7 @@ class SageGenerator:
         items: list[GeneratedQA] = []
         for chunk_idx, chunk_text in enumerate(chunk_texts):
             anchor = anchors[chunk_idx]
-            target_steps = (
-                anchor.target_hop_count if anchor else cfg.n_search_steps
-            )
+            target_steps = anchor.target_hop_count if anchor else cfg.n_search_steps
 
             if anchor:
                 qa = run_question_generation_direct(
@@ -209,7 +208,7 @@ class SageGenerator:
             qa_data_point: QADataPoint = {
                 "question": qa["question"],
                 "answer": qa["answer"],
-                "reference_chunks": [],
+                "reference_chunks": (_build_reference_chunks_from_anchor(anchor) if anchor else []),
                 "qa_type": anchor.target_qa_type if anchor else "unknown",
                 "min_hop_count": target_steps,
                 "is_co_located": None,
@@ -228,17 +227,11 @@ class SageGenerator:
             if anchor:
                 gen_meta["anchor_qa_type"] = anchor.target_qa_type
                 gen_meta["anchor_hop_count"] = anchor.target_hop_count
-            seed_chunk = (
-                sample_chunks[chunk_idx]
-                if chunk_idx < len(sample_chunks)
-                else None
-            )
+            seed_chunk = sample_chunks[chunk_idx] if chunk_idx < len(sample_chunks) else None
             if seed_chunk is not None:
                 gen_meta["seed_chunk"] = seed_chunk
 
-            items.append(
-                GeneratedQA(qa=qa_data_point, generation_metadata=gen_meta)
-            )
+            items.append(GeneratedQA(qa=qa_data_point, generation_metadata=gen_meta))
 
         # 7. Store shared state in context for downstream steps
         context["anchors"] = anchors

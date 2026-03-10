@@ -359,11 +359,7 @@ class RetrievalLLMFilterConfig:
     overlap_threshold: float = 0.5
     too_easy_confidence_threshold: float = 0.75
     too_easy_overlap_threshold: float = 0.65
-    unknown_answerable_confidence_threshold: float = 0.85
-    require_multi_chunk_evidence_for_non_lookup_pass: bool = False
-    min_matched_reference_chunks_for_non_lookup_pass: int = 2
-    route_unsupported_to_failure: bool = True
-    stats_key: str = "retrieval_filter_stats"
+    stats_key: str = "retrieval_too_easy_filter_stats"
 
 
 @dataclass
@@ -401,12 +397,10 @@ class FilteringConfig:
 
     deterministic_guards: DeterministicGuardsConfig = field(default_factory=DeterministicGuardsConfig)
     filters: list[str] = field(
-        default_factory=lambda: ["retrieval_too_easy_llm", "grounding_llm"]
+        default_factory=lambda: ["grounding_llm", "retrieval_too_easy_llm"]
     )
-    mode: str = "retrieval_llm"
     retrieval_llm: RetrievalLLMFilterConfig = field(default_factory=RetrievalLLMFilterConfig)
     grounding_llm: GroundingLLMFilterConfig = field(default_factory=GroundingLLMFilterConfig)
-    llm_env: LLMEnvFilterConfig = field(default_factory=LLMEnvFilterConfig)
 
 
 @dataclass
@@ -414,7 +408,6 @@ class RefinementConfig:
     """Refinement controls for retrying failed filter candidates."""
 
     enabled: bool = True
-    strategy: str = "regenerate_with_generator"
     model: str = "gpt-5-mini"
     api_key: str = ""
     base_url: str = "https://app.cgft.io/api/llm"
@@ -488,11 +481,6 @@ class CgftPipelineConfig:
 
         if not self.filtering.grounding_llm.judge_api_key:
             self.filtering.grounding_llm.judge_api_key = platform_key
-
-        if not self.filtering.llm_env.api_key:
-            self.filtering.llm_env.api_key = platform_key
-        if not self.filtering.llm_env.judge_api_key:
-            self.filtering.llm_env.judge_api_key = platform_key
 
         if not self.refinement.api_key:
             self.refinement.api_key = platform_key
@@ -686,10 +674,47 @@ def _parse_model_cfg(raw: Any, *, fallback: ModelConfig) -> ModelConfig:
     )
 
 
+def _collect_removed_config_keys(raw: dict[str, Any]) -> list[str]:
+    """Return removed config keys present in user YAML."""
+    removed_keys: list[str] = []
+
+    filtering_raw = raw.get("filtering", {}) or {}
+    retrieval_raw = filtering_raw.get("retrieval_llm", {}) or {}
+    refinement_raw = raw.get("refinement", {}) or {}
+
+    if "mode" in filtering_raw:
+        removed_keys.append("filtering.mode")
+    if "llm_env" in filtering_raw:
+        removed_keys.append("filtering.llm_env")
+    if "strategy" in refinement_raw:
+        removed_keys.append("refinement.strategy")
+
+    for key in (
+        "route_unsupported_to_failure",
+        "unknown_answerable_confidence_threshold",
+        "require_multi_chunk_evidence_for_non_lookup_pass",
+        "min_matched_reference_chunks_for_non_lookup_pass",
+    ):
+        if key in retrieval_raw:
+            removed_keys.append(f"filtering.retrieval_llm.{key}")
+
+    return removed_keys
+
+
 def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
     """Load `CgftPipelineConfig` from YAML."""
     with Path(path).open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
+
+    removed_keys = _collect_removed_config_keys(raw)
+    if removed_keys:
+        joined = ", ".join(sorted(removed_keys))
+        raise ValueError(
+            "Unsupported config keys for the clean-break Cgft filtering/refinement API: "
+            f"{joined}. "
+            "Use filtering.filters with supported stages {'grounding_llm', 'retrieval_too_easy_llm'} "
+            "and generator-based refinement without refinement.strategy."
+        )
 
     platform_raw = raw.get("platform", {}) or {}
     api_key = str(platform_raw.get("api_key", "")).strip()
@@ -836,9 +861,6 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         filters_raw = list(FilteringConfig().filters)
     retrieval_raw = filtering_raw.get("retrieval_llm", {}) or {}
     grounding_raw = filtering_raw.get("grounding_llm", {}) or {}
-    env_filter_raw = filtering_raw.get("llm_env", {}) or {}
-    env_filter_bundle_raw = env_filter_raw.get("env_bundle", {}) or {}
-    env_filter_limits_raw = env_filter_raw.get("rollout_limits", {}) or {}
     if isinstance(filters_raw, str):
         chain_filters = [
             token.strip().lower()
@@ -865,7 +887,6 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             ),
         ),
         filters=chain_filters,
-        mode=str(filtering_raw.get("mode", "retrieval_llm")).strip().lower() or "retrieval_llm",
         retrieval_llm=RetrievalLLMFilterConfig(
             enabled=bool(retrieval_raw.get("enabled", True)),
             judge_model=str(retrieval_raw.get("judge_model", "gpt-5-mini")),
@@ -899,21 +920,9 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
                 0.0,
                 min(1.0, float(retrieval_raw.get("too_easy_overlap_threshold", 0.65))),
             ),
-            unknown_answerable_confidence_threshold=max(
-                0.0,
-                min(1.0, float(retrieval_raw.get("unknown_answerable_confidence_threshold", 0.85))),
-            ),
-            require_multi_chunk_evidence_for_non_lookup_pass=bool(
-                retrieval_raw.get("require_multi_chunk_evidence_for_non_lookup_pass", False)
-            ),
-            min_matched_reference_chunks_for_non_lookup_pass=max(
-                1,
-                int(retrieval_raw.get("min_matched_reference_chunks_for_non_lookup_pass", 2)),
-            ),
-            route_unsupported_to_failure=bool(retrieval_raw.get("route_unsupported_to_failure", True)),
             stats_key=(
-                str(retrieval_raw.get("stats_key", "retrieval_filter_stats")).strip()
-                or "retrieval_filter_stats"
+                str(retrieval_raw.get("stats_key", "retrieval_too_easy_filter_stats")).strip()
+                or "retrieval_too_easy_filter_stats"
             ),
         ),
         grounding_llm=GroundingLLMFilterConfig(
@@ -945,35 +954,11 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
                 or "grounding_filter_stats"
             ),
         ),
-        llm_env=LLMEnvFilterConfig(
-            enabled=bool(env_filter_raw.get("enabled", True)),
-            model=str(env_filter_raw.get("model", "gpt-5-mini")),
-            api_key=str(env_filter_raw.get("api_key", "")),
-            base_url=str(env_filter_raw.get("base_url", "https://app.cgft.io/api/llm")),
-            judge_model=str(env_filter_raw.get("judge_model", "gpt-5-mini")),
-            judge_api_key=str(env_filter_raw.get("judge_api_key", "")),
-            judge_base_url=str(env_filter_raw.get("judge_base_url", "https://app.cgft.io/api/llm")),
-            env_bundle=EnvBundleConfig(
-                env_cls_path=str(env_filter_bundle_raw.get("env_cls_path", "")),
-                env_metadata_path=str(env_filter_bundle_raw.get("env_metadata_path", "")),
-                env_cls_file=str(env_filter_bundle_raw.get("env_cls_file", "")),
-                env_metadata_file=str(env_filter_bundle_raw.get("env_metadata_file", "")),
-            ),
-            rollout_limits=RolloutLimits(
-                max_turns=max(1, int(env_filter_limits_raw.get("max_turns", 16))),
-                max_tool_calls=max(1, int(env_filter_limits_raw.get("max_tool_calls", 24))),
-                max_completion_tokens=max(
-                    100, int(env_filter_limits_raw.get("max_completion_tokens", 2048))
-                ),
-                timeout=max(10.0, float(env_filter_limits_raw.get("timeout", 120.0))),
-            ),
-        ),
     )
 
     refinement_raw = raw.get("refinement", {}) or {}
     refinement = RefinementConfig(
         enabled=bool(refinement_raw.get("enabled", True)),
-        strategy=str(refinement_raw.get("strategy", RefinementConfig().strategy)),
         model=str(refinement_raw.get("model", "gpt-5-mini")),
         api_key=str(refinement_raw.get("api_key", "")),
         base_url=str(refinement_raw.get("base_url", "https://app.cgft.io/api/llm")),

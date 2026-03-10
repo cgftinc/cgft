@@ -1,4 +1,4 @@
-"""Retrieval + LLM-judge filter for CgftPipeline."""
+"""Retrieval + LLM-judge too-easy filter for CgftPipeline."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 _DUMMY_CHUNK = Chunk(content="", metadata=(("_dummy", True),))
 
+_FILTER_MODE = "retrieval_too_easy_llm"
 _JUDGE_SYSTEM_PROMPT = DEFAULT_RETRIEVAL_JUDGE_SYSTEM_PROMPT
 _JUDGE_USER_TEMPLATE = DEFAULT_RETRIEVAL_JUDGE_USER_TEMPLATE
 _JUDGE_TAG_TOO_EASY = "too_easy_lexical"
@@ -28,7 +29,6 @@ _JUDGE_TAG_UNSUPPORTED = "unsupported"
 _JUDGE_TAG_PASS = "challenging_answerable_pass"
 _JUDGE_TAG_UNKNOWN = "unknown"
 _FAILURE_TYPE_TOO_EASY = "too_easy"
-_FAILURE_TYPE_UNSUPPORTED = "unsupported"
 _FAILURE_TYPE_NONE = "none"
 
 
@@ -40,7 +40,7 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
 
 
 class RetrievalLLMFilter:
-    """Rejects/flags items answerable by naive single-retrieval steps."""
+    """Flags QA pairs that appear too easy for naive retrieval."""
 
     def __init__(
         self,
@@ -60,7 +60,7 @@ class RetrievalLLMFilter:
             return items
 
         max_refinements = context.config.refinement.max_refinements_per_item
-        stats_key = str(self.cfg.stats_key or "").strip() or "retrieval_filter_stats"
+        stats_key = str(self.cfg.stats_key or "").strip() or "retrieval_too_easy_filter_stats"
         stats = context.setdefault(
             stats_key,
             {
@@ -68,6 +68,7 @@ class RetrievalLLMFilter:
                 "needs_refinement": 0,
                 "rejected": 0,
                 "errors": 0,
+                "judge_calls": 0,
                 "judge_answerable_true": 0,
                 "judge_answerable_false": 0,
                 "judge_reason_tags": {
@@ -77,16 +78,10 @@ class RetrievalLLMFilter:
                     _JUDGE_TAG_UNKNOWN: 0,
                 },
                 "too_easy_total": 0,
-                "too_easy_due_to_judge_only": 0,
-                "too_easy_due_to_overlap_only": 0,
-                "too_easy_due_to_both": 0,
-                "too_easy_due_to_non_lookup_evidence": 0,
-                "too_easy_high_confidence": 0,
-                "too_easy_low_confidence": 0,
-                "too_easy_calibrated_pass": 0,
-                "unsupported_total": 0,
-                "forced_reanchor_total": 0,
+                "too_easy_due_to_overlap_pre_gate": 0,
+                "too_easy_due_to_judge": 0,
                 "overlap_threshold_triggered": 0,
+                "too_easy_overlap_threshold_triggered": 0,
             },
         )
         self._ensure_stats_shape(stats)
@@ -104,7 +99,7 @@ class RetrievalLLMFilter:
                     reason="retrieval_filter_error",
                     reasoning="Filter error; passed by default.",
                     metadata={
-                        "filter_mode": self._filter_mode(),
+                        "filter_mode": _FILTER_MODE,
                         "reason_code": "filter_error",
                         "confidence": 0.0,
                         "retrieval_query": str(item.qa.get("question", "")),
@@ -113,6 +108,7 @@ class RetrievalLLMFilter:
                         "force_reanchor": False,
                         "feedback_type": None,
                         "refinement_hint": None,
+                        "judge_called": False,
                     },
                 )
                 stats["errors"] = int(stats.get("errors", 0)) + 1
@@ -136,7 +132,7 @@ class RetrievalLLMFilter:
                 reason="retrieval_filter_rejected",
                 reasoning="Missing question/retrieval_query.",
                 metadata={
-                    "filter_mode": self._filter_mode(),
+                    "filter_mode": _FILTER_MODE,
                     "reason_code": "missing_query",
                     "confidence": 1.0,
                     "retrieval_query": "",
@@ -145,6 +141,7 @@ class RetrievalLLMFilter:
                     "force_reanchor": False,
                     "feedback_type": None,
                     "refinement_hint": None,
+                    "judge_called": False,
                 },
             )
 
@@ -155,21 +152,47 @@ class RetrievalLLMFilter:
         )
         retrieved_chunks: list[Chunk] = [row["chunk"] for row in search_results if "chunk" in row]
         ref_chunks = list(item.qa.get("reference_chunks", []) or [])
-        overlap_ratio, _matched_ids = self._compute_overlap(ref_chunks, retrieved_chunks)
-        matched_reference_chunks = len(_matched_ids)
+        overlap_ratio, matched_reference_ids = self._compute_overlap(ref_chunks, retrieved_chunks)
+        overlap_triggered = overlap_ratio >= self.cfg.overlap_threshold
+        too_easy_overlap_triggered = overlap_ratio >= self.cfg.too_easy_overlap_threshold
+        refinements = int(item.generation_metadata.get("refinement_count", 0))
 
-        qa_type = str(
-            item.qa.get("qa_type") or item.generation_metadata.get("qa_type_target") or ""
-        ).strip().lower()
-        try:
-            target_hop_count = int(
-                item.qa.get("min_hop_count")
-                or item.generation_metadata.get("target_hop_count")
-                or 1
+        shared_metadata = {
+            "filter_mode": _FILTER_MODE,
+            "retrieval_query": query,
+            "ref_overlap_ratio": overlap_ratio,
+            "overlap_threshold": self.cfg.overlap_threshold,
+            "overlap_triggered": overlap_triggered,
+            "too_easy_overlap_threshold": self.cfg.too_easy_overlap_threshold,
+            "too_easy_overlap_triggered": too_easy_overlap_triggered,
+            "too_easy_confidence_threshold": self.cfg.too_easy_confidence_threshold,
+            "force_reanchor": False,
+            "matched_reference_ids": matched_reference_ids,
+            "matched_reference_chunks": len(matched_reference_ids),
+            "retrieved_chunk_count": len(retrieved_chunks),
+            "top_score": search_results[0].get("max_score", 0.0) if search_results else 0.0,
+        }
+
+        if too_easy_overlap_triggered:
+            metadata = {
+                **shared_metadata,
+                "reason_code": "naive_retrieval_sufficient",
+                "confidence": 1.0,
+                "failure_type": _FAILURE_TYPE_TOO_EASY,
+                "feedback_type": "same_anchor_feedback",
+                "refinement_hint": "Increase retrieval difficulty and avoid directly retrievable terms.",
+                "judge_called": False,
+                "judge_answerable": None,
+                "judge_reasoning": "",
+                "judge_reason_tag": _JUDGE_TAG_UNKNOWN,
+                "too_easy_source": "overlap_pre_gate",
+            }
+            return self._too_easy_verdict(
+                metadata=metadata,
+                overlap_ratio=overlap_ratio,
+                refinements=refinements,
+                max_refinements=max_refinements,
             )
-        except (TypeError, ValueError):
-            target_hop_count = 1
-        non_lookup_expected = qa_type not in {"", "lookup"} or target_hop_count > 1
 
         judge_result = self._run_judge(item, retrieved_chunks)
         answerable = bool(judge_result.get("answerable", False))
@@ -179,175 +202,91 @@ class RetrievalLLMFilter:
             reason_tag=judge_result.get("reason_tag", ""),
             reasoning=judge_reasoning,
         )
-        lexical_anchor_evidence = str(judge_result.get("lexical_anchor_evidence", "")).strip()
-        support_gap = str(judge_result.get("support_gap", "")).strip()
-        overlap_triggered = overlap_ratio >= self.cfg.overlap_threshold
         too_easy_high_confidence = confidence >= self.cfg.too_easy_confidence_threshold
-        too_easy_overlap_triggered = overlap_ratio >= self.cfg.too_easy_overlap_threshold
-        too_easy_hard_signal = too_easy_high_confidence and too_easy_overlap_triggered
-        unknown_answerable_high_confidence = (
-            answerable and confidence >= self.cfg.unknown_answerable_confidence_threshold
+        too_easy_due_to_judge = (
+            judge_reason_tag == _JUDGE_TAG_TOO_EASY and too_easy_high_confidence
+        )
+        too_easy_calibrated_out = (
+            judge_reason_tag == _JUDGE_TAG_TOO_EASY and not too_easy_due_to_judge
         )
 
-        too_easy_calibrated_out = False
-        unsupported_signal_deferred = False
-        if self.cfg.route_unsupported_to_failure and judge_reason_tag == _JUDGE_TAG_UNSUPPORTED:
-            failure_type = _FAILURE_TYPE_UNSUPPORTED
-        elif not self.cfg.route_unsupported_to_failure and judge_reason_tag == _JUDGE_TAG_UNSUPPORTED:
-            unsupported_signal_deferred = True
-            failure_type = _FAILURE_TYPE_NONE
-        elif judge_reason_tag == _JUDGE_TAG_TOO_EASY and too_easy_hard_signal:
-            failure_type = _FAILURE_TYPE_TOO_EASY
-        elif (
-            answerable
-            and judge_reason_tag not in {_JUDGE_TAG_PASS, _JUDGE_TAG_UNSUPPORTED}
-            and unknown_answerable_high_confidence
-        ):
-            # Backward-compat fallback for weak judge outputs lacking expected tags.
-            failure_type = _FAILURE_TYPE_TOO_EASY
-        else:
-            if judge_reason_tag == _JUDGE_TAG_TOO_EASY:
-                too_easy_calibrated_out = True
-            failure_type = _FAILURE_TYPE_NONE
-
-        required_matched_ref_chunks = max(
-            1, int(self.cfg.min_matched_reference_chunks_for_non_lookup_pass)
-        )
-        non_lookup_evidence_shortfall = False
-        if (
-            failure_type == _FAILURE_TYPE_NONE
-            and self.cfg.require_multi_chunk_evidence_for_non_lookup_pass
-            and non_lookup_expected
-        ):
-            non_lookup_evidence_shortfall = matched_reference_chunks < required_matched_ref_chunks
-            if non_lookup_evidence_shortfall:
-                failure_type = _FAILURE_TYPE_TOO_EASY
-
-        too_easy_source = "none"
-        if failure_type == _FAILURE_TYPE_TOO_EASY:
-            if non_lookup_evidence_shortfall:
-                too_easy_source = "non_lookup_evidence"
-            elif answerable and overlap_triggered:
-                too_easy_source = "both"
-            elif answerable:
-                too_easy_source = "judge_only"
-            elif overlap_triggered:
-                too_easy_source = "overlap_only"
-
-        refinements = int(item.generation_metadata.get("refinement_count", 0))
-        is_too_easy = failure_type == _FAILURE_TYPE_TOO_EASY
-        is_unsupported = failure_type == _FAILURE_TYPE_UNSUPPORTED
-        needs_fix = is_too_easy or is_unsupported
-
-        reason_code = "retrieval_difficulty_passed"
-        feedback_type = None
-        refinement_hint = None
-        force_reanchor = False
-        if is_too_easy:
-            if non_lookup_evidence_shortfall:
-                reason_code = "insufficient_non_lookup_evidence"
-                refinement_hint = (
-                    "Non-lookup item needs multi-chunk evidence. Use at least "
-                    f"{required_matched_ref_chunks} matched reference chunks."
-                )
-            else:
-                reason_code = "naive_retrieval_sufficient"
-                refinement_hint = "Increase retrieval difficulty and avoid directly retrievable terms."
-            feedback_type = "same_anchor_feedback"
-        elif is_unsupported:
-            reason_code = "unsupported_or_unanswerable"
-            feedback_type = "reanchor_feedback"
-            refinement_hint = "Reground answer with chunk evidence and revise unsupported facts."
-            force_reanchor = True
-
-        metadata = {
-            "filter_mode": self._filter_mode(),
-            "reason_code": reason_code,
-            "confidence": confidence,
-            "retrieval_query": query,
-            "ref_overlap_ratio": overlap_ratio,
-            "failure_type": failure_type,
-            "force_reanchor": force_reanchor,
-            "feedback_type": feedback_type,
-            "refinement_hint": refinement_hint,
-            "judge_answerable": answerable,
-            "judge_reasoning": judge_reasoning,
-            "judge_reason_tag": judge_reason_tag,
-            "lexical_anchor_evidence": lexical_anchor_evidence,
-            "support_gap": support_gap,
-            "overlap_threshold": self.cfg.overlap_threshold,
-            "overlap_triggered": overlap_triggered,
-            "too_easy_confidence_threshold": self.cfg.too_easy_confidence_threshold,
-            "too_easy_overlap_threshold": self.cfg.too_easy_overlap_threshold,
-            "unknown_answerable_confidence_threshold": self.cfg.unknown_answerable_confidence_threshold,
-            "too_easy_high_confidence": too_easy_high_confidence,
-            "too_easy_overlap_triggered": too_easy_overlap_triggered,
-            "too_easy_hard_signal": too_easy_hard_signal,
-            "unknown_answerable_high_confidence": unknown_answerable_high_confidence,
-            "too_easy_calibrated_out": too_easy_calibrated_out,
-            "route_unsupported_to_failure": self.cfg.route_unsupported_to_failure,
-            "unsupported_signal_deferred": unsupported_signal_deferred,
-            "qa_type": qa_type,
-            "target_hop_count": target_hop_count,
-            "non_lookup_expected": non_lookup_expected,
-            "require_multi_chunk_evidence_for_non_lookup_pass": (
-                self.cfg.require_multi_chunk_evidence_for_non_lookup_pass
-            ),
-            "matched_reference_chunks": matched_reference_chunks,
-            "required_matched_reference_chunks_for_non_lookup_pass": required_matched_ref_chunks,
-            "non_lookup_evidence_shortfall": non_lookup_evidence_shortfall,
-            "too_easy_source": too_easy_source,
-            "top_score": search_results[0].get("max_score", 0.0) if search_results else 0.0,
-            "retrieved_chunk_count": len(retrieved_chunks),
-        }
-
-        if needs_fix and refinements < max_refinements:
-            reason_text = "Unsupported/unanswerable grounding detected." if is_unsupported else "Naive retrieval appears sufficient."
-            return FilterVerdict(
-                status="needs_refinement",
-                reason="retrieval_filter_needs_refinement",
-                reasoning=f"{reason_text} (failure_type={failure_type}, answerable={answerable}, overlap={overlap_ratio:.2f}).",
+        if too_easy_due_to_judge:
+            metadata = {
+                **shared_metadata,
+                "reason_code": "naive_retrieval_sufficient",
+                "confidence": confidence,
+                "failure_type": _FAILURE_TYPE_TOO_EASY,
+                "feedback_type": "same_anchor_feedback",
+                "refinement_hint": "Increase retrieval difficulty and avoid directly retrievable terms.",
+                "judge_called": True,
+                "judge_answerable": answerable,
+                "judge_reasoning": judge_reasoning,
+                "judge_reason_tag": judge_reason_tag,
+                "too_easy_high_confidence": too_easy_high_confidence,
+                "too_easy_calibrated_out": False,
+                "too_easy_source": "judge",
+            }
+            return self._too_easy_verdict(
                 metadata=metadata,
-            )
-
-        if needs_fix:
-            return FilterVerdict(
-                status="rejected",
-                reason="retrieval_filter_rejected",
-                reasoning=(
-                    f"Refinement budget exhausted for failure_type={failure_type} "
-                    f"({refinements}/{max_refinements})."
-                ),
-                metadata=metadata,
+                overlap_ratio=overlap_ratio,
+                refinements=refinements,
+                max_refinements=max_refinements,
             )
 
         return FilterVerdict(
             status="passed",
             reason="retrieval_filter_passed",
             reasoning=(
-                "Unsupported signal deferred to a downstream grounding filter. "
-                if unsupported_signal_deferred
-                else ""
-            )
-            + (
-                "Borderline too-easy signal did not meet calibrated hard-fail thresholds. "
+                "Borderline too-easy signal did not meet confidence threshold. "
                 if too_easy_calibrated_out
-                else (
-                    "Answerable signal did not meet calibrated hard-fail thresholds. "
-                    if answerable
-                    else "Not answerable by naive retrieval "
-                )
+                else "Not classified as too easy by overlap gate or judge. "
             )
-            + (
-                f"(answerable={answerable}, overlap={overlap_ratio:.2f}, confidence={confidence:.2f})."
+            + f"(overlap={overlap_ratio:.2f}, confidence={confidence:.2f}).",
+            metadata={
+                **shared_metadata,
+                "reason_code": "retrieval_difficulty_passed",
+                "confidence": confidence,
+                "failure_type": _FAILURE_TYPE_NONE,
+                "feedback_type": None,
+                "refinement_hint": None,
+                "judge_called": True,
+                "judge_answerable": answerable,
+                "judge_reasoning": judge_reasoning,
+                "judge_reason_tag": judge_reason_tag,
+                "too_easy_high_confidence": too_easy_high_confidence,
+                "too_easy_calibrated_out": too_easy_calibrated_out,
+                "too_easy_source": "none",
+            },
+        )
+
+    @staticmethod
+    def _too_easy_verdict(
+        *,
+        metadata: dict[str, Any],
+        overlap_ratio: float,
+        refinements: int,
+        max_refinements: int,
+    ) -> FilterVerdict:
+        if refinements < max_refinements:
+            return FilterVerdict(
+                status="needs_refinement",
+                reason="retrieval_filter_needs_refinement",
+                reasoning=(
+                    "Naive retrieval appears sufficient "
+                    f"(overlap={overlap_ratio:.2f}, source={metadata.get('too_easy_source', 'unknown')})."
+                ),
+                metadata=metadata,
+            )
+
+        return FilterVerdict(
+            status="rejected",
+            reason="retrieval_filter_rejected",
+            reasoning=(
+                "Refinement budget exhausted for failure_type=too_easy "
+                f"({refinements}/{max_refinements})."
             ),
             metadata=metadata,
         )
-
-    def _filter_mode(self) -> str:
-        if not self.cfg.route_unsupported_to_failure:
-            return "retrieval_too_easy_llm"
-        return "retrieval_llm"
 
     @staticmethod
     def _compute_overlap(
@@ -447,19 +386,14 @@ class RetrievalLLMFilter:
         stats.setdefault("needs_refinement", 0)
         stats.setdefault("rejected", 0)
         stats.setdefault("errors", 0)
+        stats.setdefault("judge_calls", 0)
         stats.setdefault("judge_answerable_true", 0)
         stats.setdefault("judge_answerable_false", 0)
         stats.setdefault("too_easy_total", 0)
-        stats.setdefault("too_easy_due_to_judge_only", 0)
-        stats.setdefault("too_easy_due_to_overlap_only", 0)
-        stats.setdefault("too_easy_due_to_both", 0)
-        stats.setdefault("too_easy_due_to_non_lookup_evidence", 0)
-        stats.setdefault("too_easy_high_confidence", 0)
-        stats.setdefault("too_easy_low_confidence", 0)
-        stats.setdefault("too_easy_calibrated_pass", 0)
-        stats.setdefault("unsupported_total", 0)
-        stats.setdefault("forced_reanchor_total", 0)
+        stats.setdefault("too_easy_due_to_overlap_pre_gate", 0)
+        stats.setdefault("too_easy_due_to_judge", 0)
         stats.setdefault("overlap_threshold_triggered", 0)
+        stats.setdefault("too_easy_overlap_threshold_triggered", 0)
 
         tags = stats.setdefault("judge_reason_tags", {})
         if not isinstance(tags, dict):
@@ -473,52 +407,44 @@ class RetrievalLLMFilter:
     @staticmethod
     def _record_diagnostics(stats: dict[str, Any], verdict: FilterVerdict) -> None:
         metadata = verdict.metadata if isinstance(verdict.metadata, dict) else {}
-        judge_answerable = metadata.get("judge_answerable")
-        if isinstance(judge_answerable, bool):
-            if judge_answerable:
-                stats["judge_answerable_true"] = int(stats.get("judge_answerable_true", 0)) + 1
-            else:
-                stats["judge_answerable_false"] = int(stats.get("judge_answerable_false", 0)) + 1
-
-        judge_reason_tag = str(metadata.get("judge_reason_tag", "")).strip().lower() or _JUDGE_TAG_UNKNOWN
-        tags = stats.get("judge_reason_tags", {})
-        if isinstance(tags, dict):
-            if judge_reason_tag not in tags:
-                tags[judge_reason_tag] = 0
-            tags[judge_reason_tag] = int(tags.get(judge_reason_tag, 0)) + 1
-
-        if judge_reason_tag == _JUDGE_TAG_TOO_EASY:
-            if bool(metadata.get("too_easy_high_confidence", False)):
-                stats["too_easy_high_confidence"] = int(stats.get("too_easy_high_confidence", 0)) + 1
-            else:
-                stats["too_easy_low_confidence"] = int(stats.get("too_easy_low_confidence", 0)) + 1
-        if bool(metadata.get("too_easy_calibrated_out", False)):
-            stats["too_easy_calibrated_pass"] = int(stats.get("too_easy_calibrated_pass", 0)) + 1
 
         overlap_triggered = bool(metadata.get("overlap_triggered", False))
         if overlap_triggered:
             stats["overlap_threshold_triggered"] = int(stats.get("overlap_threshold_triggered", 0)) + 1
+        too_easy_overlap_triggered = bool(metadata.get("too_easy_overlap_triggered", False))
+        if too_easy_overlap_triggered:
+            stats["too_easy_overlap_threshold_triggered"] = int(
+                stats.get("too_easy_overlap_threshold_triggered", 0)
+            ) + 1
+
+        judge_called = bool(metadata.get("judge_called", False))
+        if judge_called:
+            stats["judge_calls"] = int(stats.get("judge_calls", 0)) + 1
+            judge_answerable = metadata.get("judge_answerable")
+            if isinstance(judge_answerable, bool):
+                if judge_answerable:
+                    stats["judge_answerable_true"] = int(stats.get("judge_answerable_true", 0)) + 1
+                else:
+                    stats["judge_answerable_false"] = int(stats.get("judge_answerable_false", 0)) + 1
+
+            judge_reason_tag = (
+                str(metadata.get("judge_reason_tag", "")).strip().lower() or _JUDGE_TAG_UNKNOWN
+            )
+            tags = stats.get("judge_reason_tags", {})
+            if isinstance(tags, dict):
+                if judge_reason_tag not in tags:
+                    tags[judge_reason_tag] = 0
+                tags[judge_reason_tag] = int(tags.get(judge_reason_tag, 0)) + 1
 
         failure_type = str(metadata.get("failure_type", "")).strip()
-        if failure_type == _FAILURE_TYPE_UNSUPPORTED:
-            stats["unsupported_total"] = int(stats.get("unsupported_total", 0)) + 1
-        elif failure_type == _FAILURE_TYPE_TOO_EASY:
+        if failure_type == _FAILURE_TYPE_TOO_EASY:
             stats["too_easy_total"] = int(stats.get("too_easy_total", 0)) + 1
-            too_easy_source = str(metadata.get("too_easy_source", "")).strip()
-            if too_easy_source == "judge_only":
-                stats["too_easy_due_to_judge_only"] = int(
-                    stats.get("too_easy_due_to_judge_only", 0)
+            source = str(metadata.get("too_easy_source", "")).strip()
+            if source == "overlap_pre_gate":
+                stats["too_easy_due_to_overlap_pre_gate"] = int(
+                    stats.get("too_easy_due_to_overlap_pre_gate", 0)
                 ) + 1
-            elif too_easy_source == "overlap_only":
-                stats["too_easy_due_to_overlap_only"] = int(
-                    stats.get("too_easy_due_to_overlap_only", 0)
+            elif source == "judge":
+                stats["too_easy_due_to_judge"] = int(
+                    stats.get("too_easy_due_to_judge", 0)
                 ) + 1
-            elif too_easy_source == "both":
-                stats["too_easy_due_to_both"] = int(stats.get("too_easy_due_to_both", 0)) + 1
-            elif too_easy_source == "non_lookup_evidence":
-                stats["too_easy_due_to_non_lookup_evidence"] = int(
-                    stats.get("too_easy_due_to_non_lookup_evidence", 0)
-                ) + 1
-
-        if bool(metadata.get("force_reanchor", False)):
-            stats["forced_reanchor_total"] = int(stats.get("forced_reanchor_total", 0)) + 1

@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import logging
 import random
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +21,6 @@ from synthetic_data_prep.qa_generation.cgft_models import (
 )
 from synthetic_data_prep.qa_generation.filters import (
     DeterministicGuardsFilter,
-    EnvRolloutFilter,
     GroundingLLMFilter,
     RetrievalLLMFilter,
 )
@@ -37,24 +35,16 @@ from synthetic_data_prep.qa_generation.linkers import (
     StructuralChunkLinker,
 )
 from synthetic_data_prep.qa_generation.protocols import ChunkLinker, EvaluatorFilter, QuestionGenerator
-from synthetic_data_prep.qa_generation.regenerators import FeedbackRefiner
 from synthetic_data_prep.qa_generation.response_parsers import parse_corpus_summary_response
 from synthetic_data_prep.trainer.client import RolloutClient
 
 logger = logging.getLogger(__name__)
 
-_FRESH_GENERATION_STRATEGIES = {"fresh_generation", "generator_retry"}
-_GENERATOR_REFINEMENT_STRATEGIES = {"regenerate_with_generator"}
-_FEEDBACK_REFINEMENT_STRATEGIES = {"same_anchor_feedback", "feedback"}
-_RETRIEVAL_FILTER_STAGE = "retrieval_llm"
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
 _GROUNDING_FILTER_STAGE = "grounding_llm"
-_ENV_FILTER_STAGE = "llm_env"
 _SUPPORTED_FILTER_STAGES = (
-    _RETRIEVAL_TOO_EASY_FILTER_STAGE,
     _GROUNDING_FILTER_STAGE,
-    _RETRIEVAL_FILTER_STAGE,
-    _ENV_FILTER_STAGE,
+    _RETRIEVAL_TOO_EASY_FILTER_STAGE,
 )
 
 
@@ -139,63 +129,22 @@ def _build_generator(
     )
 
 
-def _build_active_filter(
-    cfg: CgftPipelineConfig,
-    *,
-    source: Any,
-    rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
-) -> EvaluatorFilter:
-    mode = str(cfg.filtering.mode or "").strip().lower() or _RETRIEVAL_FILTER_STAGE
-    if mode == _ENV_FILTER_STAGE:
-        rollout_client = (
-            rollout_client_factory(cfg) if rollout_client_factory else _build_rollout_client(cfg)
-        )
-        return EnvRolloutFilter(
-            rollout_client=rollout_client,
-            cfg=cfg.filtering.llm_env,
-        )
-
-    return RetrievalLLMFilter(
-        chunk_source=source,
-        cfg=cfg.filtering.retrieval_llm,
-    )
-
-
 def _build_filter_from_stage_name(
     stage_name: str,
     cfg: CgftPipelineConfig,
     *,
     source: Any,
-    rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> EvaluatorFilter:
     stage = str(stage_name or "").strip().lower()
-    if stage == _RETRIEVAL_TOO_EASY_FILTER_STAGE:
-        stage_cfg = replace(
-            cfg.filtering.retrieval_llm,
-            route_unsupported_to_failure=False,
-            stats_key="retrieval_too_easy_filter_stats",
-        )
-        return RetrievalLLMFilter(
-            chunk_source=source,
-            cfg=stage_cfg,
-        )
     if stage == _GROUNDING_FILTER_STAGE:
         return GroundingLLMFilter(
             chunk_source=source,
             cfg=cfg.filtering.grounding_llm,
         )
-    if stage == _RETRIEVAL_FILTER_STAGE:
+    if stage == _RETRIEVAL_TOO_EASY_FILTER_STAGE:
         return RetrievalLLMFilter(
             chunk_source=source,
             cfg=cfg.filtering.retrieval_llm,
-        )
-    if stage == _ENV_FILTER_STAGE:
-        rollout_client = (
-            rollout_client_factory(cfg) if rollout_client_factory else _build_rollout_client(cfg)
-        )
-        return EnvRolloutFilter(
-            rollout_client=rollout_client,
-            cfg=cfg.filtering.llm_env,
         )
     raise ValueError(
         f"Unknown filter stage '{stage_name}'. "
@@ -207,28 +156,17 @@ def _build_filter_chain(
     cfg: CgftPipelineConfig,
     *,
     source: Any,
-    rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> tuple[list[str], list[EvaluatorFilter]]:
     chain_names = [
         str(name).strip().lower()
         for name in (cfg.filtering.filters or [])
         if str(name).strip()
     ]
-    if not chain_names:
-        mode = str(cfg.filtering.mode or "").strip().lower() or _RETRIEVAL_FILTER_STAGE
-        return [mode], [
-            _build_active_filter(
-                cfg,
-                source=source,
-                rollout_client_factory=rollout_client_factory,
-            )
-        ]
     filters = [
         _build_filter_from_stage_name(
             stage_name,
             cfg,
             source=source,
-            rollout_client_factory=rollout_client_factory,
         )
         for stage_name in chain_names
     ]
@@ -264,23 +202,6 @@ def _serialize_qa_with_filter_details(item: GeneratedQA) -> dict[str, Any]:
     row["filter_reasoning"] = verdict.reasoning
     row["filter_metadata"] = dict(verdict.metadata) if isinstance(verdict.metadata, dict) else {}
     return row
-
-
-def _resolve_refinement_strategy(strategy: str) -> str:
-    normalized = str(strategy or "").strip().lower()
-    if not normalized:
-        return "fresh_generation"
-    if normalized in _FRESH_GENERATION_STRATEGIES:
-        return "fresh_generation"
-    if normalized in _GENERATOR_REFINEMENT_STRATEGIES:
-        return "regenerate_with_generator"
-    if normalized in _FEEDBACK_REFINEMENT_STRATEGIES:
-        return "same_anchor_feedback"
-    logger.warning(
-        "Unknown refinement strategy '%s'; defaulting to fresh_generation.",
-        strategy,
-    )
-    return "fresh_generation"
 
 
 def _int_or(value: Any, default: int) -> int:
@@ -634,53 +555,6 @@ def _regenerate_with_generator(
     return regenerated_for_retry, failed_to_regenerate
 
 
-def _regenerate_fresh(
-    items: list[GeneratedQA],
-    *,
-    generator: QuestionGenerator,
-    context: CgftContext,
-) -> tuple[list[GeneratedQA], list[GeneratedQA]]:
-    """Discard failed items and generate a fresh batch with new random seeds.
-
-    Mirrors SAGE's ``GenerationRetryRegenerator`` approach: no feedback prompt,
-    no failed Q/A — just fresh tasks with different seed assignments.
-    """
-    cfg = context.config
-    seed_lookup = context.get("seed_chunk_lookup", {}) or {}
-    seed_chunk_ids = [str(sid) for sid in seed_lookup if str(sid)]
-    if not seed_chunk_ids:
-        return [], list(items)
-
-    # Bump the random seed so new tasks get different chunk assignments.
-    fresh_seed = cfg.random_seed + len(items) + int(context.get("total_regenerations", 0) or 0) + 1
-    fresh_cfg = CgftPipelineConfig(
-        platform=cfg.platform,
-        targets=cfg.targets,
-        linker=cfg.linker,
-        random_seed=fresh_seed,
-    )
-    fresh_tasks = build_generation_tasks(fresh_cfg, seed_chunk_ids=seed_chunk_ids)
-    # Only need as many replacements as there are failed items.
-    fresh_tasks = fresh_tasks[: len(items)]
-    if not fresh_tasks:
-        return [], list(items)
-
-    fresh_items = generator.generate(fresh_tasks, context)
-    # Mark them as having come through a fresh-generation retry.
-    for item in fresh_items:
-        item.filter_verdict = None
-        meta = dict(item.generation_metadata)
-        prev_count = max(0, _int_or(meta.get("refinement_count", 0), 0))
-        meta["refinement_count"] = prev_count + 1
-        item.generation_metadata = meta
-        item.regeneration_history = item.regeneration_history + [
-            {"type": "fresh_generation", "round": prev_count + 1}
-        ]
-
-    failed = items[len(fresh_items) :]
-    return list(fresh_items), list(failed)
-
-
 def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftContext) -> None:
     """Generate corpus summary/example queries from description and samples."""
     profile_cfg = cfg.corpus_context
@@ -842,13 +716,8 @@ class CgftPipeline:
         filter_stage_names, filter_chain = _build_filter_chain(
             cfg,
             source=source,
-            rollout_client_factory=self.rollout_client_factory,
         )
         context["filter_chain"] = list(filter_stage_names)
-        refinement_strategy = _resolve_refinement_strategy(cfg.refinement.strategy)
-        refiner: FeedbackRefiner | None = None
-        if refinement_strategy == "same_anchor_feedback":
-            refiner = FeedbackRefiner(cfg.refinement)
         formatter = TrainEvalFormatter(output_cfg=cfg.output, split_cfg=cfg.split)
 
         raw_items = generator.generate(tasks, context)
@@ -914,38 +783,19 @@ class CgftPipeline:
                     )
                 )
 
-            if refinement_strategy == "fresh_generation":
-                refined_items, regen_failures = _regenerate_fresh(
-                    to_refine,
-                    generator=generator,
-                    context=context,
-                )
-                if regen_failures:
-                    final_rejected.extend(
-                        _mark_rejected(
-                            regen_failures,
-                            reason="fresh_generation_failed",
-                            reason_code="fresh_generation_failed",
-                        )
+            refined_items, regen_failures = _regenerate_with_generator(
+                to_refine,
+                generator=generator,
+                context=context,
+            )
+            if regen_failures:
+                final_rejected.extend(
+                    _mark_rejected(
+                        regen_failures,
+                        reason="generator_regeneration_failed",
+                        reason_code="generator_regeneration_failed",
                     )
-            elif refinement_strategy == "regenerate_with_generator":
-                refined_items, regen_failures = _regenerate_with_generator(
-                    to_refine,
-                    generator=generator,
-                    context=context,
                 )
-                if regen_failures:
-                    final_rejected.extend(
-                        _mark_rejected(
-                            regen_failures,
-                            reason="generator_regeneration_failed",
-                            reason_code="generator_regeneration_failed",
-                        )
-                    )
-            else:
-                if refiner is None:
-                    raise RuntimeError("Refiner is not configured for feedback refinement strategy.")
-                refined_items = refiner.refine(to_refine, context)
             total_regens += len(to_refine)
             next_active: list[GeneratedQA] = []
             for item in refined_items:
@@ -993,10 +843,6 @@ class CgftPipeline:
         if isinstance(guard_stats, dict) and guard_stats:
             result["stats"]["deterministic_guards"] = dict(guard_stats)
 
-        retrieval_stats = context.get("retrieval_filter_stats")
-        if isinstance(retrieval_stats, dict) and retrieval_stats:
-            result["stats"]["retrieval_filter"] = dict(retrieval_stats)
-
         retrieval_too_easy_stats = context.get("retrieval_too_easy_filter_stats")
         if isinstance(retrieval_too_easy_stats, dict) and retrieval_too_easy_stats:
             result["stats"]["retrieval_too_easy_filter"] = dict(retrieval_too_easy_stats)
@@ -1005,9 +851,6 @@ class CgftPipeline:
         if isinstance(grounding_stats, dict) and grounding_stats:
             result["stats"]["grounding_filter"] = dict(grounding_stats)
 
-        env_stats = context.get("env_filter_stats")
-        if isinstance(env_stats, dict) and env_stats:
-            result["stats"]["env_filter"] = dict(env_stats)
         return result
 
 

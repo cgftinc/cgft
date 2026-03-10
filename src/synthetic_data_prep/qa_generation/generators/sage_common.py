@@ -7,7 +7,7 @@ from typing import Any
 
 from synthetic_data_prep.qa_generation.anchor_selector import AnchorBundle
 from synthetic_data_prep.qa_generation.generated_qa import GeneratedQA
-from synthetic_data_prep.qa_generation.models import QADataPoint
+from synthetic_data_prep.qa_generation.models import QADataPoint, ReferenceChunk
 from synthetic_data_prep.qa_generation.sage_utils import (
     QuestionGenEnv,
     SagePipelineConfig,
@@ -119,6 +119,44 @@ def bundle_search_environment(
     )
 
 
+def _chunk_to_reference_chunk(chunk: Any) -> ReferenceChunk:
+    """Convert a Chunk (or chunk-like object) to a ReferenceChunk dict."""
+    metadata: dict[str, Any] = {}
+    if hasattr(chunk, "metadata_dict"):
+        metadata = dict(chunk.metadata_dict)
+    elif hasattr(chunk, "metadata") and isinstance(chunk.metadata, dict):
+        metadata = dict(chunk.metadata)
+    elif isinstance(chunk, dict):
+        metadata = dict(chunk.get("metadata", {}) or {})
+
+    chunk_id = (
+        getattr(chunk, "hash", None)
+        or metadata.get("id")
+        or metadata.get("file")
+        or str(chunk)[:80]
+    )
+    content = chunk.content if hasattr(chunk, "content") else str(chunk)
+    return {"id": str(chunk_id), "metadata": metadata, "content": str(content)}
+
+
+def _build_reference_chunks_from_anchor(
+    anchor: AnchorBundle,
+) -> list[ReferenceChunk]:
+    """Extract reference chunks from an AnchorBundle, deduplicated by id."""
+    refs = [_chunk_to_reference_chunk(anchor.primary_chunk)]
+    refs.extend(_chunk_to_reference_chunk(c) for c in anchor.secondary_chunks)
+    refs.extend(
+        _chunk_to_reference_chunk(c) for c in anchor.structural_hints.get("bm25_related", [])
+    )
+    seen: set[str] = set()
+    deduped: list[ReferenceChunk] = []
+    for ref in refs:
+        if ref["id"] not in seen:
+            seen.add(ref["id"])
+            deduped.append(ref)
+    return deduped
+
+
 def build_generated_item(
     *,
     qa: dict[str, Any],
@@ -132,7 +170,7 @@ def build_generated_item(
     qa_data_point: QADataPoint = {
         "question": qa["question"],
         "answer": qa["answer"],
-        "reference_chunks": [],
+        "reference_chunks": (_build_reference_chunks_from_anchor(anchor) if anchor else []),
         "qa_type": anchor.target_qa_type if anchor else "unknown",
         "min_hop_count": target_steps,
         "is_co_located": None,
