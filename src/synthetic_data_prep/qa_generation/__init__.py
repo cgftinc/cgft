@@ -6,6 +6,7 @@ from .anchor_utils import (
     generate_bm25_queries,
     select_anchor_bundle_with_enrichment,
 )
+from .batch_processor import BatchResponse, BatchResult, batch_process_sync
 from .cgft_models import (
     CgftContext,
     CgftPipelineConfig,
@@ -21,7 +22,6 @@ from .filters import (
     DeterministicGuardsFilter,
     EnvRolloutFilter,
     GroundingLLMFilter,
-    RetrievalDifficultyFilter,
     RetrievalLLMFilter,
 )
 from .formatters import TrainEvalFormatter
@@ -40,9 +40,12 @@ from .protocols import (
     QuestionGenerator,
     Refiner,
 )
-from .regenerators import FeedbackRefiner, GenerationRetryRegenerator
+from .regenerators import FeedbackRefiner
 
 __all__ = [
+    "BatchResponse",
+    "BatchResult",
+    "batch_process_sync",
     "AnchorBundle",
     "AnchorSelector",
     "CorpusCapabilities",
@@ -73,9 +76,7 @@ __all__ = [
     "RetrievalLLMFilter",
     "GroundingLLMFilter",
     "EnvRolloutFilter",
-    "RetrievalDifficultyFilter",
     "FeedbackRefiner",
-    "GenerationRetryRegenerator",
     "Pipeline",
     "TrainEvalFormatter",
     "CgftPipeline",

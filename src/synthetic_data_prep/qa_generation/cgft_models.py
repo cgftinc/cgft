@@ -111,9 +111,10 @@ Rules:
 - The answer must be FULLY supported. Partial support is not enough.
 - For multi-hop answers, all intermediate facts must be present in the evidence.
 - Do not use external knowledge.
+- Identify which specific chunk IDs provide the supporting evidence.
 
 Respond with JSON only:
-{"answerable": <bool>, "confidence": <float 0-1>, "reasoning": "<brief explanation>"}"""
+{"answerable": <bool>, "confidence": <float 0-1>, "reasoning": "<brief explanation>", "supporting_chunk_ids": ["<id1>", "<id2>", ...]}"""
 
 DEFAULT_GROUNDING_JUDGE_USER_TEMPLATE = """\
 Question: {question}
@@ -329,6 +330,9 @@ class LLMDirectGenerationConfig:
     timeout: float = 120.0
     system_prompt: str = "You are an expert QA dataset author."
     prompt_templates_by_qa_type: dict[str, str] = field(default_factory=dict)
+    max_concurrent: int = 8
+    batch_enabled: bool = True
+    show_batch_progress: bool = True
 
 
 @dataclass
@@ -413,6 +417,8 @@ class RetrievalLLMFilterConfig:
     too_easy_confidence_threshold: float = 0.75
     too_easy_overlap_threshold: float = 0.65
     stats_key: str = "retrieval_too_easy_filter_stats"
+    max_concurrent: int = 8
+    batch_enabled: bool = True
 
 
 @dataclass
@@ -427,6 +433,8 @@ class GroundingLLMFilterConfig:
     judge_user_template: str = DEFAULT_GROUNDING_JUDGE_USER_TEMPLATE
     top_k: int = 5
     stats_key: str = "grounding_filter_stats"
+    max_concurrent: int = 8
+    batch_enabled: bool = True
 
 
 @dataclass
@@ -914,6 +922,9 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
                 direct_raw.get("system_prompt", LLMDirectGenerationConfig().system_prompt)
             ),
             prompt_templates_by_qa_type=dict(direct_raw.get("prompt_templates_by_qa_type", {}) or {}),
+            max_concurrent=max(1, int(direct_raw.get("max_concurrent", 8))),
+            batch_enabled=bool(direct_raw.get("batch_enabled", True)),
+            show_batch_progress=bool(direct_raw.get("show_batch_progress", True)),
         ),
         llm_env=LLMEnvGenerationConfig(
             model=str(env_gen_raw.get("model", "gpt-5-mini")),
@@ -988,7 +999,6 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         filters=chain_filters,
         query_rewrite=QueryRewriteConfig(
             enabled=bool(rewrite_raw.get("enabled", True)),
-            source=(str(rewrite_raw.get("source", "heuristic")).strip().lower() or "heuristic"),
             max_terms=max(1, int(rewrite_raw.get("max_terms", 16))),
             max_chars=max(20, int(rewrite_raw.get("max_chars", 140))),
             apply_to_all_rows=bool(rewrite_raw.get("apply_to_all_rows", True)),
@@ -1030,6 +1040,8 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
                 str(retrieval_raw.get("stats_key", "retrieval_too_easy_filter_stats")).strip()
                 or "retrieval_too_easy_filter_stats"
             ),
+            max_concurrent=max(1, int(retrieval_raw.get("max_concurrent", 8))),
+            batch_enabled=bool(retrieval_raw.get("batch_enabled", True)),
         ),
         grounding_llm=GroundingLLMFilterConfig(
             enabled=bool(grounding_raw.get("enabled", True)),
@@ -1059,6 +1071,8 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
                 str(grounding_raw.get("stats_key", "grounding_filter_stats")).strip()
                 or "grounding_filter_stats"
             ),
+            max_concurrent=max(1, int(grounding_raw.get("max_concurrent", 8))),
+            batch_enabled=bool(grounding_raw.get("batch_enabled", True)),
         ),
     )
 

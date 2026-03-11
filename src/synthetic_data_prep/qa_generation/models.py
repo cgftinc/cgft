@@ -34,6 +34,9 @@ class QADataPoint(TypedDict):
     no_context_answer: Optional[str]
     eval_scores: dict
 
+    # Populated by grounding filter: subset of reference_chunks verified as supporting the answer
+    verified_reference_chunks: NotRequired[list[ReferenceChunk]]
+
     # @model_validator(mode='after')
     # def derive_additional_fields(self):
     #     super()

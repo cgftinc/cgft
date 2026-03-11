@@ -19,7 +19,6 @@ class QueryRewriteConfig:
     """Configuration for deriving retrieval-friendly query text."""
 
     enabled: bool = True
-    source: str = "heuristic"
     max_terms: int = 16
     max_chars: int = 140
     apply_to_all_rows: bool = True
@@ -61,18 +60,11 @@ def resolve_retrieval_query(
         should_rewrite = observed in {QUERY_STYLE_NATURAL, QUERY_STYLE_EXPERT}
 
     if should_rewrite:
-        if rewrite_cfg.source == "heuristic":
-            rewritten = heuristic_query_rewrite(
-                user_question,
-                max_terms=rewrite_cfg.max_terms,
-                max_chars=rewrite_cfg.max_chars,
-            )
-        else:
-            rewritten = heuristic_query_rewrite(
-                user_question,
-                max_terms=rewrite_cfg.max_terms,
-                max_chars=rewrite_cfg.max_chars,
-            )
+        rewritten = heuristic_query_rewrite(
+            user_question,
+            max_terms=rewrite_cfg.max_terms,
+            max_chars=rewrite_cfg.max_chars,
+        )
         resolved = rewritten or user_question
     else:
         resolved = user_question

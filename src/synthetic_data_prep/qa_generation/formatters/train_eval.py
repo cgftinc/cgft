@@ -70,7 +70,7 @@ class TrainEvalFormatter:
             "style_target": style_target,
             "style_observed": style_observed,
             "min_hop_count": item.qa.get("min_hop_count"),
-            "reference_chunks": item.qa.get("reference_chunks", []),
+            "reference_chunks": item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []),
             "generation_metadata": {
                 "qa_type_target": item.generation_metadata.get("qa_type_target"),
                 "target_hop_count": item.generation_metadata.get("target_hop_count"),

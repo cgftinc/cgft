@@ -5,12 +5,18 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from openai import OpenAI
 
 from synthetic_data_prep.qa_generation.anchor_selector import AnchorBundle
-from synthetic_data_prep.qa_generation.cgft_models import CgftContext, GenerationTask, LLMDirectGenerationConfig
+from synthetic_data_prep.qa_generation.batch_processor import BatchResult, batch_process_sync
+from synthetic_data_prep.qa_generation.cgft_models import (
+    CgftContext,
+    GenerationTask,
+    LLMDirectGenerationConfig,
+)
 from synthetic_data_prep.qa_generation.generated_qa import GeneratedQA
 from synthetic_data_prep.qa_generation.helpers import render_template
 from synthetic_data_prep.qa_generation.models import QADataPoint, ReferenceChunk
@@ -54,9 +60,10 @@ _DEFAULT_TEMPLATE = (
     "- Reduce lexical shortcut risk by paraphrasing direct chunk phrasing and adding compositional constraints.\n"
     "[[if previous_failure_type]]- If previous_failure_type=too_easy, keep answer facts stable and make the question harder.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer using current chunk evidence only.\n[[endif]]"
-    "- Output exactly one question and one answer.\n\n"
+    "- Output exactly one question and one answer.\n"
+    "- In chunks_used, list the indices of chunks you referenced (0=primary, 1+=secondary).\n\n"
     'First output your reasoning in <think>...</think>, then provide:\n'
-    '```json\n{{\"question\": \"...\", \"answer\": \"...\", \"answering_steps\": \"...\"}}\n```'
+    '```json\n{{\"question\": \"...\", \"answer\": \"...\", \"answering_steps\": \"...\", \"chunks_used\": [0, 1, ...]}}\n```'
 )
 
 
@@ -97,10 +104,10 @@ def _create_chat_completion_with_fallback(client: OpenAI, **kwargs: Any) -> Any:
         raise
 
 
-def _parse_qa_response(raw_text: str) -> tuple[str, str]:
+def _parse_qa_response(raw_text: str) -> tuple[str, str, list[int] | None]:
     text = (raw_text or "").strip()
     if not text:
-        return "", ""
+        return "", "", None
 
     # Strip <think> blocks before parsing
     text = _THINK_BLOCK_RE.sub("", text).strip()
@@ -113,17 +120,21 @@ def _parse_qa_response(raw_text: str) -> tuple[str, str]:
         question = str(payload.get("question", "")).strip()
         answer = str(payload.get("answer", "")).strip()
         if question and answer:
-            return question, answer
+            raw_chunks_used = payload.get("chunks_used")
+            chunks_used: list[int] | None = None
+            if isinstance(raw_chunks_used, list):
+                chunks_used = [int(i) for i in raw_chunks_used if isinstance(i, (int, float))]
+            return question, answer, chunks_used
 
     question_match = _QUESTION_RE.search(text)
     answer_match = _ANSWER_RE.search(text)
     if question_match and answer_match:
-        return question_match.group(1).strip(), answer_match.group(1).strip()
+        return question_match.group(1).strip(), answer_match.group(1).strip(), None
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
-        return lines[0], "\n".join(lines[1:])
-    return "", ""
+        return lines[0], "\n".join(lines[1:]), None
+    return "", "", None
 
 
 def _chunk_to_reference_chunk(chunk: Any) -> ReferenceChunk:
@@ -160,6 +171,20 @@ def _format_secondary_chunks(anchor: AnchorBundle) -> str:
     return "\n\n".join(parts)
 
 
+@dataclass
+class _PreparedTask:
+    """Intermediate representation of a prepared generation task."""
+
+    task: GenerationTask
+    anchor: Any  # AnchorBundle
+    prompt: str
+    system_prompt: str
+    resolved_qa_type: str
+    resolved_hop_count: int
+    requested_qa_type: str
+    requested_hop_count: int
+
+
 class DirectLLMGenerator:
     """Direct-call generator using task+anchor intent."""
 
@@ -175,13 +200,67 @@ class DirectLLMGenerator:
         self.cfg = cfg
 
     def generate(self, tasks: list[GenerationTask], context: CgftContext) -> list[GeneratedQA]:
+        if not self.cfg.batch_enabled or len(tasks) <= 1:
+            return self._generate_sequential(tasks, context)
+        return self._generate_batched(tasks, context)
+
+    def _generate_sequential(
+        self, tasks: list[GenerationTask], context: CgftContext
+    ) -> list[GeneratedQA]:
+        """Original sequential generation path."""
+        generated: list[GeneratedQA] = []
+        for pt in self._prepare_tasks(tasks, context):
+            completion = _create_chat_completion_with_fallback(
+                self.client,
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": pt.system_prompt},
+                    {"role": "user", "content": pt.prompt},
+                ],
+                max_completion_tokens=self.cfg.max_completion_tokens,
+                timeout=self.cfg.timeout,
+                temperature=1.0,
+            )
+            raw_text = completion.choices[0].message.content or ""
+            question, answer, chunks_used = _parse_qa_response(raw_text)
+            if not question or not answer:
+                logger.warning("Skipping task %s: failed to parse QA response.", pt.task.task_id)
+                continue
+            generated.append(self._build_generated_qa(pt, question, answer, chunks_used))
+        return generated
+
+    def _generate_batched(
+        self, tasks: list[GenerationTask], context: CgftContext
+    ) -> list[GeneratedQA]:
+        """Parallel batch generation path."""
+        prepared = self._prepare_tasks(tasks, context)
+        if not prepared:
+            return []
+
+        result = batch_process_sync(
+            client=self.client,
+            model=self.cfg.model,
+            prompts=[pt.prompt for pt in prepared],
+            system_prompt=[pt.system_prompt for pt in prepared],
+            max_tokens=self.cfg.max_completion_tokens,
+            timeout=self.cfg.timeout,
+            max_concurrent=self.cfg.max_concurrent,
+            show_progress=self.cfg.show_batch_progress,
+            temperature=1.0,
+        )
+        return self._process_batch_results(prepared, result)
+
+    def _prepare_tasks(
+        self, tasks: list[GenerationTask], context: CgftContext
+    ) -> list[_PreparedTask]:
+        """Resolve anchors and build prompts for all tasks."""
         seed_lookup: dict[str, Any] = context.get("seed_chunk_lookup", {})
         corpus_pool: list[Any] = context.get("corpus_pool", [])
         corpus_summary = str(context.get("corpus_summary", "") or "").strip()
         corpus_queries = str(context.get("corpus_queries", "") or "").strip()
         corpus_description = str(context.get("corpus_description", "") or "").strip()
-        generated: list[GeneratedQA] = []
 
+        prepared: list[_PreparedTask] = []
         for task in tasks:
             seed_chunk = seed_lookup.get(task.seed_chunk_id)
             if seed_chunk is None and corpus_pool:
@@ -226,74 +305,94 @@ class DirectLLMGenerator:
                 "failed_question": task.failed_question,
                 "failed_answer": task.failed_answer,
                 "primary_chunk": (
-                    anchor.primary_chunk.chunk_str()
+                    f"[0] {anchor.primary_chunk.chunk_str()}"
                     if hasattr(anchor.primary_chunk, "chunk_str")
-                    else str(anchor.primary_chunk)
+                    else f"[0] {anchor.primary_chunk!s}"
                 ),
                 "secondary_chunks": _format_secondary_chunks(anchor),
             }
             prompt = _render_template_safe(template, variables)
             system_prompt = _render_template_safe(self.cfg.system_prompt, variables)
 
-            user_content = prompt
             regeneration_prompt = str(task.regeneration_prompt or "").strip()
             if regeneration_prompt:
-                user_content = (
-                    f"{user_content}\n\n"
+                prompt = (
+                    f"{prompt}\n\n"
                     "Use this regeneration feedback from the failed prior attempt:\n"
                     f"{regeneration_prompt}"
                 )
-            completion = _create_chat_completion_with_fallback(
-                self.client,
-                model=self.cfg.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                max_completion_tokens=self.cfg.max_completion_tokens,
-                timeout=self.cfg.timeout,
-                temperature=1.0,
-            )
-            raw_text = completion.choices[0].message.content or ""
-            question, answer = _parse_qa_response(raw_text)
-            if not question or not answer:
-                logger.warning("Skipping task %s: failed to parse QA response.", task.task_id)
-                continue
 
-            reference_chunks = [_chunk_to_reference_chunk(anchor.primary_chunk)]
-            reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in anchor.secondary_chunks)
-            bm25_chunks = anchor.structural_hints.get("bm25_related", [])
-            reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in bm25_chunks)
-
-            qa_point: QADataPoint = {
-                "question": question,
-                "answer": answer,
-                "reference_chunks": reference_chunks,
-                "qa_type": resolved_qa_type,
-                "min_hop_count": resolved_hop_count,
-                "is_co_located": None,
-                "filter_status": None,
-                "filter_reasoning": None,
-                "no_context_answer": None,
-                "eval_scores": {},
-            }
-            generated.append(
-                GeneratedQA(
-                    qa=qa_point,
-                    generation_metadata={
-                        "qa_type_target": resolved_qa_type,
-                        "target_hop_count": resolved_hop_count,
-                        "qa_type_requested": requested_qa_type,
-                        "target_hop_count_requested": requested_hop_count,
-                        "anchor_bundle": anchor,
-                        "generation_mode": "llm_direct",
-                        "refinement_count": 0,
-                        "same_seed_refinement_count": 0,
-                        "task_id": task.task_id,
-                        "source_task_id": task.source_task_id or task.task_id,
-                        "regeneration_attempt": task.regeneration_attempt,
-                        "seed_chunk_id": task.seed_chunk_id,
-                    },
+            prepared.append(
+                _PreparedTask(
+                    task=task,
+                    anchor=anchor,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    resolved_qa_type=resolved_qa_type,
+                    resolved_hop_count=resolved_hop_count,
+                    requested_qa_type=requested_qa_type,
+                    requested_hop_count=requested_hop_count,
                 )
             )
+        return prepared
+
+    def _process_batch_results(
+        self, prepared: list[_PreparedTask], result: BatchResult
+    ) -> list[GeneratedQA]:
+        """Parse batch LLM responses and build GeneratedQA objects."""
+        generated: list[GeneratedQA] = []
+        for pt, response in zip(prepared, result.responses):
+            if response is None:
+                logger.warning("Skipping task %s: batch LLM call failed.", pt.task.task_id)
+                continue
+            question, answer, chunks_used = _parse_qa_response(response.answer or "")
+            if not question or not answer:
+                logger.warning("Skipping task %s: failed to parse QA response.", pt.task.task_id)
+                continue
+            generated.append(self._build_generated_qa(pt, question, answer, chunks_used))
         return generated
+
+    @staticmethod
+    def _build_generated_qa(
+        pt: _PreparedTask,
+        question: str,
+        answer: str,
+        chunks_used: list[int] | None = None,
+    ) -> GeneratedQA:
+        """Build a GeneratedQA from a prepared task and parsed question/answer."""
+        anchor = pt.anchor
+        reference_chunks = [_chunk_to_reference_chunk(anchor.primary_chunk)]
+        reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in anchor.secondary_chunks)
+        bm25_chunks = anchor.structural_hints.get("bm25_related", [])
+        reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in bm25_chunks)
+
+        qa_point: QADataPoint = {
+            "question": question,
+            "answer": answer,
+            "reference_chunks": reference_chunks,
+            "qa_type": pt.resolved_qa_type,
+            "min_hop_count": pt.resolved_hop_count,
+            "is_co_located": None,
+            "filter_status": None,
+            "filter_reasoning": None,
+            "no_context_answer": None,
+            "eval_scores": {},
+        }
+        return GeneratedQA(
+            qa=qa_point,
+            generation_metadata={
+                "qa_type_target": pt.resolved_qa_type,
+                "target_hop_count": pt.resolved_hop_count,
+                "qa_type_requested": pt.requested_qa_type,
+                "target_hop_count_requested": pt.requested_hop_count,
+                "anchor_bundle": anchor,
+                "generation_mode": "llm_direct",
+                "refinement_count": 0,
+                "same_seed_refinement_count": 0,
+                "task_id": pt.task.task_id,
+                "source_task_id": pt.task.source_task_id or pt.task.task_id,
+                "regeneration_attempt": pt.task.regeneration_attempt,
+                "seed_chunk_id": pt.task.seed_chunk_id,
+                "generator_chunks_used": chunks_used,
+            },
+        )

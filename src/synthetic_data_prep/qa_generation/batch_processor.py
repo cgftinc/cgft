@@ -41,6 +41,7 @@ def _chat_completion_with_token_fallback(
     messages: list[dict[str, str]],
     max_tokens: int,
     timeout: float,
+    temperature: float = 1.0,
 ):
     """Call chat completions with both token params, then fallback by error hint.
 
@@ -54,6 +55,7 @@ def _chat_completion_with_token_fallback(
         "max_tokens": max_tokens,
         "max_completion_tokens": max_tokens,
         "timeout": timeout,
+        "temperature": temperature,
     }
     try:
         return client.chat.completions.create(**kwargs)
@@ -141,6 +143,7 @@ async def call_openai_async(
     system_prompt: str | None = None,
     max_tokens: int = 500,
     timeout: float = 60.0,
+    temperature: float = 1.0,
 ) -> BatchResponse:
     """Call OpenAI API asynchronously for a single prompt.
 
@@ -151,6 +154,7 @@ async def call_openai_async(
         system_prompt: Optional system prompt
         max_tokens: Maximum tokens in response
         timeout: Request timeout in seconds
+        temperature: Sampling temperature
 
     Returns:
         BatchResponse with the result
@@ -172,6 +176,7 @@ async def call_openai_async(
             messages=messages,
             max_tokens=max_tokens,
             timeout=timeout,
+            temperature=temperature,
         ),
     )
 
@@ -193,11 +198,12 @@ async def batch_process_async(
     client: Any,
     model: str,
     prompts: list[str],
-    system_prompt: str | None = None,
+    system_prompt: str | list[str] | None = None,
     max_tokens: int = 500,
     timeout: float = 60.0,
     max_concurrent: int = 10,
     show_progress: bool = True,
+    temperature: float = 1.0,
 ) -> BatchResult:
     """Process multiple prompts in parallel with rate limiting.
 
@@ -205,11 +211,14 @@ async def batch_process_async(
         client: OpenAI client instance
         model: Model name to use
         prompts: List of user prompts
-        system_prompt: Optional system prompt (same for all)
+        system_prompt: Optional system prompt. Pass a single string to use the same
+            prompt for all requests, or a list aligned to ``prompts`` for per-prompt
+            system prompts.
         max_tokens: Maximum tokens per response
         timeout: Request timeout in seconds
         max_concurrent: Maximum concurrent requests
         show_progress: Whether to print progress updates
+        temperature: Sampling temperature
 
     Returns:
         BatchResult with all responses
@@ -238,22 +247,26 @@ async def batch_process_async(
     # Create progress bar if enabled
     pbar = tqdm(total=len(prompts), desc="Processing prompts", disable=not show_progress)
 
-    async def process_with_semaphore(prompt: str) -> BatchResponse:
+    async def process_with_semaphore(idx: int, prompt: str) -> BatchResponse:
         async with semaphore:
+            per_prompt_system = (
+                system_prompt[idx] if isinstance(system_prompt, list) else system_prompt
+            )
             try:
                 return await call_openai_async(
                     client=client,
                     model=model,
                     prompt=prompt,
-                    system_prompt=system_prompt,
+                    system_prompt=per_prompt_system,
                     max_tokens=max_tokens,
                     timeout=timeout,
+                    temperature=temperature,
                 )
             finally:
                 pbar.update(1)
 
     # Process all prompts concurrently
-    tasks = [process_with_semaphore(prompt) for prompt in prompts]
+    tasks = [process_with_semaphore(i, prompt) for i, prompt in enumerate(prompts)]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
     pbar.close()
 
@@ -282,11 +295,12 @@ def batch_process_sync(
     client: Any,
     model: str,
     prompts: list[str],
-    system_prompt: str | None = None,
+    system_prompt: str | list[str] | None = None,
     max_tokens: int = 500,
     timeout: float = 60.0,
     max_concurrent: int = 10,
     show_progress: bool = True,
+    temperature: float = 1.0,
 ) -> BatchResult:
     """Synchronous wrapper for batch_process_async.
 
@@ -324,6 +338,7 @@ def batch_process_sync(
         timeout=timeout,
         max_concurrent=max_concurrent,
         show_progress=show_progress,
+        temperature=temperature,
     )
 
     try:
