@@ -24,20 +24,9 @@ from .filters import (
     RetrievalDifficultyFilter,
     RetrievalLLMFilter,
 )
-from .formatters import SageFormatter, TrainEvalFormatter
+from .formatters import TrainEvalFormatter
 from .generated_qa import FilterVerdict, GeneratedQA
-from .generators import DirectLLMGenerator, EnvRolloutGenerator, SageGenerator
-from .legacy_prompt_archive import (
-    HYBRID_PROMPTS,
-    SAGE_PROMPTS,
-    get_hybrid_prompts,
-    get_sage_prompts,
-    hybrid_multi_hop_user_template_for_cgft,
-    hybrid_single_hop_user_template_for_cgft,
-    render_hybrid_multi_hop_system_prompt,
-    render_hybrid_single_hop_system_prompt,
-    render_hybrid_style_instruction,
-)
+from .generators import DirectLLMGenerator, EnvRolloutGenerator
 from .linkers import AdaptiveChunkLinker, LLMGuidedChunkLinker, StructuralChunkLinker
 from .orchestrator import Pipeline
 from .protocols import (
@@ -78,15 +67,6 @@ __all__ = [
     "StructuralChunkLinker",
     "LLMGuidedChunkLinker",
     "AdaptiveChunkLinker",
-    "HYBRID_PROMPTS",
-    "SAGE_PROMPTS",
-    "get_hybrid_prompts",
-    "get_sage_prompts",
-    "render_hybrid_style_instruction",
-    "render_hybrid_single_hop_system_prompt",
-    "render_hybrid_multi_hop_system_prompt",
-    "hybrid_single_hop_user_template_for_cgft",
-    "hybrid_multi_hop_user_template_for_cgft",
     "DirectLLMGenerator",
     "EnvRolloutGenerator",
     "DeterministicGuardsFilter",
@@ -96,8 +76,6 @@ __all__ = [
     "RetrievalDifficultyFilter",
     "FeedbackRefiner",
     "GenerationRetryRegenerator",
-    "SageFormatter",
-    "SageGenerator",
     "Pipeline",
     "TrainEvalFormatter",
     "CgftPipeline",

@@ -13,10 +13,6 @@ import yaml
 from synthetic_data_prep.qa_generation.anchor_selector import (
     DEFAULT_TARGET_HOP_COUNTS,
 )
-from synthetic_data_prep.qa_generation.legacy_prompt_archive import (
-    HYBRID_CORPUS_SYSTEM_PROMPT,
-    HYBRID_CORPUS_USER_TEMPLATE,
-)
 from synthetic_data_prep.qa_generation.style_controls import (
     QUERY_STYLE_EXPERT,
     QUERY_STYLE_KEYWORD,
@@ -24,6 +20,58 @@ from synthetic_data_prep.qa_generation.style_controls import (
     normalize_style_distribution,
 )
 from synthetic_data_prep.qa_generation.retrieval_query import QueryRewriteConfig
+
+CORPUS_SYSTEM_PROMPT = (
+    "You are a technical analyst specializing in document corpus analysis.\n"
+    "Your goal is to understand the overall themes, content type, and typical query that a user might search for.\n"
+    "\n"
+    "Based on the context and thoughts, form an understanding of the corpus, and then provide a short summary and "
+    "example search queries. Weigh the user's input if provided.\n"
+    "\n"
+    "Guideline:\n"
+    "- Try to generalize and identify the overall theme of the corpus.\n"
+    "- Use your context of the theme, domain, etc. to guess the persona and purpose of searching this corpus\n"
+    "- i.e.\n"
+    "    - student finding their learning notes\n"
+    "    - developer looking up API documentation\n"
+    "    - journalist researching a topic\n"
+    "    - business analyst gathering market research\n"
+    "- Use that persona to guess the types of queries they might perform.\n"
+    "\n"
+    "For the summary:\n"
+    "- First line - corpus themes (documentation, tutorials, reference, etc.)\n"
+    "- Second line - content domain (technical, business, scientific, etc.)\n"
+    "- Third line - user persona and purpose (likely developer looking up API documentation)\n"
+    "- Do NOT cite specific chunk content in the summary.\n"
+    "\n"
+    "For the example queries:\n"
+    "- Provide 5-10 realistic example queries a user might search for in this corpus.\n"
+    "- Use the inferred user persona and purpose to guide the query style.\n"
+    "- Queries can have incomplete information, as often users do not remember full context.\n"
+    "\n"
+    'Return JSON with:\n'
+    '- thoughts: Your analysis and reasoning here\n'
+    '- summary: our summary here (3 lines as described above)\n'
+    '- example_queries: List of example queries in the form of ["query1", "query2", ...]'
+)
+
+CORPUS_USER_TEMPLATE = (
+    "Analyze the following document corpus:\n"
+    "\n"
+    "<user_context>\n"
+    "{user_context}\n"
+    "</user_context>\n"
+    "\n"
+    "<top_level_chunks>\n"
+    "{top_level_content}\n"
+    "</top_level_chunks>\n"
+    "\n"
+    "<random_sampled_chunks>\n"
+    "{random_content}\n"
+    "</random_sampled_chunks>\n"
+    "\n"
+    "Return your analysis as JSON with keys: thoughts, summary, example_queries"
+)
 
 DEFAULT_QA_TYPE_DISTRIBUTION = {
     "lookup": 0.333,
@@ -207,8 +255,8 @@ class CorpusContextConfig:
     num_top_level_samples: int = 4
     num_random_samples: int = 4
     min_chunk_chars: int = 400
-    system_prompt: str = HYBRID_CORPUS_SYSTEM_PROMPT
-    user_template: str = HYBRID_CORPUS_USER_TEMPLATE
+    system_prompt: str = CORPUS_SYSTEM_PROMPT
+    user_template: str = CORPUS_USER_TEMPLATE
     generate_entity_patterns: bool = True
     entity_extraction: EntityExtractionConfig | None = None
     entity_extraction_llm: EntityExtractionLLMConfig = field(default_factory=EntityExtractionLLMConfig)
@@ -786,13 +834,13 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         num_random_samples=max(0, int(corpus_context_raw.get("num_random_samples", 4))),
         min_chunk_chars=max(0, int(corpus_context_raw.get("min_chunk_chars", 400))),
         system_prompt=str(
-            corpus_context_raw.get("system_prompt", HYBRID_CORPUS_SYSTEM_PROMPT)
+            corpus_context_raw.get("system_prompt", CORPUS_SYSTEM_PROMPT)
         ).strip()
-        or HYBRID_CORPUS_SYSTEM_PROMPT,
+        or CORPUS_SYSTEM_PROMPT,
         user_template=str(
-            corpus_context_raw.get("user_template", HYBRID_CORPUS_USER_TEMPLATE)
+            corpus_context_raw.get("user_template", CORPUS_USER_TEMPLATE)
         ).strip()
-        or HYBRID_CORPUS_USER_TEMPLATE,
+        or CORPUS_USER_TEMPLATE,
         generate_entity_patterns=bool(corpus_context_raw.get("generate_entity_patterns", True)),
         entity_extraction_llm=EntityExtractionLLMConfig(
             model=str(
