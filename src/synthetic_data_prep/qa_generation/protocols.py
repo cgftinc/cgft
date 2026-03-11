@@ -74,6 +74,13 @@ class Refiner(Protocol):
 
 
 @runtime_checkable
+class QuestionTransformer(Protocol):
+    """Transforms question text without changing answers or reference chunks."""
+
+    def transform(self, items: list[GeneratedQA], context: CgftContext) -> list[GeneratedQA]: ...
+
+
+@runtime_checkable
 class Formatter(Protocol):
     """Formats final pipeline output artifacts."""
 

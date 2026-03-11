@@ -21,9 +21,9 @@ from synthetic_data_prep.qa_generation.style_controls import (
     QUERY_STYLE_EXPERT,
     QUERY_STYLE_KEYWORD,
     QUERY_STYLE_NATURAL,
-    allocate_largest_remainder,
     normalize_style_distribution,
 )
+from synthetic_data_prep.qa_generation.retrieval_query import QueryRewriteConfig
 
 DEFAULT_QA_TYPE_DISTRIBUTION = {
     "lookup": 0.333,
@@ -32,36 +32,6 @@ DEFAULT_QA_TYPE_DISTRIBUTION = {
     "sequential_reasoning": 0.133,
     "synthesis": 0.0,
 }
-
-DEFAULT_STYLE_DISTRIBUTION_BY_QA_TYPE = {
-    "lookup": {
-        QUERY_STYLE_KEYWORD: 0.25,
-        QUERY_STYLE_NATURAL: 0.50,
-        QUERY_STYLE_EXPERT: 0.25,
-    },
-    "co_located_multi_hop": {
-        QUERY_STYLE_KEYWORD: 0.15,
-        QUERY_STYLE_NATURAL: 0.55,
-        QUERY_STYLE_EXPERT: 0.30,
-    },
-    "cross_document_multi_hop": {
-        QUERY_STYLE_KEYWORD: 0.10,
-        QUERY_STYLE_NATURAL: 0.55,
-        QUERY_STYLE_EXPERT: 0.35,
-    },
-    "sequential_reasoning": {
-        QUERY_STYLE_KEYWORD: 0.10,
-        QUERY_STYLE_NATURAL: 0.50,
-        QUERY_STYLE_EXPERT: 0.40,
-    },
-    "synthesis": {
-        QUERY_STYLE_KEYWORD: 0.05,
-        QUERY_STYLE_NATURAL: 0.45,
-        QUERY_STYLE_EXPERT: 0.50,
-    },
-}
-
-DEFAULT_STYLE_DISTRIBUTION = dict(DEFAULT_STYLE_DISTRIBUTION_BY_QA_TYPE["lookup"])
 
 DEFAULT_RETRIEVAL_JUDGE_SYSTEM_PROMPT = """\
 You are an expert judge evaluating whether retrieved text chunks contain ALL information \
@@ -139,18 +109,6 @@ Evaluate in order:
 5) Otherwise set answerable=false and reason_tag=challenging_answerable_pass."""
 
 
-def _copy_default_style_by_type() -> dict[str, dict[str, float]]:
-    return {
-        qa_type: dict(
-            DEFAULT_STYLE_DISTRIBUTION_BY_QA_TYPE.get(
-                qa_type,
-                DEFAULT_STYLE_DISTRIBUTION,
-            )
-        )
-        for qa_type in DEFAULT_QA_TYPE_DISTRIBUTION
-    }
-
-
 @dataclass
 class ModelConfig:
     """Model endpoint settings."""
@@ -201,6 +159,8 @@ class PlatformConfig:
 
     api_key: str
     base_url: str = "https://app.cgft.io"
+    llm_api_key: str = ""
+    llm_base_url: str = "https://app.cgft.io/api/llm"
 
 
 @dataclass
@@ -212,6 +172,26 @@ class CorpusConfig:
     corpus_name: str = "cgft-corpus"
     show_summary: bool = True
     min_chunk_chars: int = 400
+
+
+@dataclass
+class EntityExtractionConfig:
+    """LLM-generated patterns for extracting linkable entities from chunk content."""
+
+    entity_names: list[str] = field(default_factory=list)
+    code_patterns: dict[str, str] = field(default_factory=dict)
+    domain_terms: list[str] = field(default_factory=list)
+    query_templates: list[str] = field(default_factory=list)
+    confidence: str = "low"  # "low" | "medium" | "high"
+
+
+@dataclass
+class EntityExtractionLLMConfig:
+    """LLM settings for the entity extraction call."""
+
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""
 
 
 @dataclass
@@ -229,18 +209,18 @@ class CorpusContextConfig:
     min_chunk_chars: int = 400
     system_prompt: str = HYBRID_CORPUS_SYSTEM_PROMPT
     user_template: str = HYBRID_CORPUS_USER_TEMPLATE
+    generate_entity_patterns: bool = True
+    entity_extraction: EntityExtractionConfig | None = None
+    entity_extraction_llm: EntityExtractionLLMConfig = field(default_factory=EntityExtractionLLMConfig)
 
 
 @dataclass
 class TargetsConfig:
-    """Target matrix settings for qa_type/style generation."""
+    """Target matrix settings for qa_type generation."""
 
     total_samples: int = 200
     qa_type_distribution: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_QA_TYPE_DISTRIBUTION)
-    )
-    style_distribution_by_qa_type: dict[str, dict[str, float]] = field(
-        default_factory=_copy_default_style_by_type
     )
 
     def normalized_qa_type_distribution(self) -> dict[str, float]:
@@ -253,10 +233,6 @@ class TargetsConfig:
             qa_type: max(0.0, float(weight)) / total
             for qa_type, weight in self.qa_type_distribution.items()
         }
-
-    def normalized_style_distribution_for(self, qa_type: str) -> dict[str, float]:
-        raw = self.style_distribution_by_qa_type.get(qa_type, DEFAULT_STYLE_DISTRIBUTION)
-        return normalize_style_distribution(raw)
 
 
 @dataclass
@@ -277,7 +253,7 @@ class LLMGuidedLinkerConfig:
 
     model: str = "gpt-5-mini"
     api_key: str = ""
-    base_url: str = "https://app.cgft.io/api/llm"
+    base_url: str = ""
     system_prompt: str = ""
     user_template: str = ""
     top_k_bm25: int = 5
@@ -300,7 +276,7 @@ class LLMDirectGenerationConfig:
 
     model: str = "gpt-5.2"
     api_key: str = ""
-    base_url: str = "https://app.cgft.io/api/llm"
+    base_url: str = ""
     max_completion_tokens: int = 4096
     timeout: float = 120.0
     system_prompt: str = "You are an expert QA dataset author."
@@ -313,12 +289,12 @@ class LLMEnvGenerationConfig:
 
     model: str = "gpt-5-mini"
     api_key: str = ""
-    base_url: str = "https://app.cgft.io/api/llm"
+    base_url: str = ""
     env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
     rollout_limits: RolloutLimits = field(default_factory=RolloutLimits)
     prompt_template: str = (
         "Generate one QA pair as JSON with keys question and answer. "
-        "qa_type={qa_type}; style={style_target}; target_hop_count={target_hop_count}.\n\n"
+        "qa_type={qa_type}; target_hop_count={target_hop_count}.\n\n"
         "Corpus summary:\n{corpus_summary}\n\n"
         "Example queries:\n{corpus_queries}\n\n"
         "Primary:\n{primary_chunk}\n\nSecondary:\n{secondary_chunks}\n"
@@ -335,6 +311,36 @@ class GenerationConfig:
 
 
 @dataclass
+class TransformationConfig:
+    """Post-generation question transformation controls."""
+
+    # LLM settings
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    system_prompt: str = ""
+    user_template: str = ""
+
+    # Noise level for style-appropriate mutations
+    noise_level: str = "light"  # "none", "light", "moderate"
+
+    # Style distribution for rewrites
+    style_distribution: dict[str, float] = field(
+        default_factory=lambda: {
+            QUERY_STYLE_KEYWORD: 0.33,
+            QUERY_STYLE_NATURAL: 0.34,
+            QUERY_STYLE_EXPERT: 0.33,
+        }
+    )
+
+    # Validation settings
+    validation_enabled: bool = True
+    validation_model: str = ""
+
+    preserve_original_in_metadata: bool = True
+
+
+@dataclass
 class DeterministicGuardsConfig:
     """Deterministic quality gates."""
 
@@ -342,7 +348,6 @@ class DeterministicGuardsConfig:
     min_question_chars: int = 12
     min_answer_chars: int = 24
     min_reference_chunks: int = 1
-    enforce_style_mismatch_guard: bool = True
 
 
 @dataclass
@@ -352,7 +357,7 @@ class RetrievalLLMFilterConfig:
     enabled: bool = True
     judge_model: str = "gpt-5-mini"
     judge_api_key: str = ""
-    judge_base_url: str = "https://app.cgft.io/api/llm"
+    judge_base_url: str = ""
     judge_system_prompt: str = DEFAULT_RETRIEVAL_JUDGE_SYSTEM_PROMPT
     judge_user_template: str = DEFAULT_RETRIEVAL_JUDGE_USER_TEMPLATE
     top_k: int = 5
@@ -369,7 +374,7 @@ class GroundingLLMFilterConfig:
     enabled: bool = True
     judge_model: str = "gpt-5-mini"
     judge_api_key: str = ""
-    judge_base_url: str = "https://app.cgft.io/api/llm"
+    judge_base_url: str = ""
     judge_system_prompt: str = DEFAULT_GROUNDING_JUDGE_SYSTEM_PROMPT
     judge_user_template: str = DEFAULT_GROUNDING_JUDGE_USER_TEMPLATE
     top_k: int = 5
@@ -383,10 +388,10 @@ class LLMEnvFilterConfig:
     enabled: bool = True
     model: str = "gpt-5-mini"
     api_key: str = ""
-    base_url: str = "https://app.cgft.io/api/llm"
+    base_url: str = ""
     judge_model: str = "gpt-5-mini"
     judge_api_key: str = ""
-    judge_base_url: str = "https://app.cgft.io/api/llm"
+    judge_base_url: str = ""
     env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
     rollout_limits: RolloutLimits = field(default_factory=RolloutLimits)
 
@@ -399,6 +404,7 @@ class FilteringConfig:
     filters: list[str] = field(
         default_factory=lambda: ["grounding_llm", "retrieval_too_easy_llm"]
     )
+    query_rewrite: QueryRewriteConfig = field(default_factory=QueryRewriteConfig)
     retrieval_llm: RetrievalLLMFilterConfig = field(default_factory=RetrievalLLMFilterConfig)
     grounding_llm: GroundingLLMFilterConfig = field(default_factory=GroundingLLMFilterConfig)
 
@@ -410,14 +416,14 @@ class RefinementConfig:
     enabled: bool = True
     model: str = "gpt-5-mini"
     api_key: str = ""
-    base_url: str = "https://app.cgft.io/api/llm"
+    base_url: str = ""
     max_refinements_per_item: int = 2
     max_same_seed_attempts_before_reanchor: int = 3
     max_rounds: int = 4
     max_total_regenerations: int = 400
     prompt_template: str = (
         "Refine this QA pair while preserving answer correctness and anchor intent.\n"
-        "qa_type={qa_type}\nstyle_target={style_target}\nfeedback={feedback}\n\n"
+        "qa_type={qa_type}\nfeedback={feedback}\n\n"
         "Current question: {question}\nCurrent answer: {answer}\n\n"
         "Return JSON with keys question and answer."
     )
@@ -451,6 +457,7 @@ class CgftPipelineConfig:
     targets: TargetsConfig = field(default_factory=TargetsConfig)
     linker: LinkerConfig = field(default_factory=LinkerConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
+    transformation: TransformationConfig = field(default_factory=TransformationConfig)
     filtering: FilteringConfig = field(default_factory=FilteringConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
@@ -458,32 +465,64 @@ class CgftPipelineConfig:
     random_seed: int = 42
 
     def resolve_api_keys(self) -> None:
-        """Fill unset component API keys with the platform key."""
-        platform_key = self.platform.api_key
+        """Fill unset component API keys/base URLs with shared platform LLM settings."""
+        shared_llm_key = self.platform.llm_api_key or self.platform.api_key
+        shared_llm_base_url = (
+            self.platform.llm_base_url.strip() or "https://app.cgft.io/api/llm"
+        )
 
         if not self.generation.llm_direct.api_key:
-            self.generation.llm_direct.api_key = platform_key
+            self.generation.llm_direct.api_key = shared_llm_key
+        if not self.generation.llm_direct.base_url:
+            self.generation.llm_direct.base_url = shared_llm_base_url
         if not self.generation.llm_env.api_key:
-            self.generation.llm_env.api_key = platform_key
+            self.generation.llm_env.api_key = shared_llm_key
+        if not self.generation.llm_env.base_url:
+            self.generation.llm_env.base_url = shared_llm_base_url
+
+        if not self.transformation.api_key:
+            self.transformation.api_key = shared_llm_key
+        if not self.transformation.base_url:
+            self.transformation.base_url = shared_llm_base_url
+        if not self.transformation.model:
+            self.transformation.model = self.generation.llm_direct.model
+        self.transformation.style_distribution = normalize_style_distribution(
+            self.transformation.style_distribution
+        )
 
         if not self.corpus_context.api_key:
-            self.corpus_context.api_key = platform_key
+            self.corpus_context.api_key = shared_llm_key
         if not self.corpus_context.base_url:
-            self.corpus_context.base_url = self.generation.llm_direct.base_url
+            self.corpus_context.base_url = shared_llm_base_url
         if not self.corpus_context.model:
             self.corpus_context.model = self.generation.llm_direct.model
 
+        if not self.corpus_context.entity_extraction_llm.api_key:
+            self.corpus_context.entity_extraction_llm.api_key = self.corpus_context.api_key
+        if not self.corpus_context.entity_extraction_llm.base_url:
+            self.corpus_context.entity_extraction_llm.base_url = self.corpus_context.base_url
+        if not self.corpus_context.entity_extraction_llm.model:
+            self.corpus_context.entity_extraction_llm.model = self.corpus_context.model
+
         if not self.linker.llm_guided.api_key:
-            self.linker.llm_guided.api_key = platform_key
+            self.linker.llm_guided.api_key = shared_llm_key
+        if not self.linker.llm_guided.base_url:
+            self.linker.llm_guided.base_url = shared_llm_base_url
 
         if not self.filtering.retrieval_llm.judge_api_key:
-            self.filtering.retrieval_llm.judge_api_key = platform_key
+            self.filtering.retrieval_llm.judge_api_key = shared_llm_key
+        if not self.filtering.retrieval_llm.judge_base_url:
+            self.filtering.retrieval_llm.judge_base_url = shared_llm_base_url
 
         if not self.filtering.grounding_llm.judge_api_key:
-            self.filtering.grounding_llm.judge_api_key = platform_key
+            self.filtering.grounding_llm.judge_api_key = shared_llm_key
+        if not self.filtering.grounding_llm.judge_base_url:
+            self.filtering.grounding_llm.judge_base_url = shared_llm_base_url
 
         if not self.refinement.api_key:
-            self.refinement.api_key = platform_key
+            self.refinement.api_key = shared_llm_key
+        if not self.refinement.base_url:
+            self.refinement.base_url = shared_llm_base_url
 
         if self.refinement.max_total_regenerations <= 0:
             self.refinement.max_total_regenerations = max(1, self.targets.total_samples * 2)
@@ -495,7 +534,6 @@ class GenerationTask:
 
     task_id: str
     qa_type: str
-    style_target: str
     target_hop_count: int
     seed_chunk_id: str
     regeneration_prompt: str = ""
@@ -611,20 +649,12 @@ def allocate_largest_remainder_generic(
     return base
 
 
-def matrix_target_counts(targets: TargetsConfig) -> dict[tuple[str, str], int]:
-    """Allocate deterministic target counts over (qa_type, style)."""
-    qa_counts = allocate_largest_remainder_generic(
+def matrix_target_counts(targets: TargetsConfig) -> dict[str, int]:
+    """Allocate deterministic target counts over qa_type."""
+    return allocate_largest_remainder_generic(
         targets.total_samples,
         targets.normalized_qa_type_distribution(),
     )
-    pair_counts: dict[tuple[str, str], int] = {}
-    for qa_type in sorted(qa_counts):
-        qa_count = qa_counts[qa_type]
-        style_dist = targets.normalized_style_distribution_for(qa_type)
-        style_counts = allocate_largest_remainder(qa_count, style_dist)
-        for style, count in style_counts.items():
-            pair_counts[(qa_type, style)] = int(count)
-    return pair_counts
 
 
 def build_generation_tasks(
@@ -636,7 +666,7 @@ def build_generation_tasks(
     if not seed_chunk_ids:
         return []
     rng = random.Random(cfg.random_seed)
-    pair_counts = matrix_target_counts(cfg.targets)
+    qa_counts = matrix_target_counts(cfg.targets)
     hop_map = {
         **DEFAULT_TARGET_HOP_COUNTS,
         **(cfg.linker.structural.target_hop_counts or {}),
@@ -644,8 +674,8 @@ def build_generation_tasks(
 
     tasks: list[GenerationTask] = []
     idx = 0
-    for qa_type, style in sorted(pair_counts):
-        count = pair_counts[(qa_type, style)]
+    for qa_type in sorted(qa_counts):
+        count = qa_counts[qa_type]
         for _ in range(max(0, count)):
             seed_chunk_id = seed_chunk_ids[idx % len(seed_chunk_ids)]
             idx += 1
@@ -653,7 +683,6 @@ def build_generation_tasks(
                 GenerationTask(
                     task_id=f"task_{len(tasks):05d}",
                     qa_type=qa_type,
-                    style_target=style,
                     target_hop_count=int(hop_map.get(qa_type, hop_map.get("multi_hop", 2))),
                     seed_chunk_id=seed_chunk_id,
                 )
@@ -678,9 +707,16 @@ def _collect_removed_config_keys(raw: dict[str, Any]) -> list[str]:
     """Return removed config keys present in user YAML."""
     removed_keys: list[str] = []
 
+    targets_raw = raw.get("targets", {}) or {}
     filtering_raw = raw.get("filtering", {}) or {}
+    guards_raw = filtering_raw.get("deterministic_guards", {}) or {}
     retrieval_raw = filtering_raw.get("retrieval_llm", {}) or {}
     refinement_raw = raw.get("refinement", {}) or {}
+
+    if "style_distribution_by_qa_type" in targets_raw:
+        removed_keys.append("targets.style_distribution_by_qa_type")
+    if "enforce_style_mismatch_guard" in guards_raw:
+        removed_keys.append("filtering.deterministic_guards.enforce_style_mismatch_guard")
 
     if "mode" in filtering_raw:
         removed_keys.append("filtering.mode")
@@ -723,6 +759,10 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
     platform = PlatformConfig(
         api_key=api_key,
         base_url=str(platform_raw.get("base_url", "https://app.cgft.io")).strip(),
+        llm_api_key=str(platform_raw.get("llm_api_key", "")).strip(),
+        llm_base_url=str(
+            platform_raw.get("llm_base_url", "https://app.cgft.io/api/llm")
+        ).strip(),
     )
 
     corpus_raw = raw.get("corpus", {}) or {}
@@ -753,6 +793,18 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             corpus_context_raw.get("user_template", HYBRID_CORPUS_USER_TEMPLATE)
         ).strip()
         or HYBRID_CORPUS_USER_TEMPLATE,
+        generate_entity_patterns=bool(corpus_context_raw.get("generate_entity_patterns", True)),
+        entity_extraction_llm=EntityExtractionLLMConfig(
+            model=str(
+                (corpus_context_raw.get("entity_extraction_llm") or {}).get("model", "")
+            ).strip(),
+            api_key=str(
+                (corpus_context_raw.get("entity_extraction_llm") or {}).get("api_key", "")
+            ).strip(),
+            base_url=str(
+                (corpus_context_raw.get("entity_extraction_llm") or {}).get("base_url", "")
+            ).strip(),
+        ),
     )
 
     targets_raw = raw.get("targets", {}) or {}
@@ -762,22 +814,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             targets_raw.get("qa_type_distribution"),
             fallback=dict(DEFAULT_QA_TYPE_DISTRIBUTION),
         ),
-        style_distribution_by_qa_type={},
     )
-    style_by_type_raw = targets_raw.get("style_distribution_by_qa_type", {}) or {}
-    if isinstance(style_by_type_raw, dict):
-        for qa_type, dist in style_by_type_raw.items():
-            targets.style_distribution_by_qa_type[str(qa_type)] = normalize_style_distribution(dist)
-    for qa_type in targets.qa_type_distribution:
-        targets.style_distribution_by_qa_type.setdefault(
-            qa_type,
-            dict(
-                DEFAULT_STYLE_DISTRIBUTION_BY_QA_TYPE.get(
-                    qa_type,
-                    DEFAULT_STYLE_DISTRIBUTION,
-                )
-            ),
-        )
 
     linker_raw = raw.get("linker", {}) or {}
     structural_raw = linker_raw.get("structural", {}) or {}
@@ -795,7 +832,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         llm_guided=LLMGuidedLinkerConfig(
             model=str(llm_linker_raw.get("model", "gpt-5-mini")),
             api_key=str(llm_linker_raw.get("api_key", "")),
-            base_url=str(llm_linker_raw.get("base_url", "https://app.cgft.io/api/llm")),
+            base_url=str(llm_linker_raw.get("base_url", "")).strip(),
             system_prompt=str(llm_linker_raw.get("system_prompt", "")),
             user_template=str(llm_linker_raw.get("user_template", "")),
             top_k_bm25=max(1, int(llm_linker_raw.get("top_k_bm25", 5))),
@@ -814,9 +851,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         llm_direct=LLMDirectGenerationConfig(
             model=str(direct_raw.get("model", LLMDirectGenerationConfig().model)),
             api_key=str(direct_raw.get("api_key", "")),
-            base_url=str(
-                direct_raw.get("base_url", LLMDirectGenerationConfig().base_url)
-            ),
+            base_url=str(direct_raw.get("base_url", "")).strip(),
             max_completion_tokens=max(
                 100,
                 int(
@@ -835,7 +870,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         llm_env=LLMEnvGenerationConfig(
             model=str(env_gen_raw.get("model", "gpt-5-mini")),
             api_key=str(env_gen_raw.get("api_key", "")),
-            base_url=str(env_gen_raw.get("base_url", "https://app.cgft.io/api/llm")),
+            base_url=str(env_gen_raw.get("base_url", "")).strip(),
             env_bundle=EnvBundleConfig(
                 env_cls_path=str(env_gen_bundle_raw.get("env_cls_path", "")),
                 env_metadata_path=str(env_gen_bundle_raw.get("env_metadata_path", "")),
@@ -854,11 +889,33 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         ),
     )
 
+    transformation_raw = raw.get("transformation", {}) or {}
+    transformation = TransformationConfig(
+        model=str(transformation_raw.get("model", "")).strip(),
+        api_key=str(transformation_raw.get("api_key", "")).strip(),
+        base_url=str(transformation_raw.get("base_url", "")).strip(),
+        system_prompt=str(transformation_raw.get("system_prompt", "")).strip(),
+        user_template=str(transformation_raw.get("user_template", "")).strip(),
+        noise_level=str(transformation_raw.get("noise_level", "light")).strip() or "light",
+        style_distribution=normalize_style_distribution(
+            transformation_raw.get(
+                "style_distribution",
+                TransformationConfig().style_distribution,
+            )
+        ),
+        validation_enabled=bool(transformation_raw.get("validation_enabled", True)),
+        validation_model=str(transformation_raw.get("validation_model", "")).strip(),
+        preserve_original_in_metadata=bool(
+            transformation_raw.get("preserve_original_in_metadata", True)
+        ),
+    )
+
     filtering_raw = raw.get("filtering", {}) or {}
     guards_raw = filtering_raw.get("deterministic_guards", {}) or {}
     filters_raw = filtering_raw.get("filters", None)
     if filters_raw is None:
         filters_raw = list(FilteringConfig().filters)
+    rewrite_raw = filtering_raw.get("query_rewrite", {}) or {}
     retrieval_raw = filtering_raw.get("retrieval_llm", {}) or {}
     grounding_raw = filtering_raw.get("grounding_llm", {}) or {}
     if isinstance(filters_raw, str):
@@ -879,19 +936,20 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             min_question_chars=max(1, int(guards_raw.get("min_question_chars", 12))),
             min_answer_chars=max(1, int(guards_raw.get("min_answer_chars", 24))),
             min_reference_chunks=max(0, int(guards_raw.get("min_reference_chunks", 1))),
-            enforce_style_mismatch_guard=bool(
-                guards_raw.get(
-                    "enforce_style_mismatch_guard",
-                    DeterministicGuardsConfig().enforce_style_mismatch_guard,
-                )
-            ),
         ),
         filters=chain_filters,
+        query_rewrite=QueryRewriteConfig(
+            enabled=bool(rewrite_raw.get("enabled", True)),
+            source=(str(rewrite_raw.get("source", "heuristic")).strip().lower() or "heuristic"),
+            max_terms=max(1, int(rewrite_raw.get("max_terms", 16))),
+            max_chars=max(20, int(rewrite_raw.get("max_chars", 140))),
+            apply_to_all_rows=bool(rewrite_raw.get("apply_to_all_rows", True)),
+        ),
         retrieval_llm=RetrievalLLMFilterConfig(
             enabled=bool(retrieval_raw.get("enabled", True)),
             judge_model=str(retrieval_raw.get("judge_model", "gpt-5-mini")),
             judge_api_key=str(retrieval_raw.get("judge_api_key", "")),
-            judge_base_url=str(retrieval_raw.get("judge_base_url", "https://app.cgft.io/api/llm")),
+            judge_base_url=str(retrieval_raw.get("judge_base_url", "")).strip(),
             judge_system_prompt=(
                 str(
                     retrieval_raw.get(
@@ -929,7 +987,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             enabled=bool(grounding_raw.get("enabled", True)),
             judge_model=str(grounding_raw.get("judge_model", "gpt-5-mini")),
             judge_api_key=str(grounding_raw.get("judge_api_key", "")),
-            judge_base_url=str(grounding_raw.get("judge_base_url", "https://app.cgft.io/api/llm")),
+            judge_base_url=str(grounding_raw.get("judge_base_url", "")).strip(),
             judge_system_prompt=(
                 str(
                     grounding_raw.get(
@@ -961,7 +1019,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         enabled=bool(refinement_raw.get("enabled", True)),
         model=str(refinement_raw.get("model", "gpt-5-mini")),
         api_key=str(refinement_raw.get("api_key", "")),
-        base_url=str(refinement_raw.get("base_url", "https://app.cgft.io/api/llm")),
+        base_url=str(refinement_raw.get("base_url", "")).strip(),
         max_refinements_per_item=max(
             0, int(refinement_raw.get("max_refinements_per_item", 2))
         ),
@@ -1002,6 +1060,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         targets=targets,
         linker=linker,
         generation=generation,
+        transformation=transformation,
         filtering=filtering,
         refinement=refinement,
         split=split,

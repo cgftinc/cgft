@@ -14,7 +14,6 @@ from synthetic_data_prep.qa_generation.cgft_models import CgftContext, Generatio
 from synthetic_data_prep.qa_generation.generated_qa import GeneratedQA
 from synthetic_data_prep.qa_generation.helpers import render_template
 from synthetic_data_prep.qa_generation.models import QADataPoint, ReferenceChunk
-from synthetic_data_prep.qa_generation.style_controls import classify_query_style
 
 logger = logging.getLogger(__name__)
 
@@ -22,22 +21,21 @@ _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _QUESTION_RE = re.compile(r"<question>(.*?)</question>", re.IGNORECASE | re.DOTALL)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 _TEMPLATE_FIELD_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _ESCAPED_OPEN_BRACE = "__CGFT_ESCAPED_OPEN_BRACE__"
 _ESCAPED_CLOSE_BRACE = "__CGFT_ESCAPED_CLOSE_BRACE__"
 
 _DEFAULT_TEMPLATE = (
-    "Generate one grounded QA pair for retrieval training.\n"
-    "qa_type={qa_type}\n"
-    "style_target={style_target}\n"
-    "target_hop_count={target_hop_count}\n"
-    "\n"
+    "Your task is to generate a {qa_type} question that will require "
+    "{target_hop_count} search steps to answer by gathering information from multiple sources.\n\n"
+    "You must first reason inside <think> and </think> about how to connect the information "
+    "across the provided documents to create a challenging, multi-hop question.\n\n"
     "[[if regeneration_attempt]]attempt={regeneration_attempt}\n[[endif]]"
     "[[if source_task_id]]source_task_id={source_task_id}\n[[endif]]"
     "[[if previous_failure_type]]previous_failure_type={previous_failure_type}\n[[endif]]"
     "[[if previous_judge_reason_tag]]previous_judge_reason_tag={previous_judge_reason_tag}\n[[endif]]"
     "[[if overlap_triggered]]overlap_triggered={overlap_triggered}\n[[endif]]"
     "[[if expected_action]]expected_action={expected_action}\n[[endif]]"
-    "\n"
     "Corpus summary:\n{corpus_summary}\n\n"
     "Example queries:\n{corpus_queries}\n\n"
     "Primary chunk:\n{primary_chunk}\n\n"
@@ -46,7 +44,7 @@ _DEFAULT_TEMPLATE = (
     "[[if failed_answer]]Failed answer:\n{failed_answer}\n\n[[endif]]"
     "[[if regeneration_prompt]]Feedback:\n{regeneration_prompt}\n\n[[endif]]"
     "Requirements:\n"
-    "- Generate a realistic, user-facing {qa_type} question that requires compositional reasoning over provided chunk evidence.\n"
+    "- Generate a **complicated**, realistic, user-facing {qa_type} question connecting information across chunks.\n"
     "- The question should require around {target_hop_count} retrieval/search steps to answer and avoid single-lookup shortcuts.\n"
     "- Use only chunk evidence; do not use outside knowledge.\n"
     "- Keep the question standalone and understandable without seeing source chunks.\n"
@@ -57,14 +55,9 @@ _DEFAULT_TEMPLATE = (
     "[[if previous_failure_type]]- If previous_failure_type=too_easy, keep answer facts stable and make the question harder.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer using current chunk evidence only.\n[[endif]]"
     "- Output exactly one question and one answer.\n\n"
-    "Return strict JSON only: {{\"question\": \"...\", \"answer\": \"...\", \"answering_steps\": \"...\"}}."
+    'First output your reasoning in <think>...</think>, then provide:\n'
+    '```json\n{{\"question\": \"...\", \"answer\": \"...\", \"answering_steps\": \"...\"}}\n```'
 )
-
-_STYLE_INSTRUCTIONS = {
-    "keyword": "Use terse, keyword-heavy query style while avoiding direct copy-paste phrases from chunks.",
-    "natural": "Use natural-language question style and avoid direct lexical lookup phrasing.",
-    "expert": "Use advanced troubleshooting/comparison style with compositional constraints.",
-}
 
 
 def _render_template_safe(template: str, variables: dict[str, Any]) -> str:
@@ -108,6 +101,9 @@ def _parse_qa_response(raw_text: str) -> tuple[str, str]:
     text = (raw_text or "").strip()
     if not text:
         return "", ""
+
+    # Strip <think> blocks before parsing
+    text = _THINK_BLOCK_RE.sub("", text).strip()
 
     for candidate in (text, *_JSON_BLOCK_RE.findall(text)):
         try:
@@ -216,7 +212,6 @@ class DirectLLMGenerator:
             )
             variables = {
                 "qa_type": resolved_qa_type,
-                "style_target": task.style_target,
                 "target_hop_count": resolved_hop_count,
                 "corpus_summary": corpus_summary,
                 "corpus_queries": corpus_queries,
@@ -240,11 +235,7 @@ class DirectLLMGenerator:
             prompt = _render_template_safe(template, variables)
             system_prompt = _render_template_safe(self.cfg.system_prompt, variables)
 
-            style_instruction = _STYLE_INSTRUCTIONS.get(
-                task.style_target,
-                "Use realistic user-facing query phrasing.",
-            )
-            user_content = f"{style_instruction}\n\n{prompt}"
+            user_content = prompt
             regeneration_prompt = str(task.regeneration_prompt or "").strip()
             if regeneration_prompt:
                 user_content = (
@@ -261,7 +252,7 @@ class DirectLLMGenerator:
                 ],
                 max_completion_tokens=self.cfg.max_completion_tokens,
                 timeout=self.cfg.timeout,
-                response_format={"type": "json_object"},
+                temperature=1.0,
             )
             raw_text = completion.choices[0].message.content or ""
             question, answer = _parse_qa_response(raw_text)
@@ -271,6 +262,8 @@ class DirectLLMGenerator:
 
             reference_chunks = [_chunk_to_reference_chunk(anchor.primary_chunk)]
             reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in anchor.secondary_chunks)
+            bm25_chunks = anchor.structural_hints.get("bm25_related", [])
+            reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in bm25_chunks)
 
             qa_point: QADataPoint = {
                 "question": question,
@@ -282,17 +275,13 @@ class DirectLLMGenerator:
                 "filter_status": None,
                 "filter_reasoning": None,
                 "no_context_answer": None,
-                "eval_scores": {
-                    "query_style_target": task.style_target,
-                    "query_style_observed": classify_query_style(question),
-                },
+                "eval_scores": {},
             }
             generated.append(
                 GeneratedQA(
                     qa=qa_point,
                     generation_metadata={
                         "qa_type_target": resolved_qa_type,
-                        "style_target": task.style_target,
                         "target_hop_count": resolved_hop_count,
                         "qa_type_requested": requested_qa_type,
                         "target_hop_count_requested": requested_hop_count,

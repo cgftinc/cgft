@@ -55,8 +55,9 @@ class TrainEvalFormatter:
 
     def _to_row(self, item: GeneratedQA) -> dict[str, Any]:
         eval_scores = dict(item.qa.get("eval_scores", {}) or {})
-        style_target = str(item.generation_metadata.get("style_target", "")).strip() or str(
-            eval_scores.get("query_style_target", "")
+        transform_meta = dict(item.generation_metadata.get("transformation", {}) or {})
+        style_target = str(transform_meta.get("target_style", "")).strip() or str(
+            item.qa.get("style_target", "")
         ).strip()
         style_observed = str(eval_scores.get("query_style_observed", "")).strip()
         if not style_observed:
@@ -72,11 +73,11 @@ class TrainEvalFormatter:
             "reference_chunks": item.qa.get("reference_chunks", []),
             "generation_metadata": {
                 "qa_type_target": item.generation_metadata.get("qa_type_target"),
-                "style_target": style_target,
                 "target_hop_count": item.generation_metadata.get("target_hop_count"),
                 "generation_mode": item.generation_metadata.get("generation_mode"),
                 "refinement_count": item.generation_metadata.get("refinement_count", 0),
                 "task_id": item.generation_metadata.get("task_id"),
+                "transformation": transform_meta,
             },
         }
 

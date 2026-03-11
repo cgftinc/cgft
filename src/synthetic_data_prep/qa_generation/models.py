@@ -1,6 +1,8 @@
 """Data models for QA generation datasets."""
 
-from typing import Any, NotRequired, Optional, TypedDict
+from typing import Any, Optional, TypedDict
+
+from typing_extensions import NotRequired
 
 
 class ReferenceChunk(TypedDict):

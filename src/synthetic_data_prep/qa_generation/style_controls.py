@@ -25,6 +25,29 @@ DEFAULT_QUERY_STYLE_DISTRIBUTION = {
     QUERY_STYLE_EXPERT: 0.1,
 }
 
+QA_TYPE_STYLE_DISTRIBUTIONS: dict[str, dict[str, float]] = {
+    "lookup": {
+        QUERY_STYLE_KEYWORD: 0.60,
+        QUERY_STYLE_NATURAL: 0.30,
+        QUERY_STYLE_EXPERT: 0.10,
+    },
+    "multi_hop": {
+        QUERY_STYLE_KEYWORD: 0.10,
+        QUERY_STYLE_NATURAL: 0.60,
+        QUERY_STYLE_EXPERT: 0.30,
+    },
+    "cross_document_multi_hop": {
+        QUERY_STYLE_KEYWORD: 0.05,
+        QUERY_STYLE_NATURAL: 0.55,
+        QUERY_STYLE_EXPERT: 0.40,
+    },
+}
+
+
+def get_style_distribution(qa_type: str) -> dict[str, float]:
+    """Return style distribution for a given QA type, or DEFAULT_QUERY_STYLE_DISTRIBUTION."""
+    return QA_TYPE_STYLE_DISTRIBUTIONS.get(qa_type, DEFAULT_QUERY_STYLE_DISTRIBUTION)
+
 
 @dataclass
 class StyleControlConfig:
@@ -163,26 +186,6 @@ def classify_query_style(question: str) -> str:
 def get_item_question(item: GeneratedQA) -> str:
     """Return the normalized question string from a GeneratedQA item."""
     return str(item.qa.get("question", "")).strip()
-
-
-def get_item_style_target(item: GeneratedQA) -> str:
-    """Read style target from generation metadata or eval_scores."""
-    target = str(item.generation_metadata.get("query_style_target", "")).strip()
-    if target in QUERY_STYLE_KEYS:
-        return target
-    eval_scores = item.qa.get("eval_scores", {}) or {}
-    target = str(eval_scores.get("query_style_target", "")).strip()
-    return target if target in QUERY_STYLE_KEYS else ""
-
-
-def set_item_style_target(item: GeneratedQA, target: str) -> None:
-    """Persist style target in both generation metadata and eval_scores."""
-    if target not in QUERY_STYLE_KEYS:
-        return
-    item.generation_metadata["query_style_target"] = target
-    eval_scores = cast(dict[str, Any], dict(item.qa.get("eval_scores", {}) or {}))
-    eval_scores["query_style_target"] = target
-    item.qa["eval_scores"] = eval_scores
 
 
 def set_item_style_observed(item: GeneratedQA, observed: str) -> None:

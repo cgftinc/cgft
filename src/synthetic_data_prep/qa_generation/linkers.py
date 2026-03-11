@@ -14,12 +14,17 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from .anchor_selector import AnchorBundle, AnchorSelector
-from .anchor_utils import generate_bm25_queries, select_anchor_bundle_with_enrichment
+from .anchor_utils import (
+    generate_bm25_queries,
+    generate_bm25_queries_from_extraction,
+    select_anchor_bundle_with_enrichment,
+)
 from .corpus_capabilities import CorpusCapabilities
 from .helpers import render_template
 from .response_parsers import parse_related_queries_response
 
 if TYPE_CHECKING:
+    from .cgft_models import EntityExtractionConfig
     from .protocols import ChunkLinker
 
 logger = logging.getLogger(__name__)
@@ -112,6 +117,7 @@ class StructuralChunkLinker:
         bm25_enrichment_queries: int = 3,
         bm25_enrichment_top_k: int = 5,
         max_related_refs: int = 3,
+        entity_extraction: EntityExtractionConfig | None = None,
     ) -> None:
         self.source = source
         self.capabilities = capabilities
@@ -120,6 +126,7 @@ class StructuralChunkLinker:
         self.bm25_enrichment_queries = bm25_enrichment_queries
         self.bm25_enrichment_top_k = bm25_enrichment_top_k
         self.max_related_refs = max_related_refs
+        self.entity_extraction = entity_extraction
         self._selector: AnchorSelector | None = None
 
     def _ensure_selector(self, corpus_pool: list[Any]) -> AnchorSelector:
@@ -142,7 +149,12 @@ class StructuralChunkLinker:
     ) -> AnchorBundle:
         pool = corpus_pool or []
         selector = self._ensure_selector(pool)
-        queries = generate_bm25_queries(primary_chunk, self.bm25_enrichment_queries)
+        if self.entity_extraction is not None:
+            queries = generate_bm25_queries_from_extraction(
+                primary_chunk, self.entity_extraction, self.bm25_enrichment_queries
+            ) or generate_bm25_queries(primary_chunk, self.bm25_enrichment_queries)
+        else:
+            queries = generate_bm25_queries(primary_chunk, self.bm25_enrichment_queries)
         bundle = select_anchor_bundle_with_enrichment(
             selector=selector,
             primary_chunk=primary_chunk,
@@ -152,6 +164,7 @@ class StructuralChunkLinker:
             bm25_enrichment_top_k=self.bm25_enrichment_top_k,
             max_related_refs=self.max_related_refs,
             qa_type=target_qa_type,
+            prebuilt_queries=queries,
         )
         if isinstance(bundle, tuple):
             bundle = bundle[0]

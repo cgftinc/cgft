@@ -16,6 +16,7 @@ from synthetic_data_prep.qa_generation.cgft_models import (
     RetrievalLLMFilterConfig,
 )
 from synthetic_data_prep.qa_generation.generated_qa import FilterVerdict, GeneratedQA
+from synthetic_data_prep.qa_generation.retrieval_query import QueryRewriteConfig, resolve_retrieval_query
 
 logger = logging.getLogger(__name__)
 
@@ -85,15 +86,21 @@ class RetrievalLLMFilter:
             },
         )
         self._ensure_stats_shape(stats)
+        rewrite_cfg = context.config.filtering.query_rewrite
 
         for item in items:
             if item.filter_verdict is not None and not item.is_passed:
                 continue
 
             try:
-                verdict = self._evaluate_item(item, max_refinements=max_refinements)
+                verdict = self._evaluate_item(
+                    item,
+                    max_refinements=max_refinements,
+                    rewrite_cfg=rewrite_cfg,
+                )
             except Exception:
                 logger.exception("RetrievalLLMFilter failed for one item")
+                query = resolve_retrieval_query(item.qa, rewrite_cfg=rewrite_cfg)
                 verdict = FilterVerdict(
                     status="passed",
                     reason="retrieval_filter_error",
@@ -102,7 +109,7 @@ class RetrievalLLMFilter:
                         "filter_mode": _FILTER_MODE,
                         "reason_code": "filter_error",
                         "confidence": 0.0,
-                        "retrieval_query": str(item.qa.get("question", "")),
+                        "retrieval_query": query,
                         "ref_overlap_ratio": 0.0,
                         "failure_type": _FAILURE_TYPE_NONE,
                         "force_reanchor": False,
@@ -124,8 +131,14 @@ class RetrievalLLMFilter:
 
         return items
 
-    def _evaluate_item(self, item: GeneratedQA, *, max_refinements: int) -> FilterVerdict:
-        query = str(item.qa.get("retrieval_query") or item.qa.get("question", "")).strip()
+    def _evaluate_item(
+        self,
+        item: GeneratedQA,
+        *,
+        max_refinements: int,
+        rewrite_cfg: QueryRewriteConfig,
+    ) -> FilterVerdict:
+        query = resolve_retrieval_query(item.qa, rewrite_cfg=rewrite_cfg)
         if not query:
             return FilterVerdict(
                 status="rejected",

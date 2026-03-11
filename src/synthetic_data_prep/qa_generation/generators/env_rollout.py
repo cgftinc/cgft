@@ -12,7 +12,6 @@ from synthetic_data_prep.qa_generation.cgft_models import CgftContext, Generatio
 from synthetic_data_prep.qa_generation.generated_qa import GeneratedQA
 from synthetic_data_prep.qa_generation.helpers import render_template
 from synthetic_data_prep.qa_generation.models import QADataPoint, ReferenceChunk
-from synthetic_data_prep.qa_generation.style_controls import classify_query_style
 from synthetic_data_prep.trainer.client import RolloutClient
 
 logger = logging.getLogger(__name__)
@@ -183,7 +182,6 @@ class EnvRolloutGenerator:
 
             variables = {
                 "qa_type": task.qa_type,
-                "style_target": task.style_target,
                 "target_hop_count": task.target_hop_count,
                 "corpus_summary": corpus_summary,
                 "corpus_queries": corpus_queries,
@@ -233,17 +231,13 @@ class EnvRolloutGenerator:
                 "filter_status": None,
                 "filter_reasoning": None,
                 "no_context_answer": None,
-                "eval_scores": {
-                    "query_style_target": task.style_target,
-                    "query_style_observed": classify_query_style(question),
-                },
+                "eval_scores": {},
             }
             generated.append(
                 GeneratedQA(
                     qa=qa_point,
                     generation_metadata={
                         "qa_type_target": task.qa_type,
-                        "style_target": task.style_target,
                         "target_hop_count": task.target_hop_count,
                         "anchor_bundle": anchor,
                         "generation_mode": "llm_env",

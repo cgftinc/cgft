@@ -59,9 +59,6 @@ class FeedbackRefiner:
         current_count = int(meta.get("refinement_count", 0))
         verdict = item.filter_verdict
         feedback_reason = verdict.reasoning if verdict is not None else ""
-        style_target = str(meta.get("style_target", "")).strip() or str(
-            (item.qa.get("eval_scores", {}) or {}).get("query_style_target", "")
-        ).strip()
         qa_type = str(meta.get("qa_type_target", "")).strip() or str(item.qa.get("qa_type", "")).strip()
 
         if current_count >= self.cfg.max_refinements_per_item:
@@ -87,7 +84,6 @@ class FeedbackRefiner:
             self.cfg.prompt_template,
             {
                 "qa_type": qa_type or "unknown",
-                "style_target": style_target or "natural",
                 "feedback": feedback_reason,
                 "question": str(item.qa.get("question", "")).strip(),
                 "answer": str(item.qa.get("answer", "")).strip(),
@@ -123,8 +119,6 @@ class FeedbackRefiner:
             return item
 
         updated_eval_scores = dict(item.qa.get("eval_scores", {}) or {})
-        if style_target:
-            updated_eval_scores["query_style_target"] = style_target
         updated_eval_scores["query_style_observed"] = classify_query_style(question)
 
         refined_qa: QADataPoint = {

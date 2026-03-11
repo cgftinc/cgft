@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from synthetic_data_prep.chunkers.models import Chunk
 from synthetic_data_prep.qa_generation.generated_qa import FilterVerdict, GeneratedQA
+from synthetic_data_prep.qa_generation.retrieval_query import QueryRewriteConfig, resolve_retrieval_query
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ Retrieved chunks:
 {chunks_text}
 
 Can the question be fully answered using ONLY the retrieved chunks above?"""
+
+_DEFAULT_QUERY_REWRITE_CFG = QueryRewriteConfig()
 
 
 class RetrievalDifficultyFilter:
@@ -122,7 +125,7 @@ class RetrievalDifficultyFilter:
         return items
 
     def _evaluate_item(self, item: GeneratedQA) -> FilterVerdict:
-        query = str(item.qa.get("retrieval_query") or item.qa["question"])
+        query = resolve_retrieval_query(item.qa, rewrite_cfg=_DEFAULT_QUERY_REWRITE_CFG)
 
         search_results = self.chunk_source.search_related(
             source=_DUMMY_CHUNK, queries=[query], top_k=self.top_k

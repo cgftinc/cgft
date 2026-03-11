@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import random
+import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
-from openai import OpenAI
+from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, OpenAI, RateLimitError
 
 from synthetic_data_prep.corpus.corpora.source import CorporaChunkSource
 from synthetic_data_prep.qa_generation.cgft_models import (
     CgftContext,
     CgftPipelineConfig,
     CgftRunStats,
+    EntityExtractionConfig,
     GenerationTask,
     build_generation_tasks,
     load_cgft_config,
@@ -34,11 +38,47 @@ from synthetic_data_prep.qa_generation.linkers import (
     RELATED_CHUNK_USER_TEMPLATE,
     StructuralChunkLinker,
 )
-from synthetic_data_prep.qa_generation.protocols import ChunkLinker, EvaluatorFilter, QuestionGenerator
+from synthetic_data_prep.qa_generation.protocols import (
+    ChunkLinker,
+    EvaluatorFilter,
+    QuestionGenerator,
+    QuestionTransformer,
+)
 from synthetic_data_prep.qa_generation.response_parsers import parse_corpus_summary_response
+from synthetic_data_prep.qa_generation.transformers import LLMStyleTransformer
 from synthetic_data_prep.trainer.client import RolloutClient
 
 logger = logging.getLogger(__name__)
+
+_ENTITY_EXTRACTION_SYSTEM_PROMPT = (
+    "You are an expert at analyzing documentation corpora to identify linkable entities, "
+    "code patterns, and domain terminology that can be used for keyword search."
+)
+
+_ENTITY_EXTRACTION_USER_TEMPLATE = """\
+Analyze these sample chunks from a documentation corpus and identify patterns for \
+finding related content via keyword (BM25) search.
+
+<samples>
+{chunk_samples}
+</samples>
+
+Identify the following:
+1. Named entities: product names, tools, services, APIs, brand names that appear across chunks
+2. Code patterns: regex patterns for extracting function calls, file paths, config keys, properties
+3. Domain terminology: technical terms, acronyms, and jargon specific to this corpus
+4. Query templates: search phrase templates using {{entity}} as a placeholder
+
+Return JSON only:
+{{
+  "entity_names": ["Name1", "Name2"],
+  "code_patterns": {{
+    "category_name": "<regex_pattern>"
+  }},
+  "domain_terms": ["term1", "term2"],
+  "query_templates": ["{{entity}} setup", "configure {{entity}}", "{{entity}} guide"],
+  "confidence": "high"
+}}"""
 
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
 _GROUNDING_FILTER_STAGE = "grounding_llm"
@@ -50,6 +90,59 @@ _SUPPORTED_FILTER_STAGES = (
 
 def _build_openai_client(*, api_key: str, base_url: str) -> OpenAI:
     return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    if isinstance(exc, (RateLimitError, APITimeoutError, APIConnectionError)):
+        return True
+    # BadRequestError is a subclass of APIError — check it first so the specific
+    # logic below takes precedence over the broad APIError fallthrough.
+    if isinstance(exc, BadRequestError):
+        code = str(getattr(exc, "code", "") or "").strip().lower()
+        body = str(getattr(exc, "body", "") or "").strip().lower()
+        message = str(exc).strip().lower()
+        return code == "upstream_error" or "internal error" in body or "internal error" in message
+    if isinstance(exc, APIError):
+        return True
+    return False
+
+
+def _chat_completion_with_retry(
+    *,
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, str]],
+    response_format: dict[str, str] | None = None,
+    temperature: float | None = None,
+    max_attempts: int = 3,
+    initial_delay_seconds: float = 0.75,
+) -> Any:
+    delay = max(0.1, float(initial_delay_seconds))
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, max_attempts) + 1):
+        try:
+            kwargs: dict[str, Any] = {"model": model, "messages": messages}
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= max_attempts or not _is_retryable_openai_error(exc):
+                raise
+            logger.warning(
+                "Transient LLM error on attempt %d/%d; retrying in %.2fs: %s",
+                attempt,
+                max_attempts,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+            delay *= 2.0
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Completion retry loop exited unexpectedly.")
 
 
 def _load_source(cfg: CgftPipelineConfig) -> CorporaChunkSource:
@@ -98,6 +191,7 @@ def _build_linker(cfg: CgftPipelineConfig, source: Any) -> ChunkLinker:
         bm25_enrichment_queries=structural_cfg.bm25_enrichment_queries,
         bm25_enrichment_top_k=structural_cfg.bm25_enrichment_top_k,
         max_related_refs=structural_cfg.max_related_refs,
+        entity_extraction=cfg.corpus_context.entity_extraction,
     )
 
 
@@ -127,6 +221,10 @@ def _build_generator(
         linker=linker,
         cfg=generation_cfg,
     )
+
+
+def _build_transformer(cfg: CgftPipelineConfig) -> QuestionTransformer:
+    return LLMStyleTransformer(cfg.transformation)
 
 
 def _build_filter_from_stage_name(
@@ -417,12 +515,6 @@ def _build_regeneration_tasks(
         if not qa_type:
             qa_type = "lookup"
 
-        style_target = str(meta.get("style_target", "")).strip() or str(
-            (item.qa.get("eval_scores", {}) or {}).get("query_style_target", "")
-        ).strip()
-        if not style_target:
-            style_target = "natural"
-
         target_hop_count = max(
             1,
             _int_or(meta.get("target_hop_count", item.qa.get("min_hop_count", 1)), 1),
@@ -461,7 +553,6 @@ def _build_regeneration_tasks(
         task_kwargs: dict[str, Any] = {
             "task_id": task_id,
             "qa_type": qa_type,
-            "style_target": style_target,
             "target_hop_count": target_hop_count,
             "seed_chunk_id": seed_chunk_id,
             "regeneration_prompt": _build_regeneration_prompt(
@@ -555,6 +646,78 @@ def _regenerate_with_generator(
     return regenerated_for_retry, failed_to_regenerate
 
 
+def _generate_entity_extraction_patterns(
+    cfg: CgftPipelineConfig,
+    source: Any,
+    context: CgftContext,
+) -> EntityExtractionConfig | None:
+    """Generate entity extraction patterns from corpus samples via LLM."""
+    profile_cfg = cfg.corpus_context
+    samples: list[Any] = []
+
+    corpus_pool: list[Any] = context.get("corpus_pool", []) or []
+    if corpus_pool:
+        rng = context.rng
+        n = min(8, len(corpus_pool))
+        samples = rng.sample(corpus_pool, n)
+
+    if not samples:
+        return None
+
+    chunk_samples_text = "\n\n---\n\n".join(
+        chunk.chunk_str() if hasattr(chunk, "chunk_str") else str(chunk)
+        for chunk in samples
+    )
+    user_prompt = _ENTITY_EXTRACTION_USER_TEMPLATE.format(chunk_samples=chunk_samples_text)
+
+    try:
+        entity_llm_cfg = profile_cfg.entity_extraction_llm
+        client = _build_openai_client(
+            api_key=entity_llm_cfg.api_key,
+            base_url=entity_llm_cfg.base_url,
+        )
+        completion = _chat_completion_with_retry(
+            client=client,
+            model=entity_llm_cfg.model,
+            messages=[
+                {"role": "system", "content": _ENTITY_EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+        raw = completion.choices[0].message.content or ""
+        data = json.loads(raw)
+
+        valid_patterns: dict[str, str] = {}
+        for name, pattern in (data.get("code_patterns") or {}).items():
+            try:
+                re.compile(str(pattern))
+                valid_patterns[str(name)] = str(pattern)
+            except re.error:
+                logger.warning("Skipping invalid entity extraction regex '%s': %s", name, pattern)
+
+        return EntityExtractionConfig(
+            entity_names=[
+                str(e).strip() for e in (data.get("entity_names") or []) if str(e).strip()
+            ],
+            code_patterns=valid_patterns,
+            domain_terms=[
+                str(t).strip() for t in (data.get("domain_terms") or []) if str(t).strip()
+            ],
+            query_templates=[
+                str(q).strip() for q in (data.get("query_templates") or []) if str(q).strip()
+            ],
+            confidence=str(data.get("confidence", "low")).strip().lower(),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Entity extraction pattern generation failed; BM25 will use metadata fallback. reason=%s",
+            exc,
+        )
+        return None
+
+
 def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftContext) -> None:
     """Generate corpus summary/example queries from description and samples."""
     profile_cfg = cfg.corpus_context
@@ -632,18 +795,23 @@ def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftCon
             api_key=profile_cfg.api_key,
             base_url=profile_cfg.base_url,
         )
-        completion = client.chat.completions.create(
+        completion = _chat_completion_with_retry(
+            client=client,
             model=profile_cfg.model,
             messages=[
                 {"role": "system", "content": profile_cfg.system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
+            temperature=0.0,
         )
         raw = completion.choices[0].message.content or ""
         summary, queries = parse_corpus_summary_response(raw)
-    except Exception:
-        logger.exception("Corpus profiling failed; using user-provided description/example queries.")
+    except Exception as exc:
+        logger.warning(
+            "Corpus profiling failed; using user-provided description/example queries. reason=%s",
+            exc,
+        )
         summary, queries, raw, user_prompt = "", [], "", ""
 
     summary = summary.strip() or default_summary
@@ -700,6 +868,19 @@ class CgftPipeline:
         context["seed_chunks"] = seed_chunks
         _build_corpus_profile(cfg, source, context)
 
+        if cfg.corpus_context.generate_entity_patterns:
+            extraction = _generate_entity_extraction_patterns(cfg, source, context)
+            if extraction is not None:
+                cfg.corpus_context.entity_extraction = extraction
+                logger.info(
+                    "Entity extraction patterns generated: %d entities, %d code patterns, "
+                    "%d domain terms (confidence=%s)",
+                    len(extraction.entity_names),
+                    len(extraction.code_patterns),
+                    len(extraction.domain_terms),
+                    extraction.confidence,
+                )
+
         tasks = build_generation_tasks(
             cfg,
             seed_chunk_ids=[chunk.hash for chunk in seed_chunks],
@@ -718,6 +899,7 @@ class CgftPipeline:
             source=source,
         )
         context["filter_chain"] = list(filter_stage_names)
+        transformer = _build_transformer(cfg)
         formatter = TrainEvalFormatter(output_cfg=cfg.output, split_cfg=cfg.split)
 
         raw_items = generator.generate(tasks, context)
@@ -819,6 +1001,7 @@ class CgftPipeline:
                 )
             )
 
+        final_passed = transformer.transform(final_passed, context)
         context["rejected_items"] = [_serialize_qa_with_filter_details(item) for item in final_rejected]
         context["passed_items"] = [item.qa for item in final_passed]
         context["total_regenerations"] = total_regens
@@ -850,6 +1033,10 @@ class CgftPipeline:
         grounding_stats = context.get("grounding_filter_stats")
         if isinstance(grounding_stats, dict) and grounding_stats:
             result["stats"]["grounding_filter"] = dict(grounding_stats)
+
+        transformation_stats = context.get("transformation_stats")
+        if isinstance(transformation_stats, dict) and transformation_stats:
+            result["stats"]["transformation"] = dict(transformation_stats)
 
         return result
 
