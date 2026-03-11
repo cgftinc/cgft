@@ -550,12 +550,15 @@ def _build_windows_from_path(
                 break
             if len(window_messages) >= max_emails_per_chunk:
                 break
+            # The first email in a window bypasses the size check above (window_messages
+            # is empty so the guard is False). Truncate its body here so it can't produce
+            # a chunk that exceeds max_chars regardless of how large the raw email is.
+            if not window_messages and len(message_block) > max_chars:
+                message_obj = dict(message_obj)
+                message_obj["body"] = (message_obj.get("body") or "")[:max_chars] + " [truncated]"
+                message_block = _format_email_block(message_obj, message_order)
             window_messages.append((message_order, message_obj))
             char_count += len(message_block) + 2
-
-        if not window_messages:
-            fallback_order = start_index + 1
-            window_messages.append((fallback_order, path_messages[start_index]))
 
         end_index = start_index + len(window_messages) - 1
 

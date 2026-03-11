@@ -405,12 +405,56 @@ def clean_email_jsonl(
     }
 
 
+def clean_email_folder(
+    folder: str | Path,
+    input_name: str = "_deduped.jsonl",
+    output_name: str = "_cleaned.jsonl",
+    quote_match_min_chars: int = 40,
+    quote_match_jaccard_threshold: float = 0.9,
+    signature_tail_window: int = 12,
+    keep_original_body_field: str = "",
+) -> dict[str, Any]:
+    """Clean email bodies in a preprocessed JSONL file within a folder.
+
+    Reads <folder>/<input_name>, cleans quoted replies and signatures,
+    writes <folder>/<output_name>.
+
+    Returns the cleaning stats dict.
+    """
+    folder = Path(folder)
+    input_path = folder / input_name
+    output_path = folder / output_name
+
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {input_path}. "
+            f"Run dedupe_email_folder first to produce {input_name}."
+        )
+
+    print(f"Cleaning bodies in {input_path.name} ...")
+    stats = clean_email_jsonl(
+        input_path=input_path,
+        output_path=output_path,
+        quote_match_min_chars=quote_match_min_chars,
+        quote_match_jaccard_threshold=quote_match_jaccard_threshold,
+        signature_tail_window=signature_tail_window,
+        keep_original_body_field=keep_original_body_field,
+    )
+    print(
+        f"Clean: {stats['changed_rows']}/{stats['total_rows']} bodies cleaned "
+        f"(quotes: {stats['quote_removed_rows']}, signatures: {stats['signature_removed_rows']})"
+    )
+    return stats
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Clean parsed-email JSONL bodies (quoted replies + signatures).",
     )
-    p.add_argument("--input", default=DEFAULT_INPUT_PATH, help="Input parsed-email JSONL path")
-    p.add_argument("--output", default=DEFAULT_OUTPUT_PATH, help="Output cleaned JSONL path")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--input", help="Input parsed-email JSONL path")
+    group.add_argument("--folder", help="Folder with preprocessed _deduped.jsonl to clean")
+    p.add_argument("--output", default=DEFAULT_OUTPUT_PATH, help="Output cleaned JSONL path (for --input mode)")
     p.add_argument(
         "--quote-match-min-chars",
         type=int,
@@ -439,17 +483,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    stats = clean_email_jsonl(
-        input_path=args.input,
-        output_path=args.output,
-        quote_match_min_chars=args.quote_match_min_chars,
-        quote_match_jaccard_threshold=args.quote_match_jaccard_threshold,
-        signature_tail_window=args.signature_tail_window,
-        keep_original_body_field=args.keep_original_body_field,
-    )
-    print("Body cleaning complete")
-    for k, v in stats.items():
-        print(f"  {k}: {v}")
+    if args.folder:
+        clean_email_folder(
+            folder=args.folder,
+            quote_match_min_chars=args.quote_match_min_chars,
+            quote_match_jaccard_threshold=args.quote_match_jaccard_threshold,
+            signature_tail_window=args.signature_tail_window,
+            keep_original_body_field=args.keep_original_body_field,
+        )
+    else:
+        stats = clean_email_jsonl(
+            input_path=args.input,
+            output_path=args.output,
+            quote_match_min_chars=args.quote_match_min_chars,
+            quote_match_jaccard_threshold=args.quote_match_jaccard_threshold,
+            signature_tail_window=args.signature_tail_window,
+            keep_original_body_field=args.keep_original_body_field,
+        )
+        print("Body cleaning complete")
+        for k, v in stats.items():
+            print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
