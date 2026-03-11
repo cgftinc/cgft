@@ -1,8 +1,16 @@
 """Parse .mbox files into canonical email JSONL rows.
 
-Expected usage:
-- Run once per mailbox export to produce canonical JSONL.
-- Optionally run dedupe next, then pass resulting JSONL to `EmailChunker`.
+Public API:
+- convert_mbox_folder(folder)  — parse every .mbox in a folder, skipping already-converted files.
+- convert_mbox_file(mbox_path) — parse a single .mbox file to a .jsonl file next to it.
+
+Typical usage:
+    from synthetic_data_prep.preprocess.email import mbox
+    mbox.convert_mbox_folder(DIR_PATH)          # idempotent; skips existing .jsonl
+    mbox.convert_mbox_file("path/to/Mail.mbox") # single file
+
+After conversion, pass the folder to EmailChunker.chunk_folder().
+Optionally run dedupe between conversion and chunking.
 """
 
 from __future__ import annotations
@@ -13,7 +21,6 @@ import json
 import mailbox
 import re
 from collections import Counter
-from datetime import datetime
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import getaddresses, parsedate_to_datetime
@@ -122,10 +129,11 @@ def _thread_id_for_message(message_id: str, reply_to: str, refs: list[str], subj
     return f"thread_{digest}"
 
 
-def parse_mbox_messages(input_path: str | Path) -> list[dict[str, Any]]:
-    """Parse a .mbox file into canonical parsed-email rows.
+def _parse_mbox_to_rows(input_path: str | Path) -> list[dict[str, Any]]:
+    """Parse a single .mbox file into a list of canonical email row dicts.
 
-    Returns message-level rows expected by preprocess/dedupe/chunking stages.
+    Each row contains id, thread_id, date, subject, from, to, cc, body, etc.
+    Rows are sorted by (thread_id, date, id) for stable downstream processing.
     """
 
     path = Path(input_path)
@@ -181,18 +189,22 @@ def parse_mbox_messages(input_path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def parse_mbox_to_jsonl(input_path: str | Path, output_path: str | Path) -> dict[str, Any]:
-    """Convenience wrapper: parse .mbox and persist canonical JSONL output."""
-    rows = parse_mbox_messages(input_path)
-    out = Path(output_path)
+def convert_mbox_file(mbox_path: str | Path) -> dict[str, Any]:
+    """Parse a single .mbox file and write a .jsonl file next to it.
+
+    Output is written to <mbox_path>.jsonl (same directory, same stem).
+    Returns a stats dict: source, output_path, messages, threads, top_threads.
+    """
+    mbox_path = Path(mbox_path)
+    out = mbox_path.with_suffix(".jsonl")
+    rows = _parse_mbox_to_rows(mbox_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
     thread_counts = Counter(r.get("thread_id") or "" for r in rows)
     return {
-        "source": str(input_path),
+        "source": str(mbox_path),
         "output_path": str(out),
         "messages": len(rows),
         "threads": len(thread_counts),
@@ -200,18 +212,45 @@ def parse_mbox_to_jsonl(input_path: str | Path, output_path: str | Path) -> dict
     }
 
 
+def convert_mbox_folder(folder: str | Path, skip_existing: bool = True) -> list[dict[str, Any]]:
+    """Parse all .mbox files in a folder (recursively) to .jsonl files.
+
+    Each .mbox produces a sibling .jsonl with the same name (e.g. Drafts.mbox → Drafts.jsonl).
+    By default, files whose .jsonl already exists are skipped (idempotent).
+    Set skip_existing=False to force re-parse all files.
+
+    Returns a list of stats dicts (one per converted file).
+    """
+    results = []
+    for mbox_file in sorted(Path(folder).rglob("*.mbox")):
+        out = mbox_file.with_suffix(".jsonl")
+        if skip_existing and out.exists():
+            print(f"Skipping {mbox_file.name} (already converted)")
+            continue
+        print(f"Converting {mbox_file.name} ...")
+        stats = convert_mbox_file(mbox_file)
+        print(f"  → {stats['messages']} messages, {stats['threads']} threads")
+        results.append(stats)
+    return results
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Parse .mbox file into canonical email JSONL.")
-    p.add_argument("--input", required=True, help="Path to .mbox file")
-    p.add_argument("--output", default="emails_mbox_parsed.jsonl", help="Output canonical JSONL path")
+    p = argparse.ArgumentParser(description="Parse .mbox files into canonical email JSONL.")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--input", help="Path to a single .mbox file")
+    group.add_argument("--folder", help="Folder to convert all .mbox files in (recursive)")
+    p.add_argument("--force", action="store_true", help="Re-parse even if .jsonl already exists")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    stats = parse_mbox_to_jsonl(args.input, args.output)
-    print("Mbox parse complete")
-    print(json.dumps(stats, indent=2, ensure_ascii=False))
+    if args.folder:
+        results = convert_mbox_folder(args.folder, skip_existing=not args.force)
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    else:
+        stats = convert_mbox_file(args.input)
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
