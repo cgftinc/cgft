@@ -8,9 +8,20 @@ from typing import Any, Callable
 
 from tqdm.auto import tqdm
 
+from .filter_mapper import to_turbopuffer_filters
 from synthetic_data_prep.chunkers.inspector import ChunkInspector
 from synthetic_data_prep.chunkers.markdown import MarkdownChunker
-from synthetic_data_prep.chunkers.models import Chunk
+from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
+from synthetic_data_prep.corpus.search_schema.search_exceptions import (
+    InvalidSearchSpecError,
+    UnsupportedSearchModeError,
+)
+from synthetic_data_prep.corpus.search_schema.search_types import (
+    FilterPredicate,
+    SearchCapabilities,
+    SearchSpec,
+    validate_search_spec_shape,
+)
 
 
 class TpufChunkSource:
@@ -57,6 +68,17 @@ class TpufChunkSource:
 
         self._ns = turbopuffer.Turbopuffer(api_key=api_key, region=region).namespace(namespace)
         self._fields: list[str] = content_attr if content_attr is not None else ["content"]
+        self._search_capabilities: SearchCapabilities = {
+            "backend": "turbopuffer",
+            "modes": {"lexical"},
+            "filter_ops": {
+                "field": {"eq", "in", "gte", "lte"},
+                "logical": {"and", "or", "not"},
+            },
+            "ranking": {"bm25"},
+            "constraints": {"max_top_k": 10000, "vector_dimensions": None},
+            "graph_expansion": False,
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -139,11 +161,36 @@ class TpufChunkSource:
 
         chunker = MarkdownChunker(min_char=min_chars, max_char=max_chars, chunk_overlap=overlap_chars)
         collection = chunker.chunk_folder(docs_path, file_extensions=file_extensions)
-        all_chunks = list(collection)
 
         if show_summary:
             inspector = ChunkInspector(collection)
             inspector.summary(max_depth=3, max_files_per_folder=4)
+        self.populate_from_chunks(
+            collection=collection,
+            embed_fn=embed_fn,
+            batch_size=batch_size,
+            show_summary=show_summary,
+        )
+
+    def populate_from_chunks(
+        self,
+        collection: ChunkCollection,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+        batch_size: int = 100,
+        show_summary: bool = True,
+    ) -> None:
+        """Upload a pre-built ChunkCollection to Turbopuffer.
+
+        Args:
+            collection: ChunkCollection produced by any chunker.
+            embed_fn: Optional callable that maps list[str] -> list[list[float]].
+                      If provided, vector embeddings are stored alongside text.
+            batch_size: Number of chunks per upload batch (default 100).
+            show_summary: Print upload progress (default True).
+        """
+        all_chunks = list(collection)
+
+        if show_summary:
             print(f"\nUploading {len(all_chunks)} chunks to Turbopuffer namespace...")
 
         for batch_start in tqdm(
@@ -168,10 +215,12 @@ class TpufChunkSource:
                 }
                 for i, chunk in enumerate(batch)
             ]
-            
 
-            write_kwargs: dict = {"upsert_rows": upsert_rows, "schema": {"content": {"type": "string", "full_text_search": True}}}
-            
+            write_kwargs: dict = {
+                "upsert_rows": upsert_rows,
+                "schema": {"content": {"type": "string", "full_text_search": True}},
+            }
+
             # Inject vectors and add distance metric if an embedding function was provided
             if embed_fn:
                 for row, v in zip(upsert_rows, embed_fn([chunk.content for chunk in batch])):
@@ -317,3 +366,49 @@ class TpufChunkSource:
             key=lambda x: (len(x["queries"]), x["max_score"]),
             reverse=True,
         )
+
+    def search(self, spec: SearchSpec) -> list[Chunk]:
+        """Search chunks using a structured search spec."""
+        mode = spec.get("mode")
+        supported_modes = set(self._search_capabilities.get("modes", set()))
+        if mode not in supported_modes:
+            raise UnsupportedSearchModeError(
+                backend=str(self._search_capabilities.get("backend", "unknown")),
+                mode=str(mode),
+                supported_modes={str(m) for m in supported_modes},
+            )
+
+        shape_errors = validate_search_spec_shape(spec)
+        if shape_errors:
+            raise InvalidSearchSpecError(
+                backend=str(self._search_capabilities.get("backend", "unknown")),
+                message="; ".join(shape_errors),
+                spec=spec,
+            )
+
+        query_kwargs: dict[str, Any] = {
+            "rank_by": self._build_rank_by(str(spec.get("text_query") or "")),
+            "top_k": int(spec.get("top_k", 10)),
+            "include_attributes": True,
+        }
+        translated_filters = to_turbopuffer_filters(spec.get("filter"), self._search_capabilities)
+        if translated_filters is not None:
+            query_kwargs["filters"] = translated_filters
+
+        result = self._ns.query(**query_kwargs)
+        return [self._row_to_chunk(row) for row in result.rows]
+
+    def search_text(
+        self,
+        text_query: str,
+        top_k: int = 10,
+        filter: FilterPredicate | None = None,
+    ) -> list[Chunk]:
+        """Search chunks with a text query and optional filter."""
+        return self.search(
+            SearchSpec(mode="lexical", text_query=text_query, top_k=top_k, filter=filter)
+        )
+
+    def get_search_capabilities(self) -> SearchCapabilities:
+        """Return search capabilities for Turbopuffer backend."""
+        return self._search_capabilities

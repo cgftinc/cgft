@@ -16,6 +16,8 @@ Formulate effective search queries to retrieve the most relevant chunks.
 You can filter by metadata or filename to narrow your search.
 Write your complete answer on the final line only as a concise entity, within the xml tags <answer></answer>.
 """
+MAX_TOOL_OUTPUT_CHARS = 10000
+TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated due to character limit]"
 
 
 def percent_of_text_a_in_text_b(text_a: str, text_b: str) -> float:
@@ -91,6 +93,20 @@ class SearchEnv(BaseEnv):
 
     system_prompt: str = SYSTEM_PROMPT
     _tools: dict[str, tuple[ToolDefinition, Callable]] = {}
+
+    @staticmethod
+    def _truncate_tool_output(
+        text: str,
+        max_chars: int = MAX_TOOL_OUTPUT_CHARS,
+        suffix: str = TOOL_OUTPUT_TRUNCATION_SUFFIX,
+    ) -> str:
+        """Clamp tool output length to avoid overlong prompts in later turns."""
+        if len(text) <= max_chars:
+            return text
+
+        keep = max(0, max_chars - len(suffix))
+        truncated = text[:keep].rstrip()
+        return f"{truncated}{suffix}"
 
     @classmethod
     def dataset_preprocess(cls, example: Any, **kwargs) -> StandardizedExample:

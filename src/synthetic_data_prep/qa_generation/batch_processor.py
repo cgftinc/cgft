@@ -20,6 +20,8 @@ Example:
     )
 
     for i, response in enumerate(result.responses):
+        if response is None:
+            continue
         print(f"Prompt {i}: {response.answer}")
     ```
 """
@@ -93,27 +95,27 @@ class BatchResult:
     """Results from batch processing multiple prompts.
 
     Attributes:
-        responses: List of successful responses
+        responses: List aligned to input prompts. Failed prompts are None.
         total_latency_ms: Total time taken for all requests
     """
 
-    responses: list[BatchResponse]
+    responses: list[BatchResponse | None]
     total_latency_ms: float
 
     @property
     def num_responses(self) -> int:
         """Number of successful responses."""
-        return len(self.responses)
+        return sum(1 for r in self.responses if r is not None)
 
     @property
     def total_input_tokens(self) -> int:
         """Total input tokens across all responses."""
-        return sum(r.input_tokens for r in self.responses)
+        return sum(r.input_tokens for r in self.responses if r is not None)
 
     @property
     def total_output_tokens(self) -> int:
         """Total output tokens across all responses."""
-        return sum(r.output_tokens for r in self.responses)
+        return sum(r.output_tokens for r in self.responses if r is not None)
 
     @property
     def total_tokens(self) -> int:
@@ -123,9 +125,13 @@ class BatchResult:
     @property
     def avg_latency_ms(self) -> float:
         """Average latency per request in milliseconds."""
-        if not self.responses:
+        successful_count = self.num_responses
+        if successful_count == 0:
             return 0.0
-        return sum(r.latency_ms for r in self.responses) / len(self.responses)
+        return (
+            sum(r.latency_ms for r in self.responses if r is not None)
+            / successful_count
+        )
 
 
 async def call_openai_async(
@@ -234,30 +240,32 @@ async def batch_process_async(
 
     async def process_with_semaphore(prompt: str) -> BatchResponse:
         async with semaphore:
-            result = await call_openai_async(
-                client=client,
-                model=model,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                max_tokens=max_tokens,
-                timeout=timeout,
-            )
-            pbar.update(1)
-            return result
+            try:
+                return await call_openai_async(
+                    client=client,
+                    model=model,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                )
+            finally:
+                pbar.update(1)
 
     # Process all prompts concurrently
     tasks = [process_with_semaphore(prompt) for prompt in prompts]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
     pbar.close()
 
-    # Filter out exceptions and collect successful responses
-    successful_responses = []
+    # Preserve prompt alignment: failed prompts map to None at the same index
+    aligned_responses: list[BatchResponse | None] = []
     failed_count = 0
     for response in responses:
         if isinstance(response, Exception):
             failed_count += 1
+            aligned_responses.append(None)
         else:
-            successful_responses.append(response)
+            aligned_responses.append(response)
 
     if failed_count > 0:
         tqdm.write(f"Warning: {failed_count} prompt(s) failed to process")
@@ -265,7 +273,7 @@ async def batch_process_async(
     total_latency_ms = (time.time() - start_time) * 1000
 
     return BatchResult(
-        responses=successful_responses,
+        responses=aligned_responses,
         total_latency_ms=total_latency_ms,
     )
 

@@ -346,6 +346,9 @@ def generate_single_hop_batch(
     # 4. Parse responses and collect QA pairs
     dataset: list[QADataPoint] = []
     for i, response in enumerate(result.responses):
+        if response is None:
+            continue
+
         chunk = sampled_chunks[i]
         confidence, qa_pairs = response_parser(response.answer)
 
@@ -368,6 +371,12 @@ def generate_single_hop_batch(
                         )
                     ],
                     qa_type="single_hop",
+                    min_hop_count=1,
+                    is_co_located=None,
+                    filter_status=None,
+                    filter_reasoning=None,
+                    no_context_answer=None,
+                    eval_scores=dict()
                 )
             )
 
@@ -458,7 +467,8 @@ def generate_multi_hop_batch(
             ctx = source.get_chunk_with_context(chunk, max_chars=context_preview_chars)
             prompt = render_template(related_query_user_template, ctx)
             related_prompts.append(prompt)
-
+            
+        # 3. Batch process related query generation
         related_result = batch_process_sync(
             client=client,
             model=model,
@@ -469,6 +479,13 @@ def generate_multi_hop_batch(
             max_concurrent=max_concurrent,
             show_progress=show_progress,
         )
+
+    for i, response in enumerate(related_result.responses):
+        if response is None:
+            continue
+
+        chunk_a = sampled_chunks[i]
+        confidence, queries = related_query_parser(response.answer)
 
         for i, response in enumerate(related_result.responses):
             chunk_a = sampled_chunks[i]
@@ -527,6 +544,9 @@ def generate_multi_hop_batch(
     # 7. Parse responses and collect QA pairs
     dataset: list[QADataPoint] = []
     for i, response in enumerate(multi_hop_result.responses):
+        if response is None:
+            continue
+
         chunk_a, chunk_b, _ = chunk_pairs[i]
         qa_pairs = multi_hop_parser(response.answer)
 
@@ -554,6 +574,12 @@ def generate_multi_hop_batch(
                         ),
                     ],
                     qa_type="multi_hop",
+                    min_hop_count=2,
+                    is_co_located=None,
+                    filter_status=None,
+                    filter_reasoning=None,
+                    no_context_answer=None,
+                    eval_scores=dict()
                 )
             )
 

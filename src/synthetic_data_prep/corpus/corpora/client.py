@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -236,6 +237,7 @@ class CorpusClient:
         collection: ChunkCollection,
         batch_size: int = 100,
         show_progress: bool = True,
+        max_workers: int = 8,
     ) -> UploadResult:
         """Upload a ChunkCollection to a corpus.
 
@@ -244,6 +246,7 @@ class CorpusClient:
             collection: ChunkCollection to upload
             batch_size: Number of chunks per batch (default 100)
             show_progress: Show tqdm progress bar
+            max_workers: Number of parallel upload workers (default 8)
 
         Returns:
             UploadResult with counts and ID list
@@ -253,15 +256,21 @@ class CorpusClient:
         """
         chunks_list = list(collection)
         total_chunks = len(chunks_list)
+        if total_chunks == 0:
+            return UploadResult(success=True, inserted_count=0, chunk_ids=[])
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if max_workers <= 0:
+            raise ValueError("max_workers must be > 0")
+
+        total_batches = (total_chunks + batch_size - 1) // batch_size
         all_chunk_ids: list[str] = []
         total_inserted = 0
 
-        # Create batches
-        batches = [chunks_list[i : i + batch_size] for i in range(0, total_chunks, batch_size)]
-
-        pbar = tqdm(batches, desc="Uploading chunks", disable=not show_progress, unit="batch")
-
-        for batch in pbar:
+        def _upload_batch(batch_index: int) -> tuple[int, list[str]]:
+            start = batch_index * batch_size
+            end = min(start + batch_size, total_chunks)
+            batch = chunks_list[start:end]
             # Prepare batch payload - include hash in metadata for later matching
             payload = {
                 "chunks": [
@@ -278,11 +287,30 @@ class CorpusClient:
             self._handle_response_errors(response)
 
             data = response.json()
-            total_inserted += data.get("insertedCount", 0)
+            inserted_count = data.get("insertedCount", 0)
             chunk_ids = data.get("chunkIds", [])
-            all_chunk_ids.extend(chunk_ids)
+            return inserted_count, chunk_ids
 
-            pbar.set_postfix({"inserted": total_inserted})
+        pbar = tqdm(total=total_batches, desc="Uploading chunks", disable=not show_progress, unit="batch")
+
+        if max_workers == 1:
+            for batch_index in range(total_batches):
+                inserted_count, chunk_ids = _upload_batch(batch_index)
+                total_inserted += inserted_count
+                all_chunk_ids.extend(chunk_ids)
+                pbar.update(1)
+                pbar.set_postfix({"inserted": total_inserted})
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_upload_batch, batch_index) for batch_index in range(total_batches)]
+                for future in as_completed(futures):
+                    inserted_count, chunk_ids = future.result()
+                    total_inserted += inserted_count
+                    all_chunk_ids.extend(chunk_ids)
+                    pbar.update(1)
+                    pbar.set_postfix({"inserted": total_inserted})
+
+        pbar.close()
 
         return UploadResult(
             success=True,
@@ -339,6 +367,7 @@ class CorpusClient:
         limit: int = 10,
         offset: int = 0,
         metadata: dict[str, Any] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> SearchResult:
         """BM25 search within a corpus.
 
@@ -348,6 +377,14 @@ class CorpusClient:
             limit: Maximum results to return
             offset: Pagination offset
             metadata: Optional metadata filter
+            filters: Optional structured filter DSL.
+                Example:
+                {
+                    "and": [
+                        {"field": "date_start", "op": "gte", "value": "2017-01-01"},
+                        {"field": "participants", "op": "contains_any", "value": ["angel"]},
+                    ]
+                }
 
         Returns:
             SearchResult with results and total count
@@ -355,6 +392,8 @@ class CorpusClient:
         payload: dict[str, Any] = {"query": query, "limit": limit, "offset": offset}
         if metadata:
             payload["metadata"] = metadata
+        if filters:
+            payload["filters"] = filters
 
         response = self._http_client.post(f"/api/corpora/{corpus_id}/search", json=payload)
         self._handle_response_errors(response)
@@ -378,6 +417,8 @@ class CorpusClient:
         query: str,
         collection: ChunkCollection,
         limit: int = 10,
+        metadata: dict[str, Any] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[tuple[Chunk, float]]:
         """Search and return matching local Chunk objects with scores.
 
@@ -388,11 +429,19 @@ class CorpusClient:
             query: Search query
             collection: Local ChunkCollection
             limit: Max results
+            metadata: Optional exact-match metadata filter
+            filters: Optional structured filter DSL
 
         Returns:
             List of (Chunk, score) tuples
         """
-        result = self.search(corpus_id, query, limit=limit)
+        result = self.search(
+            corpus_id=corpus_id,
+            query=query,
+            limit=limit,
+            metadata=metadata,
+            filters=filters,
+        )
 
         matched: list[tuple[Chunk, float]] = []
         for corpus_chunk in result.results:

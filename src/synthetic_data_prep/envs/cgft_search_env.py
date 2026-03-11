@@ -75,20 +75,31 @@ class CgftSearchEnv(SearchEnv):
                             "sites": {"type": "array", "items": {"type": "string"}},
                         },
                     },
-                    "metadata": {
+                    "filters": {
                         "type": "object",
-                        "description": "Optional metadata filters (e.g., {'ticker': 'DDOG', 'year': 2024}).",
+                        "description": (
+                            "Optional structured filter object using domain-specific query language (DSL). "
+                            "Field condition shape: "
+                            "{\"field\":\"<name>\",\"op\":\"eq|in|gte|lte|contains_any|contains_all\",\"value\":...}. "
+                            "Logical shape: {\"and\":[...]} or {\"or\":[...]} or {\"not\":{...}}. "
+                            "Example: "
+                            "{\"and\":[{\"field\":\"metadata_name\",\"op\":\"eq\",\"value\":\"example_value\"},"
+                            "{\"field\":\"metadata_name_2\",\"op\":\"gte\",\"value\":123}]}"
+                        ),
                     },
                     "filename": {
                         "type": "string",
-                        "description": "Optional filename filter. Simple string for substring match (e.g., 'config') or regex pattern (e.g., '.*\\.json$').",
+                        "description": (
+                            "Optional filename filter. Simple string for substring match "
+                            "(e.g., 'config') or regex pattern (e.g., '.*\\.json$')."
+                        ),
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Max number of results to return (default 10).",
                     },
                 },
-                "required": ["query"],
+                "required": ["query"]
             },
         )
 
@@ -265,6 +276,7 @@ class CgftSearchEnv(SearchEnv):
         query: str,
         intent: dict[str, Any] | str | None = None,
         metadata: dict[str, Any] | None = None,
+        filters: dict[str, Any] | None = None,
         filename: str | None = None,
         limit: int = 10,
         **kwargs,
@@ -275,6 +287,7 @@ class CgftSearchEnv(SearchEnv):
             query: Natural-language sub-question or search text
             intent: Optional structured search intent used to build BM25 query
             metadata: Optional metadata filters
+            filters: Optional structured filter object
             filename: Optional filename filter (substring or regex)
             limit: Maximum number of results
 
@@ -285,9 +298,11 @@ class CgftSearchEnv(SearchEnv):
             return "Error: Missing required parameter: 'query'"
 
         rewritten_query = await self._rewrite_query(query, intent=intent)
-        request_body = {"query": rewritten_query, "limit": limit}
+        request_body: dict[str, Any] = {"query": query, "limit": limit}
         if metadata:
             request_body["metadata"] = metadata
+        if filters:
+            request_body["filters"] = filters
         if filename:
             request_body["filename"] = filename
 
@@ -333,7 +348,7 @@ class CgftSearchEnv(SearchEnv):
                     lines.append(f"   Metadata: {metadata_val}")
 
             lines.append(f"\nTotal: {total} results")
-            return "\n".join(lines)
+            return self._truncate_tool_output("\n".join(lines))
 
         except aiohttp.ClientError as e:
             return f"Error: Network error: {str(e)}"

@@ -54,13 +54,13 @@ class StorageClient:
     upload URL, then PUTs the file content directly to that URL.
 
     Example:
-        >>> client = StorageClient(api_key="sk_...", base_url="http://localhost:3000")
-        >>> result = client.upload_file(
-        ...     path="datasets/my-data.jsonl",
-        ...     content=b'{"q": "...", "a": "..."}',
-        ...     mime_type="application/jsonl",
-        ... )
-        >>> print(f"Uploaded to {result['blobPath']}")
+        client = StorageClient(api_key="sk_...", base_url="http://localhost:3000")
+        result = client.upload_file(
+            path="datasets/my-data.jsonl",
+            content=b'{"q": "...", "a": "..."}',
+            mime_type="application/jsonl",
+        )
+        print(f"Uploaded to {result['blobPath']}")
     """
 
     api_key: str
@@ -215,12 +215,12 @@ class TrainerClient:
     """Client for launching and managing training jobs.
 
     Example:
-        >>> client = TrainerClient(api_key="sk_...", base_url="http://localhost:3000")
-        >>> job = client.launch_job(
-        ...     job_type="search",
-        ...     args={"dataset": "datasets/search/abc123/qa-dataset.jsonl"},
-        ... )
-        >>> print(f"Launched job: {job}")
+        client = TrainerClient(api_key="sk_...", base_url="http://localhost:3000")
+        job = client.launch_job(
+            job_type="search",
+            args={"dataset": "datasets/search/abc123/qa-dataset.jsonl"},
+        )
+        print(f"Launched job: {job}")
     """
 
     api_key: str
@@ -534,10 +534,6 @@ def _print_event(
             f"{prefix} → rollout_completed  {status}  "
             f"rewards={event.get('rewards')}  error={event.get('error')}"
         )
-        if include_event_meta:
-            meta = _debug_event_fields(event)
-            if meta:
-                print(f"{prefix} → rollout_meta: {json.dumps(meta, ensure_ascii=True)}")
 
     elif etype in ("worker_error", "error", "cancelled"):
         print(_err(f"{prefix} → {etype}: {event.get('error')}"))
