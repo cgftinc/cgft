@@ -213,7 +213,7 @@ class CorpusClient:
         collection: ChunkCollection,
         batch_size: int = 100,
         show_progress: bool = True,
-        max_workers: int = 1,
+        max_workers: int = 8,
     ) -> UploadResult:
         """Upload a ChunkCollection to a corpus.
 
@@ -222,7 +222,7 @@ class CorpusClient:
             collection: ChunkCollection to upload
             batch_size: Number of chunks per batch (default 100)
             show_progress: Show tqdm progress bar
-            max_workers: Number of parallel upload workers (default 1 = sequential)
+            max_workers: Number of parallel upload workers (default 8)
 
         Returns:
             UploadResult with counts and ID list
