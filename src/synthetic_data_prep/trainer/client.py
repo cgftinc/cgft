@@ -268,6 +268,7 @@ class TrainerClient:
         env_metadata_path: str,
         train_dataset_path: str,
         eval_dataset_path: str,
+        model: str | None = None,
         name: str | None = None,
     ) -> str:
         """Launch a new experiment from a job template.
@@ -294,6 +295,7 @@ class TrainerClient:
                     "env_metadata_path": env_metadata_path,
                     "train_dataset_path": train_dataset_path,
                     "eval_dataset_path": eval_dataset_path,
+                    "model": model,
                 },
             },
         )
