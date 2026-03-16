@@ -666,7 +666,7 @@ class RolloutClient:
             "env": env,
             "llm": {
                 "base_url": llm_base_url,
-                "api_key": llm_api_key,
+                "api_key": llm_api_key or self._api_key,
                 "model": llm_model,
                 "api-version": llm_api_version
             },
