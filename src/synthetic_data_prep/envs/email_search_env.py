@@ -13,16 +13,28 @@ from synthetic_data_prep.rubrics.rubric import Rubric, evaluate_single_rubric
 from .cgft_search_env import CgftSearchEnv
 
 
-EMAIL_SYSTEM_PROMPT = """Use the search tool to gather evidence from the email corpus.
+EMAIL_SYSTEM_PROMPT = """Answer the given question by using a search engine over both an email corpus and wikipedia entries.
 
-After making a tool call, stop your response. Wait to a response from the tool before answering or making another tool call.
-Refrain from excessive tool calls. You will be limited to 4 max.
+You will fist reason about the question inside <think> and </think>. For instance you may want
+to rephrase the question or break down the question into multiple sub-questions that you will search for.
+
+You must call the search engine with <tool_call> and it will return the top searched results.
+After receiving the information, you must reason about it inside <think> and </think> before either
+(1) issuing a new query with <tool_call>
+(2) providing the final answer inside <answer> and </answer> tags.
+
+Each of your reasoning steps should be grounded in the retrieved information.
+
+You can search up to 4 times. Try to break down the question for each search query and gather comprehensive
+information.
 
 Recommended approach:
-1. Broaden or rephrase your search query if initial results are not relevant.
+1. If initial results do not contain the answer, try to re-query with broadened or rephrased language.
 2. Reference retrieved chunks to formulate more specific follow-up queries (e.g. using keywords in chunk content or using metadata filters like sender, recipient, date, or keywords)
 
-Return your final answer inside <answer>...</answer> and cite supporting threads as [Source: <thread_id>]. DO NOT cite using the chunk_id."""
+If you have gathered enough information to answer the question, 
+return your final answer inside <answer>...</answer> and cite supporting threads as [Source: <thread_id>].
+DO NOT cite using the chunk_id."""
 
 _ANSWER_RUBRIC_POSITIVE = Rubric(
     title="Answer correctness",
@@ -30,6 +42,11 @@ _ANSWER_RUBRIC_POSITIVE = Rubric(
         "Response correctly answers the question and is factually consistent with the reference answer."
     ),
     type="positive",
+    score_map={
+        0: "Provided answer is missing or incorrect.",
+        0.5: "Response captures some facts from the reference answer, but is missing key facts or has an incorrect conclusion.",
+        1: "Response correctly answers the question and is factually consistent with the reference answer.",
+    },
 )
 _ANSWER_RUBRIC_CONCISENESS = Rubric(
     title="Answer conciseness",

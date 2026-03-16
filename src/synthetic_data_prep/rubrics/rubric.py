@@ -19,6 +19,7 @@ class Rubric:
     title: str
     description: str
     type: Literal["positive", "negative"] = "positive"
+    score_map: Optional[Dict[float, str]] = None
 
 
 def _cache_dict_to_rubric(d: Dict, rubric_type: Literal["positive", "negative"]) -> "Rubric":
@@ -189,6 +190,28 @@ For NEGATIVE rubrics:
 Respond ONLY with a JSON object:
 {{
   "score": <0 or 1>,
+  "reasoning": "<brief explanation>"
+}}"""
+
+RUBRIC_RANGED_EVALUATION_PROMPT = """You are evaluating a response against a specific quality criterion.
+
+**Criterion Type**: {rubric_type}
+**Criterion Title**: {title}
+**Criterion Description**: {description}
+
+**Question**: {question}
+{ground_truth_block}
+
+**Response to Evaluate**: {response}
+
+Your task is to score this response on how well it meets (or violates) the criterion.
+
+Use exactly one of the following scores:
+{score_rubric}
+
+Respond ONLY with a JSON object:
+{{
+  "score": <one of {allowed_scores}>,
   "reasoning": "<brief explanation>"
 }}"""
 
@@ -392,7 +415,7 @@ async def evaluate_single_rubric(
     Evaluate a single response against a single rubric.
 
     Args:
-        rubric: Rubric with title, description, and type
+        rubric: Rubric with title, description, type, and optional score_map
         question: The original question
         ground_truth: Optional reference answer to ground evaluation
             - For generated rubrics, this may not be needed as the generation
@@ -404,7 +427,7 @@ async def evaluate_single_rubric(
         timeout: Request timeout
 
     Returns:
-        Dict with "score" (0 or 1) and "reasoning"
+        Dict with "score" and "reasoning"
     """
     ground_truth_text = str(ground_truth or "").strip()
     ground_truth_block = (
@@ -412,15 +435,31 @@ async def evaluate_single_rubric(
         if ground_truth_text
         else ""
     )
-
-    prompt = RUBRIC_EVALUATION_PROMPT.format(
-        rubric_type=rubric.type,
-        title=rubric.title,
-        description=rubric.description,
-        question=question,
-        ground_truth_block=ground_truth_block,
-        response=response,
-    )
+    if rubric.score_map:
+        allowed_scores = ", ".join(str(score) for score in rubric.score_map.keys())
+        score_rubric = "\n".join(
+            f"- {score}: {description}"
+            for score, description in rubric.score_map.items()
+        )
+        prompt = RUBRIC_RANGED_EVALUATION_PROMPT.format(
+            rubric_type=rubric.type,
+            title=rubric.title,
+            description=rubric.description,
+            question=question,
+            ground_truth_block=ground_truth_block,
+            response=response,
+            allowed_scores=allowed_scores,
+            score_rubric=score_rubric,
+        )
+    else:
+        prompt = RUBRIC_EVALUATION_PROMPT.format(
+            rubric_type=rubric.type,
+            title=rubric.title,
+            description=rubric.description,
+            question=question,
+            ground_truth_block=ground_truth_block,
+            response=response,
+        )
 
     client = AsyncOpenAI(base_url=base_url, api_key=api_key, max_retries=3)
 
