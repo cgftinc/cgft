@@ -83,10 +83,3 @@ Output is a `QADataset` of `QADataPoint` objects, serializable to JSONL or JSON.
 - **OpenAI API** — LLM for QA generation (primary)
 - **benchmax** — RL training framework (`BaseEnv`, `ToolDefinition`, `StandardizedExample`)
 
-### Notebooks
-
-`notebooks/` contains the primary usage examples:
-- `simple_rag_pipeline.ipynb` — 4-step quickstart (chunk → index → generate QA → train)
-- `synthetic_rag_dataset_gen.ipynb` — full QA generation walkthrough
-- `cipher_swap_env.ipynb` — custom environment example
-- `turbopuffer_rag_pipeline.ipynb` — Turbopuffer backend variant

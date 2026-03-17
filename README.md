@@ -1,4 +1,4 @@
-# cgft-utils
+# cgft
 
 End-to-end pipeline for fine-tuning LLMs on RAG workloads using reinforcement learning.
 
@@ -7,14 +7,14 @@ End-to-end pipeline for fine-tuning LLMs on RAG workloads using reinforcement le
 ## Installation
 
 ```bash
-pip install git+https://github.com/cgftinc/cgft-utils.git
+pip install git+https://github.com/cgftinc/cgft.git
 ```
 
 Or clone and install in development mode:
 
 ```bash
-git clone https://github.com/cgftinc/cgft-utils.git
-cd cgft-utils
+git clone https://github.com/cgftinc/cgft.git
+cd cgft
 pip install -e .[dev]
 ```
 
@@ -28,7 +28,8 @@ from cgft.envs import CorporaSearchEnv
 from cgft.trainer import train
 ```
 
-See `notebooks/` for full usage examples (also available on Google Colab).
+## Usage Examples
+Goolge Colab Notebooks: https://drive.google.com/drive/u/0/folders/1idySaAEmm2ruJLAkjMpJBFqM9cTY2Hv5
 
 ## CLI
 
@@ -46,25 +47,4 @@ cgft-pipeline --config path/to/config.yaml
 - **`multi_model/`** — Multi-LLM provider utilities
 
 ## Documentation
-
-### overview
-
-- [introduction](docs/overview/introduction.mdx)
-- [what-is-rl](docs/overview/what-is-rl.mdx)
-
-### bring-your-env
-
-- [train](docs/bring-your-env/train.mdx)
-- [your-own-env](docs/bring-your-env/your-own-env.mdx)
-
-### experiment
-
-- [managing-experiments](docs/experiment/managing-experiments.mdx)
-- [sharing](docs/experiment/sharing.mdx)
-
-### rag
-
-- [env](docs/rag/env.mdx)
-- [rl-for-rag](docs/rag/rl-for-rag.mdx)
-- [synthetic_datagen](docs/rag/synthetic_datagen.mdx)
-- [train](docs/rag/train.mdx)
+https://cgft.io/docs/
