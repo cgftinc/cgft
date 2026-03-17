@@ -32,6 +32,12 @@ htmlcov/
 .DS_Store
 *.log
 
+# Generated artifacts
+output*.txt
+sage_output*
+train.jsonl
+outputs/
+
 # Notebook artifacts
 notebooks/.ipynb_checkpoints/
 notebooks/samples/
@@ -39,3 +45,6 @@ notebooks/outputs/
 
 # Working Demo
 demo*/
+
+# Type checking
+.mypy_cache/
