@@ -1,12 +1,13 @@
-"""TpufSearchEnv — SearchEnv backed by Turbopuffer BM25 search."""
+"""TpufSearchEnv — SearchEnv backed by Turbopuffer search (BM25, vector, or hybrid)."""
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
-from typing import Any
 
 from benchmax.envs.types import ToolDefinition
+
+from synthetic_data_prep.corpus.search_schema.search_types import SearchSpec
+from synthetic_data_prep.corpus.turbopuffer.source import TpufChunkSource
 
 from .search_env import SearchEnv
 
@@ -14,12 +15,19 @@ from .search_env import SearchEnv
 class TpufSearchEnv(SearchEnv):
     """Search environment backed by a Turbopuffer namespace.
 
+    Supports lexical (BM25), vector (ANN), and hybrid search. When ``embed_fn``
+    is provided, vector and hybrid modes are enabled and the tool schema exposes a
+    ``mode`` parameter so the RL agent can choose between them. Without ``embed_fn``
+    only lexical search is available.
+
     Args:
         turbopuffer_api_key: Turbopuffer API key
         namespace: Turbopuffer namespace name
         region: Turbopuffer region (default ``"aws-us-east-1"``)
         content_attr: List of attribute names to search over via BM25.
             Defaults to ["content"].
+        embed_fn: Optional callable that maps list[str] → list[list[float]].
+            When provided, enables vector and hybrid search modes.
     """
 
     def __init__(
@@ -28,30 +36,51 @@ class TpufSearchEnv(SearchEnv):
         namespace: str,
         region: str = "aws-us-east-1",
         content_attr: list[str] | None = None,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
         **kwargs,
     ):
-        import turbopuffer
-
-        self._ns = turbopuffer.Turbopuffer(api_key=turbopuffer_api_key, region=region).namespace(
-            namespace
+        self._source = TpufChunkSource(
+            api_key=turbopuffer_api_key,
+            namespace=namespace,
+            region=region,
+            content_attr=content_attr,
+            embed_fn=embed_fn,
         )
-        self._fields: list[str] = content_attr if content_attr is not None else ["content"]
+        supported_modes = self._source.get_search_capabilities()["modes"]
+
+        if "hybrid" in supported_modes:
+            mode_enum = ["lexical", "vector", "hybrid"]
+            self._default_mode = "hybrid"
+        elif "vector" in supported_modes:
+            mode_enum = ["lexical", "vector"]
+            self._default_mode = "vector"
+        else:
+            mode_enum = ["lexical"]
+            self._default_mode = "lexical"
+
+        tool_properties: dict = {
+            "query": {
+                "type": "string",
+                "description": "Search query string.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max number of results to return (default 10).",
+            },
+        }
+        if len(mode_enum) > 1:
+            tool_properties["mode"] = {
+                "type": "string",
+                "enum": mode_enum,
+                "description": f'Search mode: {", ".join(mode_enum)}. Default: "{self._default_mode}".',
+            }
 
         search_tool_definition = ToolDefinition(
             name="search",
-            description="Search using BM25 full-text search.",
+            description="Search the corpus using full-text, vector, or hybrid search.",
             input_schema={
                 "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query string.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max number of results to return (default 10).",
-                    },
-                },
+                "properties": tool_properties,
                 "required": ["query"],
             },
         )
@@ -59,25 +88,15 @@ class TpufSearchEnv(SearchEnv):
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {
             search_tool_definition.name: (search_tool_definition, self._search_tool)
         }
-        # BaseEnv does not define __init__, so keep optional kwargs as attributes
-        # instead of forwarding them to object.__init__.
         self._experiment_id = kwargs.get("experiment_id")
         self._rollout_api_key = kwargs.get("api_key")
 
-    def _build_rank_by(self, query: str) -> Any:
-        """Build the rank_by argument for a BM25 Turbopuffer query."""
-        if len(self._fields) == 1:
-            return (self._fields[0], "BM25", query)
-        return (
-            "Sum",
-            tuple(("Product", 1, (f, "BM25", query)) for f in self._fields),
-        )
-
-    async def _search_tool(self, query: str, limit: int = 10, **kwargs) -> str:
-        """Search the Turbopuffer namespace using BM25.
+    async def _search_tool(self, query: str, mode: str | None = None, limit: int = 10, **kwargs) -> str:
+        """Search the Turbopuffer namespace.
 
         Args:
             query: Search query string
+            mode: Search mode (lexical/vector/hybrid). Defaults to best available.
             limit: Maximum number of results
 
         Returns:
@@ -86,26 +105,26 @@ class TpufSearchEnv(SearchEnv):
         if not query:
             return "Error: Missing required parameter: 'query'"
 
+        effective_mode = mode or self._default_mode
+        vector_query = None
+        if effective_mode in ("vector", "hybrid"):
+            vector_query = self._source.embed_query(query)
+            if vector_query is None:
+                effective_mode = "lexical"  # graceful fallback if embed_fn not set
+
+        spec = SearchSpec(
+            mode=effective_mode,  # type: ignore[arg-type]
+            top_k=limit,
+            text_query=query,
+            vector_query=vector_query,
+        )
         try:
-            result = self._ns.query(
-                rank_by=self._build_rank_by(query),
-                top_k=limit,
-                include_attributes=True,
-            )
+            chunks = self._source.search(spec)
         except Exception as e:
             return f"Error: {str(e)}"
 
-        if not result.rows:
+        if not chunks:
             return "No results found."
 
-        lines = []
-        for i, row in enumerate(result.rows, start=1):
-            score = getattr(row, "$dist", None)
-            score_str = f"(score: {score:.4f})" if score is not None else ""
-            if len(self._fields) == 1:
-                content = str(getattr(row, self._fields[0], ""))
-            else:
-                content = json.dumps({f: getattr(row, f, "") for f in self._fields}, default=str)
-            lines.append(f"{i}. {score_str}\n   Content: {content}")
-
+        lines = [f"{i}.\n   Content: {chunk.content}" for i, chunk in enumerate(chunks, 1)]
         return self._truncate_tool_output("\n".join(lines))
