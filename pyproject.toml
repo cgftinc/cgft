@@ -1,5 +1,5 @@
 [project]
-name = "cgft-utils"
+name = "cgft"
 version = "0.1.0"
 description = "End-to-end pipeline for fine-tuning LLMs on RAG workloads using reinforcement learning"
 readme = "README.md"
@@ -7,7 +7,7 @@ license = { text = "MIT" }
 authors = [
     { name = "cgft", email = "finetune@cgft.io" }
 ]
-urls = { Homepage = "https://github.com/cgftinc/cgft-utils", Repository = "https://github.com/cgftinc/cgft-utils" }
+urls = { Homepage = "https://github.com/cgftinc/cgft", Repository = "https://github.com/cgftinc/cgft" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
