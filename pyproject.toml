@@ -41,7 +41,7 @@ dev = [
 ]
 
 [project.scripts]
-cgft-pipeline = "cgft_utils.cli:main"
+cgft-pipeline = "cgft.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8.13,<0.9.0"]

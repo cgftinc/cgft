@@ -21,11 +21,11 @@ pip install -e .[dev]
 ## Quick Start
 
 ```python
-from cgft_utils.chunkers import Chunk, ChunkCollection
-from cgft_utils.corpus import CorporaChunkSource
-from cgft_utils.qa_generation import CgftPipeline
-from cgft_utils.envs import CorporaSearchEnv
-from cgft_utils.trainer import train
+from cgft.chunkers import Chunk, ChunkCollection
+from cgft.corpus import CorporaChunkSource
+from cgft.qa_generation import CgftPipeline
+from cgft.envs import CorporaSearchEnv
+from cgft.trainer import train
 ```
 
 See `notebooks/` for full usage examples (also available on Google Colab).

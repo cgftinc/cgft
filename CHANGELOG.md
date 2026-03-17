@@ -10,5 +10,5 @@ All notable changes to this project will be documented in this file.
 - PEP 561 `py.typed` marker for type checking support
 
 ### Changed
-- Package renamed from `synthetic_data_prep` to `cgft_utils`
-- All imports updated to use `cgft_utils` namespace
+- Package renamed from `synthetic_data_prep` to `cgft`
+- All imports updated to use `cgft` namespace
