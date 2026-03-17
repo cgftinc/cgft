@@ -166,7 +166,7 @@ Evaluate in order:
 class ModelConfig:
     """Model endpoint settings."""
 
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = "https://app.cgft.io/api/llm"
 
@@ -304,7 +304,7 @@ class StructuralLinkerConfig:
 class LLMGuidedLinkerConfig:
     """Config for `LLMGuidedChunkLinker`."""
 
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = ""
     system_prompt: str = ""
@@ -327,7 +327,7 @@ class LinkerConfig:
 class LLMDirectGenerationConfig:
     """Direct LLM generation controls."""
 
-    model: str = "gpt-5.2"
+    model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = ""
     max_completion_tokens: int = 4096
@@ -343,7 +343,7 @@ class LLMDirectGenerationConfig:
 class LLMEnvGenerationConfig:
     """Rollout-backed generation controls."""
 
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = ""
     env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
@@ -411,7 +411,7 @@ class RetrievalLLMFilterConfig:
     """Retrieval + judge filter settings."""
 
     enabled: bool = True
-    judge_model: str = "gpt-5-mini"
+    judge_model: str = "gpt-5.4"
     judge_api_key: str = ""
     judge_base_url: str = ""
     judge_system_prompt: str = DEFAULT_RETRIEVAL_JUDGE_SYSTEM_PROMPT
@@ -431,7 +431,7 @@ class GroundingLLMFilterConfig:
     """Grounding/answerability judge filter settings."""
 
     enabled: bool = True
-    judge_model: str = "gpt-5-mini"
+    judge_model: str = "gpt-5.4"
     judge_api_key: str = ""
     judge_base_url: str = ""
     judge_system_prompt: str = DEFAULT_GROUNDING_JUDGE_SYSTEM_PROMPT
@@ -448,10 +448,10 @@ class LLMEnvFilterConfig:
     """Rollout-backed filter settings."""
 
     enabled: bool = True
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = ""
-    judge_model: str = "gpt-5-mini"
+    judge_model: str = "gpt-5.4"
     judge_api_key: str = ""
     judge_base_url: str = ""
     env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
@@ -476,7 +476,7 @@ class RefinementConfig:
     """Refinement controls for retrying failed filter candidates."""
 
     enabled: bool = True
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = ""
     max_refinements_per_item: int = 2
@@ -893,7 +893,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             corpus_pool_size=max(10, int(structural_raw.get("corpus_pool_size", 200))),
         ),
         llm_guided=LLMGuidedLinkerConfig(
-            model=str(llm_linker_raw.get("model", "gpt-5-mini")),
+            model=str(llm_linker_raw.get("model", "gpt-5.4")),
             api_key=str(llm_linker_raw.get("api_key", "")),
             base_url=str(llm_linker_raw.get("base_url", "")).strip(),
             system_prompt=str(llm_linker_raw.get("system_prompt", "")),
@@ -934,7 +934,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             show_batch_progress=bool(direct_raw.get("show_batch_progress", True)),
         ),
         llm_env=LLMEnvGenerationConfig(
-            model=str(env_gen_raw.get("model", "gpt-5-mini")),
+            model=str(env_gen_raw.get("model", "gpt-5.4")),
             api_key=str(env_gen_raw.get("api_key", "")),
             base_url=str(env_gen_raw.get("base_url", "")).strip(),
             env_bundle=EnvBundleConfig(
@@ -1012,7 +1012,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         ),
         retrieval_llm=RetrievalLLMFilterConfig(
             enabled=bool(retrieval_raw.get("enabled", True)),
-            judge_model=str(retrieval_raw.get("judge_model", "gpt-5-mini")),
+            judge_model=str(retrieval_raw.get("judge_model", "gpt-5.4")),
             judge_api_key=str(retrieval_raw.get("judge_api_key", "")),
             judge_base_url=str(retrieval_raw.get("judge_base_url", "")).strip(),
             judge_system_prompt=(
@@ -1049,10 +1049,11 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             ),
             max_concurrent=max(1, int(retrieval_raw.get("max_concurrent", 8))),
             batch_enabled=bool(retrieval_raw.get("batch_enabled", True)),
+            show_batch_progress=bool(retrieval_raw.get("show_batch_progress", True)),
         ),
         grounding_llm=GroundingLLMFilterConfig(
             enabled=bool(grounding_raw.get("enabled", True)),
-            judge_model=str(grounding_raw.get("judge_model", "gpt-5-mini")),
+            judge_model=str(grounding_raw.get("judge_model", "gpt-5.4")),
             judge_api_key=str(grounding_raw.get("judge_api_key", "")),
             judge_base_url=str(grounding_raw.get("judge_base_url", "")).strip(),
             judge_system_prompt=(
@@ -1080,13 +1081,14 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             ),
             max_concurrent=max(1, int(grounding_raw.get("max_concurrent", 8))),
             batch_enabled=bool(grounding_raw.get("batch_enabled", True)),
+            show_batch_progress=bool(grounding_raw.get("show_batch_progress", True)),
         ),
     )
 
     refinement_raw = raw.get("refinement", {}) or {}
     refinement = RefinementConfig(
         enabled=bool(refinement_raw.get("enabled", True)),
-        model=str(refinement_raw.get("model", "gpt-5-mini")),
+        model=str(refinement_raw.get("model", "gpt-5.4")),
         api_key=str(refinement_raw.get("api_key", "")),
         base_url=str(refinement_raw.get("base_url", "")).strip(),
         max_refinements_per_item=max(
