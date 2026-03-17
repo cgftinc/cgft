@@ -98,6 +98,16 @@ def save_qa_dataset_jsonl(dataset: list[QADataPoint], path: str | Path) -> None:
             f.write(json.dumps(dp, ensure_ascii=False) + "\n")
 
 
+def save_jsonl_rows(rows: list[dict[str, Any]], path: str | Path) -> None:
+    """Save generic dict rows to JSONL."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def load_qa_dataset_jsonl(path: str | Path) -> list[QADataPoint]:
     """Load QA dataset from a JSONL file.
 

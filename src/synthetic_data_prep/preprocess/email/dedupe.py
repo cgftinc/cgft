@@ -705,9 +705,59 @@ def dedupe_email_jsonl(
     return report
 
 
+def dedupe_email_folder(
+    folder: str | Path,
+    output_name: str = "_deduped.jsonl",
+    report_name: str = "_dedup_report.json",
+    *,
+    config: DedupeConfig = DedupeConfig(),
+) -> dict[str, Any]:
+    """Combine all .jsonl files in a folder, dedupe, and write a single output.
+
+    Skips files whose name starts with '_' (preprocessor outputs).
+    Writes <folder>/<output_name> and <folder>/<report_name>.
+
+    Returns the dedupe report dict.
+    """
+    folder = Path(folder)
+    jsonl_files = sorted(
+        f for f in folder.rglob("*.jsonl") if not f.name.startswith("_")
+    )
+    if not jsonl_files:
+        print(f"No .jsonl files found in {folder}")
+        return {"counts": {"input_messages": 0, "output_messages_total": 0}}
+
+    all_rows: list[dict[str, Any]] = []
+    for f in jsonl_files:
+        rows = _read_jsonl(f)
+        print(f"  Read {f.name}: {len(rows)} messages")
+        all_rows.extend(rows)
+    print(f"Combined: {len(all_rows)} messages from {len(jsonl_files)} files")
+
+    kept_messages, report = dedupe_parsed_messages(all_rows, config=config)
+
+    out_path = folder / output_name
+    _write_jsonl(out_path, kept_messages)
+
+    rep_path = folder / report_name
+    report["input_path"] = str(folder)
+    report["output_path"] = str(out_path)
+    rep_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    c = report["counts"]
+    print(
+        f"Dedupe: {c['input_messages']} msgs / {c['input_threads']} threads "
+        f"→ {c['output_messages_total']} msgs / {c['kept_threads_total']} threads "
+        f"(removed {c['removed_total']} threads)"
+    )
+    return report
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Thread-first MinHash dedup for parsed emails.")
-    p.add_argument("--input", default=DEFAULT_INPUT_PATH)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--input", help="Path to a single parsed-email JSONL file")
+    group.add_argument("--folder", help="Folder to combine and dedupe all .jsonl files in")
     p.add_argument("--output", default=DEFAULT_OUTPUT_PATH)
     p.add_argument("--report", default=DEFAULT_REPORT_PATH)
     p.add_argument("--dry-run", action="store_true")
@@ -716,21 +766,24 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    report = dedupe_email_jsonl(
-        input_path=args.input,
-        output_path=args.output,
-        report_path=args.report,
-        dry_run=args.dry_run,
-    )
-    c = report["counts"]
-    print(
-        "Dedup complete: "
-        f"threads_in={c['input_threads']} threads_kept={c['kept_threads_total']} "
-        f"threads_removed={c['removed_total']} messages_out={c['output_messages_total']}"
-    )
-    print(f"Report: {args.report}")
-    if not args.dry_run:
-        print(f"Message output: {args.output}")
+    if args.folder:
+        dedupe_email_folder(args.folder)
+    else:
+        report = dedupe_email_jsonl(
+            input_path=args.input,
+            output_path=args.output,
+            report_path=args.report,
+            dry_run=args.dry_run,
+        )
+        c = report["counts"]
+        print(
+            "Dedup complete: "
+            f"threads_in={c['input_threads']} threads_kept={c['kept_threads_total']} "
+            f"threads_removed={c['removed_total']} messages_out={c['output_messages_total']}"
+        )
+        print(f"Report: {args.report}")
+        if not args.dry_run:
+            print(f"Message output: {args.output}")
 
 
 if __name__ == "__main__":

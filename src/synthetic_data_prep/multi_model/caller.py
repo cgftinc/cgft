@@ -195,12 +195,25 @@ async def call_model(
             "model": config.deployment_name,
             "messages": messages,
             "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
             "timeout": timeout,
         }
 
-        response = await loop.run_in_executor(
-            None, lambda: client.chat.completions.create(**kwargs)
-        )
+        def _create_chat_completion_with_fallback():
+            try:
+                return client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                msg = str(exc).lower()
+                retry_kwargs = dict(kwargs)
+                if "unsupported parameter" in msg and "max_tokens" in msg:
+                    retry_kwargs.pop("max_tokens", None)
+                    return client.chat.completions.create(**retry_kwargs)
+                if "unsupported parameter" in msg and "max_completion_tokens" in msg:
+                    retry_kwargs.pop("max_completion_tokens", None)
+                    return client.chat.completions.create(**retry_kwargs)
+                raise
+
+        response = await loop.run_in_executor(None, _create_chat_completion_with_fallback)
         latency_ms = (time.time() - start_time) * 1000
 
         answer, thinking, reasoning_summary = _extract_openai_chat_response(response)

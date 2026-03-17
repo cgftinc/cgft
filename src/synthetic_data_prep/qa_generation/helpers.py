@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 from .models import QADataPoint, ReferenceChunk
@@ -9,10 +10,65 @@ from .models import QADataPoint, ReferenceChunk
 if TYPE_CHECKING:
     from ..chunkers.models import Chunk, ChunkCollection
     from ..corpus.source import ChunkSource
+    from .protocols import ChunkLinker
 
 # ============================================================================
 # Template Rendering and Parsing
 # ============================================================================
+
+_SIMPLE_TEMPLATE_FIELD_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+_CONDITIONAL_TOKEN_RE = re.compile(
+    r"\[\[if\s+([a-zA-Z_][a-zA-Z0-9_]*)\]\]|\[\[endif\]\]"
+)
+_ESCAPED_OPEN_BRACE = "__CGFT_ESCAPED_OPEN_BRACE__"
+_ESCAPED_CLOSE_BRACE = "__CGFT_ESCAPED_CLOSE_BRACE__"
+
+
+def _template_value_present(value: Any) -> bool:
+    """Return whether a template variable value is considered present."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _render_conditionals(template: str, variables: dict[str, Any]) -> str:
+    """Render [[if field]]...[[endif]] blocks before placeholder substitution."""
+    parts_stack: list[list[str]] = [[]]
+    active_stack: list[bool] = [True]
+    pos = 0
+
+    for match in _CONDITIONAL_TOKEN_RE.finditer(template):
+        parts_stack[-1].append(template[pos : match.start()])
+
+        if match.group(1):
+            field = match.group(1)
+            parent_active = active_stack[-1]
+            value_present = _template_value_present(variables.get(field))
+            block_active = parent_active and value_present
+            parts_stack.append([])
+            active_stack.append(block_active)
+        else:
+            if len(parts_stack) == 1:
+                raise ValueError("Unbalanced conditional template markers: unexpected [[endif]].")
+            block_content = "".join(parts_stack.pop())
+            block_active = active_stack.pop()
+            if block_active:
+                parts_stack[-1].append(block_content)
+
+        pos = match.end()
+
+    parts_stack[-1].append(template[pos:])
+    if len(parts_stack) != 1:
+        raise ValueError("Unbalanced conditional template markers: missing [[endif]].")
+    return "".join(parts_stack[0])
 
 
 def render_template(template: str, variables: dict[str, Any]) -> str:
@@ -20,13 +76,28 @@ def render_template(template: str, variables: dict[str, Any]) -> str:
     Render a template string with variables.
 
     Args:
-        template: Template string with {variable} placeholders
+        template: Template string with {variable} placeholders.
+            Supports optional conditional blocks:
+            [[if variable_name]] ... [[endif]]
         variables: Dictionary of variable values
 
     Returns:
         Rendered template string
     """
-    return template.format(**variables)
+    protected = (
+        template.replace("{{", _ESCAPED_OPEN_BRACE).replace("}}", _ESCAPED_CLOSE_BRACE)
+    )
+    conditioned = _render_conditionals(protected, variables)
+    required_fields = set(_SIMPLE_TEMPLATE_FIELD_RE.findall(conditioned))
+    missing = sorted(field for field in required_fields if field not in variables)
+    if missing:
+        raise KeyError(f"Missing template variable(s): {', '.join(missing)}")
+
+    rendered = _SIMPLE_TEMPLATE_FIELD_RE.sub(
+        lambda match: str(variables[match.group(1)]),
+        conditioned,
+    )
+    return rendered.replace(_ESCAPED_OPEN_BRACE, "{").replace(_ESCAPED_CLOSE_BRACE, "}")
 
 
 # ============================================================================
@@ -300,6 +371,12 @@ def generate_single_hop_batch(
                         )
                     ],
                     qa_type="single_hop",
+                    min_hop_count=1,
+                    is_co_located=None,
+                    filter_status=None,
+                    filter_reasoning=None,
+                    no_context_answer=None,
+                    eval_scores=dict()
                 )
             )
 
@@ -326,13 +403,16 @@ def generate_multi_hop_batch(
     timeout: float = 120.0,
     show_progress: bool = True,
     max_questions: int | None = None,
+    linker: ChunkLinker | None = None,
 ) -> list[QADataPoint]:
     """Generate multi-hop QA pairs in batch using parallel LLM calls.
 
     Multi-hop generation is a two-step process:
-    1. Generate related queries for sampled chunks (parallelized)
-    2. For each chunk with high-confidence queries, search for related chunks
-       and validate connections to generate QA pairs (parallelized)
+    1. Find related chunks for sampled chunks (via linker or inline LLM+BM25)
+    2. For each chunk pair, validate connections and generate QA pairs
+
+    When a ``linker`` is provided, step 1 delegates to ``linker.link()``
+    instead of the inline LLM query generation + BM25 search.
 
     Args:
         source: ChunkSource backend to sample chunks from and search related chunks
@@ -354,7 +434,9 @@ def generate_multi_hop_batch(
         max_tokens: Maximum tokens per response (default 1000)
         timeout: Request timeout in seconds (default 120.0)
         show_progress: Whether to show progress bar (default True)
-        max_questions: Maximum number of questions to keep per chunk pair (default None for no limit)
+        max_questions: Maximum number of questions to keep per chunk pair
+        linker: Optional ChunkLinker to use for finding related chunks.
+            When provided, skips the inline LLM query generation step.
 
     Returns:
         List of QADataPoints with generated multi-hop QA pairs
@@ -364,30 +446,39 @@ def generate_multi_hop_batch(
     # 1. Sample chunks
     sampled_chunks = source.sample_chunks(num_samples, min_chars=min_chunk_chars)
 
-    if show_progress:
-        print(f"Step 1: Generating related queries for {len(sampled_chunks)} chunks...")
+    # 2. Find related chunks — via linker or inline LLM+BM25
+    chunk_pairs: list[tuple[Any, Any, list[str]]] = []
 
-    # 2. Build prompts for related query generation
-    related_prompts = []
-    for chunk in sampled_chunks:
-        ctx = source.get_chunk_with_context(chunk, max_chars=context_preview_chars)
-        prompt = render_template(related_query_user_template, ctx)
-        related_prompts.append(prompt)
+    if linker is not None:
+        if show_progress:
+            print(f"Step 1: Linking related chunks for {len(sampled_chunks)} chunks...")
 
-    # 3. Batch process related query generation
-    related_result = batch_process_sync(
-        client=client,
-        model=model,
-        prompts=related_prompts,
-        system_prompt=related_query_system_prompt,
-        max_tokens=max_tokens,
-        timeout=timeout,
-        max_concurrent=max_concurrent,
-        show_progress=show_progress,
-    )
+        corpus_pool = source.sample_chunks(min(200, num_samples * 10), min_chars=min_chunk_chars)
+        for chunk_a in sampled_chunks:
+            bundle = linker.link(chunk_a, corpus_pool=corpus_pool)
+            for chunk_b in bundle.secondary_chunks:
+                chunk_pairs.append((chunk_a, chunk_b, bundle.connecting_queries))
+    else:
+        if show_progress:
+            print(f"Step 1: Generating related queries for {len(sampled_chunks)} chunks...")
 
-    # 4. Parse responses and search for related chunks
-    chunk_pairs = []  # List of (chunk_a, chunk_b, connecting_queries)
+        related_prompts = []
+        for chunk in sampled_chunks:
+            ctx = source.get_chunk_with_context(chunk, max_chars=context_preview_chars)
+            prompt = render_template(related_query_user_template, ctx)
+            related_prompts.append(prompt)
+            
+        # 3. Batch process related query generation
+        related_result = batch_process_sync(
+            client=client,
+            model=model,
+            prompts=related_prompts,
+            system_prompt=related_query_system_prompt,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_concurrent=max_concurrent,
+            show_progress=show_progress,
+        )
 
     for i, response in enumerate(related_result.responses):
         if response is None:
@@ -396,15 +487,19 @@ def generate_multi_hop_batch(
         chunk_a = sampled_chunks[i]
         confidence, queries = related_query_parser(response.answer)
 
-        if confidence.lower() == "low" or not queries:
-            continue
+        for i, response in enumerate(related_result.responses):
+            chunk_a = sampled_chunks[i]
+            confidence, queries = related_query_parser(response.answer)
 
-        search_results = source.search_related(chunk_a, queries, top_k=top_k_bm25)
+            if confidence.lower() == "low" or not queries:
+                continue
 
-        for result in search_results[:top_related_chunks]:
-            chunk_b = result["chunk"]
-            connecting_queries = result["queries"]
-            chunk_pairs.append((chunk_a, chunk_b, connecting_queries))
+            search_results = source.search_related(chunk_a, queries, top_k=top_k_bm25)
+
+            for result in search_results[:top_related_chunks]:
+                chunk_b = result["chunk"]
+                connecting_queries = result["queries"]
+                chunk_pairs.append((chunk_a, chunk_b, connecting_queries))
 
     if not chunk_pairs:
         if show_progress:
@@ -479,6 +574,12 @@ def generate_multi_hop_batch(
                         ),
                     ],
                     qa_type="multi_hop",
+                    min_hop_count=2,
+                    is_co_located=None,
+                    filter_status=None,
+                    filter_reasoning=None,
+                    no_context_answer=None,
+                    eval_scores=dict()
                 )
             )
 
