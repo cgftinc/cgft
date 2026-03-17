@@ -112,6 +112,10 @@ Rules:
 - For multi-hop answers, all intermediate facts must be present in the evidence.
 - Do not use external knowledge.
 - Identify which specific chunk IDs provide the supporting evidence.
+- CRITICAL: Reject meta-questions about the QA generation process itself. If the question asks \
+about "chunks", "multi-hop questions", "generation", "retrieval", or why a question "cannot be \
+created/generated", return answerable=false. These are invalid QA pairs that describe generation \
+failures rather than real domain questions about the corpus content.
 
 Respond with JSON only:
 {"answerable": <bool>, "confidence": <float 0-1>, "reasoning": "<brief explanation>", "supporting_chunk_ids": ["<id1>", "<id2>", ...]}"""
@@ -419,6 +423,7 @@ class RetrievalLLMFilterConfig:
     stats_key: str = "retrieval_too_easy_filter_stats"
     max_concurrent: int = 8
     batch_enabled: bool = True
+    show_batch_progress: bool = True
 
 
 @dataclass
@@ -435,6 +440,7 @@ class GroundingLLMFilterConfig:
     stats_key: str = "grounding_filter_stats"
     max_concurrent: int = 8
     batch_enabled: bool = True
+    show_batch_progress: bool = True
 
 
 @dataclass
@@ -519,6 +525,7 @@ class CgftPipelineConfig:
     split: SplitConfig = field(default_factory=SplitConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     random_seed: int = 42
+    verbose: bool = True
 
     def resolve_api_keys(self) -> None:
         """Fill unset component API keys/base URLs with shared platform LLM settings."""

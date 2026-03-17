@@ -11,7 +11,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, OpenAI, RateLimitError
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    BadRequestError,
+    OpenAI,
+    RateLimitError,
+)
+from tqdm.auto import tqdm as _tqdm
 
 from synthetic_data_prep.corpus.corpora.source import CorporaChunkSource
 from synthetic_data_prep.qa_generation.cgft_models import (
@@ -33,9 +41,9 @@ from synthetic_data_prep.qa_generation.generated_qa import FilterVerdict, Genera
 from synthetic_data_prep.qa_generation.generators import DirectLLMGenerator, EnvRolloutGenerator
 from synthetic_data_prep.qa_generation.helpers import render_template
 from synthetic_data_prep.qa_generation.linkers import (
-    LLMGuidedChunkLinker,
     RELATED_CHUNK_SYSTEM_PROMPT,
     RELATED_CHUNK_USER_TEMPLATE,
+    LLMGuidedChunkLinker,
     StructuralChunkLinker,
 )
 from synthetic_data_prep.qa_generation.protocols import (
@@ -830,6 +838,11 @@ def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftCon
     }
 
 
+def _print_progress(message: str, *, verbose: bool) -> None:
+    if verbose:
+        _tqdm.write(message)
+
+
 class CgftPipeline:
     """Orchestrates Cgft generation, filtering, refinement, and formatting."""
 
@@ -852,11 +865,15 @@ class CgftPipeline:
         rng = random.Random(cfg.random_seed)
         context = CgftContext(config=cfg, source=source, rng=rng)
 
+        _print_progress("[1/8] Loading chunks from corpus...", verbose=cfg.verbose)
         seed_chunks = source.sample_chunks(cfg.targets.total_samples, min_chars=cfg.corpus.min_chunk_chars)
         if not seed_chunks and getattr(source, "collection", None) is not None:
             seed_chunks = list(source.collection)[: cfg.targets.total_samples]
         if not seed_chunks:
             raise RuntimeError("No eligible chunks were found for CgftPipeline generation.")
+        _print_progress(
+            f"[1/8] Loaded {len(seed_chunks)} seed chunks from corpus", verbose=cfg.verbose
+        )
 
         pool_size = max(cfg.linker.structural.corpus_pool_size, len(seed_chunks))
         corpus_pool = source.sample_chunks(pool_size, min_chars=cfg.corpus.min_chunk_chars)
@@ -866,9 +883,12 @@ class CgftPipeline:
         context["seed_chunk_lookup"] = {chunk.hash: chunk for chunk in seed_chunks}
         context["corpus_pool"] = corpus_pool
         context["seed_chunks"] = seed_chunks
+        _print_progress("[2/8] Building corpus profile...", verbose=cfg.verbose)
         _build_corpus_profile(cfg, source, context)
+        _print_progress("[2/8] Built corpus profile", verbose=cfg.verbose)
 
         if cfg.corpus_context.generate_entity_patterns:
+            _print_progress("[3/8] Generating entity patterns...", verbose=cfg.verbose)
             extraction = _generate_entity_extraction_patterns(cfg, source, context)
             if extraction is not None:
                 cfg.corpus_context.entity_extraction = extraction
@@ -880,12 +900,22 @@ class CgftPipeline:
                     len(extraction.domain_terms),
                     extraction.confidence,
                 )
+                n_entities = len(extraction.entity_names)
+                n_patterns = len(extraction.code_patterns) + len(extraction.domain_terms)
+                _print_progress(
+                    f"[3/8] Generated entity patterns: {n_entities} entities,"
+                    f" {n_patterns} patterns",
+                    verbose=cfg.verbose,
+                )
+        else:
+            _print_progress("[3/8] Skipped entity pattern generation", verbose=cfg.verbose)
 
         tasks = build_generation_tasks(
             cfg,
             seed_chunk_ids=[chunk.hash for chunk in seed_chunks],
         )
         context["tasks"] = tasks
+        _print_progress(f"[4/8] Created {len(tasks)} generation tasks", verbose=cfg.verbose)
 
         linker = _build_linker(cfg, source)
         generator = _build_generator(
@@ -902,24 +932,61 @@ class CgftPipeline:
         transformer = _build_transformer(cfg)
         formatter = TrainEvalFormatter(output_cfg=cfg.output, split_cfg=cfg.split)
 
+        _print_progress(f"[5/8] Generating {len(tasks)} QA candidates...", verbose=cfg.verbose)
         raw_items = generator.generate(tasks, context)
         context["raw_candidates"] = [item.qa for item in raw_items]
         context["raw_count"] = len(raw_items)
+        _failed_to_parse = len(tasks) - len(raw_items)
+        _parse_note = f" ({_failed_to_parse} failed to parse)" if _failed_to_parse else ""
+        _print_progress(
+            f"[5/8] Generated {len(raw_items)} QA candidates{_parse_note}", verbose=cfg.verbose
+        )
 
         final_passed: list[GeneratedQA] = []
         final_rejected: list[GeneratedQA] = []
         active_items = list(raw_items)
         total_regens = 0
 
+        _print_progress(
+            f"[6/8] Starting filtering (max {cfg.refinement.max_rounds} rounds)...",
+            verbose=cfg.verbose,
+        )
         for round_idx in range(cfg.refinement.max_rounds + 1):
             if not active_items:
                 break
             for item in active_items:
                 item.filter_verdict = None
 
+            _print_progress(
+                f"  Round {round_idx + 1}/{cfg.refinement.max_rounds + 1}:"
+                f" {len(active_items)} items to evaluate",
+                verbose=cfg.verbose,
+            )
+
             active_items = guard_filter.evaluate(active_items, context)
-            for stage_filter in filter_chain:
+            _passed = sum(1 for i in active_items if i.is_passed)
+            _refine = sum(1 for i in active_items if i.needs_refinement)
+            _rejected = sum(1 for i in active_items if i.is_rejected)
+            _print_progress(
+                f"    deterministic_guards: {_passed} passed, {_refine} need refinement,"
+                f" {_rejected} rejected",
+                verbose=cfg.verbose,
+            )
+
+            for stage_name, stage_filter in zip(filter_stage_names, filter_chain):
+                _n_to_eval = sum(1 for i in active_items if not i.is_passed and not i.is_rejected)
+                _print_progress(
+                    f"    {stage_name}: evaluating {_n_to_eval} items...", verbose=cfg.verbose
+                )
                 active_items = stage_filter.evaluate(active_items, context)
+                _passed = sum(1 for i in active_items if i.is_passed)
+                _refine = sum(1 for i in active_items if i.needs_refinement)
+                _rejected = sum(1 for i in active_items if i.is_rejected)
+                _print_progress(
+                    f"    {stage_name}: {_passed} passed, {_refine} need refinement,"
+                    f" {_rejected} rejected",
+                    verbose=cfg.verbose,
+                )
 
             passed = [item for item in active_items if item.is_passed]
             needs_refinement = [item for item in active_items if item.needs_refinement]
@@ -965,6 +1032,9 @@ class CgftPipeline:
                     )
                 )
 
+            _print_progress(
+                f"    Regenerating {len(to_refine)} items...", verbose=cfg.verbose
+            )
             refined_items, regen_failures = _regenerate_with_generator(
                 to_refine,
                 generator=generator,
@@ -979,6 +1049,10 @@ class CgftPipeline:
                     )
                 )
             total_regens += len(to_refine)
+            _regen_fail_note = f" ({len(regen_failures)} failed)" if regen_failures else ""
+            _print_progress(
+                f"    Regenerated {len(to_refine)} items{_regen_fail_note}", verbose=cfg.verbose
+            )
             next_active: list[GeneratedQA] = []
             for item in refined_items:
                 if item.filter_verdict is None:
@@ -1002,11 +1076,24 @@ class CgftPipeline:
             )
 
         final_passed = transformer.transform(final_passed, context)
+        _print_progress(
+            f"[7/8] Transformed {len(final_passed)} passed items", verbose=cfg.verbose
+        )
         context["rejected_items"] = [_serialize_qa_with_filter_details(item) for item in final_rejected]
         context["passed_items"] = [item.qa for item in final_passed]
         context["total_regenerations"] = total_regens
 
         result = formatter.format(final_passed, context)
+        _train = result.get("stats", {}).get("train", 0)
+        _eval = result.get("stats", {}).get("eval", 0)
+        _print_progress(
+            f"[8/8] Formatted output: {_train} train, {_eval} eval", verbose=cfg.verbose
+        )
+        _print_progress(
+            f"\nPipeline complete: {len(final_passed)} passed, {len(final_rejected)} rejected"
+            f" ({total_regens} regenerations)",
+            verbose=cfg.verbose,
+        )
         result["raw_candidates"] = [item.qa for item in raw_items]
         result["filtered_dataset"] = [item.qa for item in final_passed]
         result["rejected_dataset"] = [_serialize_qa_with_filter_details(item) for item in final_rejected]

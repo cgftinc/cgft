@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from openai import OpenAI
+from tqdm.auto import tqdm
 
 from synthetic_data_prep.qa_generation.anchor_selector import AnchorBundle
 from synthetic_data_prep.qa_generation.batch_processor import BatchResult, batch_process_sync
@@ -61,7 +62,11 @@ _DEFAULT_TEMPLATE = (
     "[[if previous_failure_type]]- If previous_failure_type=too_easy, keep answer facts stable and make the question harder.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer using current chunk evidence only.\n[[endif]]"
     "- Output exactly one question and one answer.\n"
-    "- In chunks_used, list the indices of chunks you referenced (0=primary, 1+=secondary).\n\n"
+    "- In chunks_used, list the indices of chunks you referenced (0=primary, 1+=secondary).\n"
+    "- CRITICAL: If the provided chunks genuinely cannot support a valid {qa_type} question "
+    "(e.g., they are completely unrelated or lack sufficient connectable information), "
+    "return `{{\"status\": \"cannot_generate\", \"reason\": \"<brief explanation>\"}}` instead. "
+    "Do NOT output a meta-question about the generation process itself.\n\n"
     'First output your reasoning in <think>...</think>, then provide:\n'
     '```json\n{{\"question\": \"...\", \"answer\": \"...\", \"answering_steps\": \"...\", \"chunks_used\": [0, 1, ...]}}\n```'
 )
@@ -117,6 +122,16 @@ def _parse_qa_response(raw_text: str) -> tuple[str, str, list[int] | None]:
             payload = json.loads(candidate)
         except Exception:
             continue
+
+        # Check for explicit generation failure signal
+        status = str(payload.get("status", "")).strip().lower()
+        if status == "cannot_generate":
+            reason = str(payload.get("reason", "")).strip()
+            logger.info(
+                "Generator signaled cannot_generate: %s", reason[:200] if reason else "no reason"
+            )
+            return "", "", None
+
         question = str(payload.get("question", "")).strip()
         answer = str(payload.get("answer", "")).strip()
         if question and answer:
@@ -261,7 +276,8 @@ class DirectLLMGenerator:
         corpus_description = str(context.get("corpus_description", "") or "").strip()
 
         prepared: list[_PreparedTask] = []
-        for task in tasks:
+        show_prep_progress = self.cfg.show_batch_progress and len(tasks) > 1
+        for task in tqdm(tasks, desc="Linking chunks", disable=not show_prep_progress):
             seed_chunk = seed_lookup.get(task.seed_chunk_id)
             if seed_chunk is None and corpus_pool:
                 seed_chunk = context.rng.choice(corpus_pool)

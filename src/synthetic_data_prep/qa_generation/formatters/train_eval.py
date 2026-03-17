@@ -54,31 +54,11 @@ class TrainEvalFormatter:
         }
 
     def _to_row(self, item: GeneratedQA) -> dict[str, Any]:
-        eval_scores = dict(item.qa.get("eval_scores", {}) or {})
-        transform_meta = dict(item.generation_metadata.get("transformation", {}) or {})
-        style_target = str(transform_meta.get("target_style", "")).strip() or str(
-            item.qa.get("style_target", "")
-        ).strip()
-        style_observed = str(eval_scores.get("query_style_observed", "")).strip()
-        if not style_observed:
-            style_observed = classify_query_style(str(item.qa.get("question", "")))
         return {
-            "task_id": item.generation_metadata.get("task_id", ""),
             "question": item.qa.get("question", ""),
             "answer": item.qa.get("answer", ""),
             "qa_type": item.qa.get("qa_type", item.generation_metadata.get("qa_type_target", "unknown")),
-            "style_target": style_target,
-            "style_observed": style_observed,
-            "min_hop_count": item.qa.get("min_hop_count"),
             "reference_chunks": item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []),
-            "generation_metadata": {
-                "qa_type_target": item.generation_metadata.get("qa_type_target"),
-                "target_hop_count": item.generation_metadata.get("target_hop_count"),
-                "generation_mode": item.generation_metadata.get("generation_mode"),
-                "refinement_count": item.generation_metadata.get("refinement_count", 0),
-                "task_id": item.generation_metadata.get("task_id"),
-                "transformation": transform_meta,
-            },
         }
 
     def _stratified_split(self, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

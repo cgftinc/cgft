@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -21,6 +23,8 @@ from .models import Corpus, CorpusChunk, SearchResult, UploadResult
 if TYPE_CHECKING:
     from synthetic_data_prep.chunkers.models import Chunk, ChunkCollection
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class CorpusClient:
@@ -36,6 +40,8 @@ class CorpusClient:
     api_key: str
     base_url: str = "http://localhost:3000"
     timeout: float = 30.0
+    max_retries: int = 3
+    retry_backoff_seconds: float = 0.5
     _http_client: httpx.Client = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -47,14 +53,53 @@ class CorpusClient:
             )
 
         self.api_key = normalized_api_key
+        timeout_config = httpx.Timeout(
+            timeout=self.timeout,
+            connect=self.timeout,
+            read=self.timeout,
+            write=self.timeout,
+            pool=self.timeout,
+        )
         self._http_client = httpx.Client(
             base_url=self.base_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=self.timeout,
+            timeout=timeout_config,
         )
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Execute an HTTP request with retry/backoff for transient network failures."""
+        retries = max(1, int(self.max_retries))
+        attempt = 1
+        while True:
+            try:
+                return self._http_client.request(method, path, **kwargs)
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                if attempt >= retries:
+                    raise CorpusAPIError(
+                        (
+                            "Corpora API request failed after retries due to a network timeout/error. "
+                            f"method={method} path={path} base_url={self.base_url} "
+                            f"attempts={retries} last_error={exc!s}"
+                        ),
+                        status_code=503,
+                    ) from exc
+                delay = self.retry_backoff_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "Corpora API request attempt %s/%s failed (%s). Retrying in %.2fs. "
+                    "method=%s path=%s base_url=%s",
+                    attempt,
+                    retries,
+                    type(exc).__name__,
+                    delay,
+                    method,
+                    path,
+                    self.base_url,
+                )
+                time.sleep(delay)
+                attempt += 1
 
     def __enter__(self) -> "CorpusClient":
         return self
@@ -107,7 +152,7 @@ class CorpusClient:
             CorpusLimitError: If max 5 corpora limit reached
             AuthenticationError: If API key is invalid
         """
-        response = self._http_client.post("/api/corpora", json={"name": name})
+        response = self._request("POST", "/api/corpora", json={"name": name})
         self._handle_response_errors(response)
         return Corpus.from_api_response(response.json())
 
@@ -117,7 +162,7 @@ class CorpusClient:
         Returns:
             List of Corpus objects
         """
-        response = self._http_client.get("/api/corpora")
+        response = self._request("GET", "/api/corpora")
         self._handle_response_errors(response)
         return [Corpus.from_api_response(c) for c in response.json()]
 
@@ -147,7 +192,7 @@ class CorpusClient:
         Returns:
             True if deletion was successful
         """
-        response = self._http_client.delete(f"/api/corpora/{corpus_id}")
+        response = self._request("DELETE", f"/api/corpora/{corpus_id}")
         self._handle_response_errors(response)
         return response.json().get("success", False)
 
@@ -283,7 +328,7 @@ class CorpusClient:
                 ]
             }
 
-            response = self._http_client.post(f"/api/corpora/{corpus_id}/chunks", json=payload)
+            response = self._request("POST", f"/api/corpora/{corpus_id}/chunks", json=payload)
             self._handle_response_errors(response)
 
             data = response.json()
@@ -336,7 +381,8 @@ class CorpusClient:
         Returns:
             SearchResult with chunk rows and total count
         """
-        response = self._http_client.get(
+        response = self._request(
+            "GET",
             f"/api/corpora/{corpus_id}/chunks",
             params={"limit": limit, "offset": offset},
         )
@@ -395,7 +441,7 @@ class CorpusClient:
         if filters:
             payload["filters"] = filters
 
-        response = self._http_client.post(f"/api/corpora/{corpus_id}/search", json=payload)
+        response = self._request("POST", f"/api/corpora/{corpus_id}/search", json=payload)
         self._handle_response_errors(response)
 
         data = response.json()

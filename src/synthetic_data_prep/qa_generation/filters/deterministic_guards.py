@@ -2,10 +2,45 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from synthetic_data_prep.qa_generation.cgft_models import CgftContext, DeterministicGuardsConfig
 from synthetic_data_prep.qa_generation.generated_qa import FilterVerdict, GeneratedQA
+
+# Patterns indicating a meta-question about generation failure rather than a real domain question
+_META_QUESTION_PATTERNS = [
+    re.compile(
+        r"\b(can'?t|cannot|unable to|not possible to)\s+(create|generate|form|construct)", re.I
+    ),
+    re.compile(r"\bno valid\s+(multi[- ]?hop\s+)?question", re.I),
+    re.compile(r"\b(why\s+)?(can'?t|cannot)\s+I\s+(create|generate|form)", re.I),
+    re.compile(r"\bchunks?\s+(do not|don'?t|lack|cannot)\s+(support|provide|contain)", re.I),
+    re.compile(r"\binsufficient\s+(interconnected\s+)?(evidence|information|data|chunks)", re.I),
+    re.compile(r"\black(s|ing)?\s+(realistic\s+)?(connection|link|evidence)", re.I),
+    re.compile(r"\bnot possible (to generate|with (the\s+)?provided)", re.I),
+]
+
+_META_ANSWER_PATTERNS = [
+    re.compile(r"^no valid (answer|question|response)", re.I),
+    re.compile(r"^(chunks?|evidence)\s+(do not|don'?t)\s+support", re.I),
+    re.compile(r"^insufficient\b", re.I),
+    re.compile(r"^cannot (be )?(determined|answered|generated)", re.I),
+    re.compile(r"^not possible\b", re.I),
+    re.compile(r"\bmulti[- ]?hop chaining\b", re.I),
+    re.compile(r"^(no|lacking)\s+(valid\s+)?(evidence|connection|link)", re.I),
+]
+
+
+def _is_meta_question(question: str, answer: str) -> bool:
+    """Check if the QA is a meta-statement about generation failure."""
+    for pattern in _META_QUESTION_PATTERNS:
+        if pattern.search(question):
+            return True
+    for pattern in _META_ANSWER_PATTERNS:
+        if pattern.search(answer):
+            return True
+    return False
 
 
 class DeterministicGuardsFilter:
@@ -80,4 +115,6 @@ class DeterministicGuardsFilter:
             return "answer_too_short"
         if len(reference_chunks) < self.cfg.min_reference_chunks:
             return "insufficient_reference_chunks"
+        if _is_meta_question(question, answer):
+            return "meta_question_about_generation"
         return None

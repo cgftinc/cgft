@@ -121,7 +121,12 @@ class RetrievalLLMFilter:
                 except Exception:
                     logger.exception("RetrievalLLMFilter failed for one item")
                     query = resolve_retrieval_query(item.qa, rewrite_cfg=rewrite_cfg)
-                    verdict = self._error_verdict(query)
+                    refinements = int(item.generation_metadata.get("refinement_count", 0))
+                    verdict = self._error_verdict(
+                        query,
+                        refinements=refinements,
+                        max_refinements=max_refinements,
+                    )
                     stats["errors"] = int(stats.get("errors", 0)) + 1
                 item.filter_verdict = verdict
                 self._update_stats(stats, verdict)
@@ -168,11 +173,26 @@ class RetrievalLLMFilter:
                 self._update_stats(stats, item.filter_verdict)
                 continue
 
-            search_results = self.chunk_source.search_related(
-                source=_DUMMY_CHUNK,
-                queries=[query],
-                top_k=self.cfg.top_k,
-            )
+            try:
+                search_results = self.chunk_source.search_related(
+                    source=_DUMMY_CHUNK,
+                    queries=[query],
+                    top_k=self.cfg.top_k,
+                )
+            except Exception:
+                logger.warning(
+                    "RetrievalLLMFilter search failed for one item; routing to refinement/rejection.",
+                    exc_info=True,
+                )
+                refinements = int(item.generation_metadata.get("refinement_count", 0))
+                item.filter_verdict = self._error_verdict(
+                    query,
+                    refinements=refinements,
+                    max_refinements=max_refinements,
+                )
+                stats["errors"] = int(stats.get("errors", 0)) + 1
+                self._update_stats(stats, item.filter_verdict)
+                continue
             retrieved_chunks: list[Chunk] = [row["chunk"] for row in search_results if "chunk" in row]
             ref_chunks = list(item.qa.get("reference_chunks", []) or [])
             overlap_ratio, matched_reference_ids = self._compute_overlap(ref_chunks, retrieved_chunks)
@@ -217,7 +237,7 @@ class RetrievalLLMFilter:
                 max_tokens=500,
                 timeout=60.0,
                 max_concurrent=self.cfg.max_concurrent,
-                show_progress=False,
+                show_progress=self.cfg.show_batch_progress,
                 temperature=0.0,
             )
             for j, i in enumerate(needs_judge_indices):
@@ -292,7 +312,12 @@ class RetrievalLLMFilter:
                     )
             except Exception:
                 logger.exception("RetrievalLLMFilter failed for one item")
-                verdict = self._error_verdict(data.query)
+                refinements = int(data.item.generation_metadata.get("refinement_count", 0))
+                verdict = self._error_verdict(
+                    data.query,
+                    refinements=refinements,
+                    max_refinements=max_refinements,
+                )
                 stats["errors"] = int(stats.get("errors", 0)) + 1
             data.item.filter_verdict = verdict
             self._update_stats(stats, verdict)
@@ -553,23 +578,39 @@ class RetrievalLLMFilter:
         )
 
     @staticmethod
-    def _error_verdict(query: str) -> FilterVerdict:
+    def _error_verdict(
+        query: str,
+        *,
+        refinements: int,
+        max_refinements: int,
+    ) -> FilterVerdict:
+        metadata = {
+            "filter_mode": _FILTER_MODE,
+            "reason_code": "filter_error",
+            "confidence": 0.0,
+            "retrieval_query": query,
+            "ref_overlap_ratio": 0.0,
+            "failure_type": _FAILURE_TYPE_NONE,
+            "force_reanchor": False,
+            "feedback_type": "retry_feedback",
+            "refinement_hint": "Retry due to transient retrieval/filter failure.",
+            "judge_called": False,
+        }
+        if refinements < max_refinements:
+            return FilterVerdict(
+                status="needs_refinement",
+                reason="retrieval_filter_needs_refinement",
+                reasoning="Retrieval/filter error; retrying via refinement.",
+                metadata=metadata,
+            )
         return FilterVerdict(
-            status="passed",
-            reason="retrieval_filter_error",
-            reasoning="Filter error; passed by default.",
-            metadata={
-                "filter_mode": _FILTER_MODE,
-                "reason_code": "filter_error",
-                "confidence": 0.0,
-                "retrieval_query": query,
-                "ref_overlap_ratio": 0.0,
-                "failure_type": _FAILURE_TYPE_NONE,
-                "force_reanchor": False,
-                "feedback_type": None,
-                "refinement_hint": None,
-                "judge_called": False,
-            },
+            status="rejected",
+            reason="retrieval_filter_rejected",
+            reasoning=(
+                "Refinement budget exhausted after retrieval/filter errors "
+                f"({refinements}/{max_refinements})."
+            ),
+            metadata=metadata,
         )
 
     @staticmethod
