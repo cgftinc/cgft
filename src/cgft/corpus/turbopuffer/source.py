@@ -18,7 +18,9 @@ from cgft.corpus.search_schema.search_exceptions import (
 )
 from cgft.corpus.search_schema.search_types import (
     FilterPredicate,
+    HybridOptions,
     SearchCapabilities,
+    SearchMode,
     SearchSpec,
     validate_search_spec_shape,
 )
@@ -63,19 +65,28 @@ class TpufChunkSource:
         namespace: str,
         region: str = "aws-us-east-1",
         content_attr: list[str] | None = None,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
     ) -> None:
         import turbopuffer
 
         self._ns = turbopuffer.Turbopuffer(api_key=api_key, region=region).namespace(namespace)
         self._fields: list[str] = content_attr if content_attr is not None else ["content"]
+        self._embed_fn = embed_fn
+
+        modes: set[SearchMode] = {"lexical"}
+        ranking: set[str] = {"bm25"}
+        if embed_fn is not None:
+            modes |= {"vector", "hybrid"}
+            ranking.add("cosine")
+
         self._search_capabilities: SearchCapabilities = {
             "backend": "turbopuffer",
-            "modes": {"lexical"},
+            "modes": modes,
             "filter_ops": {
                 "field": {"eq", "in", "gte", "lte"},
                 "logical": {"and", "or", "not"},
             },
-            "ranking": {"bm25"},
+            "ranking": ranking,
             "constraints": {"max_top_k": 10000, "vector_dimensions": None},
             "graph_expansion": False,
         }
@@ -84,7 +95,7 @@ class TpufChunkSource:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_rank_by(self, query: str) -> Any:
+    def _build_bm25_rank_by(self, query: str) -> Any:
         """Build the rank_by argument for a BM25 Turbopuffer query."""
         if len(self._fields) == 1:
             return (self._fields[0], "BM25", query)
@@ -92,6 +103,22 @@ class TpufChunkSource:
             "Sum",
             tuple(("Product", 1, (f, "BM25", query)) for f in self._fields),
         )
+
+    def _build_vector_rank_by(self, vector: list[float]) -> Any:
+        """Build the rank_by argument for a vector ANN Turbopuffer query."""
+        return ("vector", "ANN", vector)
+
+    def _build_hybrid_rank_by(
+        self, query: str, vector: list[float], hybrid_opts: HybridOptions | None
+    ) -> Any:
+        """Build the rank_by argument for a hybrid BM25+vector Turbopuffer query."""
+        opts = hybrid_opts or {}
+        lexical_weight = opts.get("lexical_weight", 1.0)
+        vector_weight = opts.get("vector_weight", 1.0)
+        return [
+            {"type": "bm25", "text": query, "fields": self._fields, "weight": lexical_weight},
+            {"type": "vector", "vector": vector, "field": "vector", "weight": vector_weight},
+        ]
 
     def _row_content(self, row: Any) -> str:
         """Return the text content for a row, drawn from self._fields."""
@@ -330,9 +357,18 @@ class TpufChunkSource:
         source_tpuf_id = source.get_metadata("_tpuf_id")
         related_map: dict[int, dict] = {}
 
-        for query in queries:
+        # Batch-embed all queries in one call when embed_fn is available
+        vectors: list[list[float]] | None = None
+        if self._embed_fn is not None:
+            vectors = self._embed_fn(queries)
+
+        for i, query in enumerate(queries):
+            if vectors is not None:
+                rank_by = self._build_hybrid_rank_by(query, vectors[i], None)
+            else:
+                rank_by = self._build_bm25_rank_by(query)
             result = self._ns.query(
-                rank_by=self._build_rank_by(query),
+                rank_by=rank_by,
                 top_k=top_k,
                 include_attributes=True,
             )
@@ -386,8 +422,19 @@ class TpufChunkSource:
                 spec=spec,
             )
 
+        text_query = str(spec.get("text_query") or "")
+        vector_query: list[float] | None = spec.get("vector_query")
+        hybrid_opts: HybridOptions | None = spec.get("hybrid")
+
+        if mode == "lexical":
+            rank_by = self._build_bm25_rank_by(text_query)
+        elif mode == "vector":
+            rank_by = self._build_vector_rank_by(vector_query)  # type: ignore[arg-type]
+        else:  # hybrid
+            rank_by = self._build_hybrid_rank_by(text_query, vector_query, hybrid_opts)  # type: ignore[arg-type]
+
         query_kwargs: dict[str, Any] = {
-            "rank_by": self._build_rank_by(str(spec.get("text_query") or "")),
+            "rank_by": rank_by,
             "top_k": int(spec.get("top_k", 10)),
             "include_attributes": True,
         }
@@ -397,6 +444,12 @@ class TpufChunkSource:
 
         result = self._ns.query(**query_kwargs)
         return [self._row_to_chunk(row) for row in result.rows]
+
+    def embed_query(self, text: str) -> list[float] | None:
+        """Return an embedding vector for text, or None if no embed_fn is configured."""
+        if self._embed_fn is None:
+            return None
+        return self._embed_fn([text])[0]
 
     def search_text(
         self,
