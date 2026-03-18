@@ -83,7 +83,6 @@ class EmailSearchEnv(CgftSearchEnv):
         w_recall: float = DEFAULT_W_RECALL,
         w_precision: float = DEFAULT_W_PRECISION,
         w_search_efficiency: float = DEFAULT_W_SEARCH_EFFICIENCY,
-        debug_reward: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -96,7 +95,6 @@ class EmailSearchEnv(CgftSearchEnv):
         self._w_recall = w_recall
         self._w_precision = w_precision
         self._w_search_efficiency = w_search_efficiency
-        self._debug_reward = bool(debug_reward)
 
         # Keep the same tool name/behavior, but update schema text for agent clarity.
         search_tool_definition = ToolDefinition(
@@ -133,16 +131,11 @@ class EmailSearchEnv(CgftSearchEnv):
                 return 0.5
             return 0.0
 
-        log_lines: list[str] = []
-
         try:
             search_calls = _count_search_calls(completion)
             search_efficiency_score = self._w_search_efficiency * _search_efficiency_raw(search_calls)
             completion_text = _extract_completion_text(completion)
             if not completion_text.strip():
-                if self._debug_reward:
-                    print(f"[EmailSearchEnv] empty completion, returning zeros")
-                # All gated rewards are 0 since correctness/precision/recall are 0
                 return {
                     "answer_correctness": 0.0,
                     "conciseness": 0.0,
@@ -175,47 +168,26 @@ class EmailSearchEnv(CgftSearchEnv):
                 f"[EmailSearchEnv] Question:\n{prompt}\n\n"
                 f"[EmailSearchEnv] Citations - predicted={sorted(cited_ids)}, ground_truth={sorted(ref_ids)}, overlap={sorted(overlap)}"
             )
-            if self._debug_reward:
-                log_lines.append(f"question={prompt}")
-                log_lines.append(f"ground_truth_answer={str(ground_truth or '')}")
-                log_lines.append(f"response_answer={answer_block}")
-                log_lines.append("citation comparison:")
-                log_lines.append(f"  predicted_citations={sorted(cited_ids)}")
-                log_lines.append(f"  ground_truth_citations={sorted(ref_ids)}")
-                log_lines.append(f"  overlap={sorted(overlap)}")
-                log_lines.append(f"  citation_recall_raw={citation_recall:.4f} citation_precision_raw={citation_precision:.4f}")
 
-            correctness_raw, conciseness_raw, judge_ok = await self._judge_answer_quality(
-                rollout_id=rollout_id,
+            correctness_raw, conciseness_raw, _ = await self._judge_answer_quality(
                 question=prompt,
                 ground_truth=gt_str,
                 response=answer_block,
-                log_lines=log_lines,
             )
-            if self._debug_reward:
-                log_lines.append(f"judge_ok={judge_ok}, correctness_raw={correctness_raw}, conciseness_raw={conciseness_raw}")
 
             # Gate rewards: conciseness requires correctness; search_efficiency requires all three
             correctness_ok = correctness_raw > 0
             precision_ok = citation_precision > 0
             recall_ok = citation_recall > 0
 
-            rewards = {
+            return {
                 "answer_correctness": self._w_correctness * correctness_raw,
                 "conciseness": self._w_conciseness * conciseness_raw if correctness_ok else 0.0,
                 "recall": self._w_recall * citation_recall,
                 "precision": self._w_precision * citation_precision,
                 "search_efficiency": search_efficiency_score if (correctness_ok and precision_ok and recall_ok) else 0.0,
             }
-            if self._debug_reward:
-                log_lines.append(f"final rewards={rewards}")
-                print("[EmailSearchEnv]\n" + "\n".join(log_lines))
-            return rewards
-        except Exception as exc:
-            if self._debug_reward:
-                log_lines.append(f"compute_reward failed: {exc}")
-                print("[EmailSearchEnv]\n" + "\n".join(log_lines))
-            # All gated rewards are 0 since correctness/precision/recall are 0
+        except Exception:
             return {
                 "answer_correctness": 0.0,
                 "conciseness": 0.0,
@@ -226,36 +198,17 @@ class EmailSearchEnv(CgftSearchEnv):
 
     async def _judge_answer_quality(
         self,
-        rollout_id: str,
         question: str,
         ground_truth: str,
         response: str,
-        log_lines: list[str] | None = None,
     ) -> tuple[float, float, bool]:
         if not response.strip():
             return (0.0, 0.0, False)
 
         if not self._judge_base_url or not self._judge_api_key:
-            if self._debug_reward and log_lines is not None:
-                log_lines.append("Judge disabled: missing judge_base_url or judge_api_key")
             return (0.0, 0.0, False)
 
-        # Log what we're sending to the judge
-        log_env(
-            rollout_id,
-            f"[EmailSearchEnv] Judge Input:\n"
-            f"  model: {self._judge_model}\n"
-            f"  base_url: {self._judge_base_url}\n"
-            f"  question: {question[:200]}{'...' if len(question) > 200 else ''}\n"
-            f"  ground_truth: {ground_truth[:200]}{'...' if len(ground_truth) > 200 else ''}\n"
-            f"  response: {response[:200]}{'...' if len(response) > 200 else ''}\n"
-            f"  correctness_rubric: {_ANSWER_RUBRIC_POSITIVE.description}\n"
-            f"  conciseness_rubric: {_ANSWER_RUBRIC_CONCISENESS.description}"
-        )
-
         try:
-            if self._debug_reward and log_lines is not None:
-                log_lines.append(f"Judge request starting (model={self._judge_model}, base_url={self._judge_base_url})")
             pos_task = evaluate_single_rubric(
                 rubric=_ANSWER_RUBRIC_POSITIVE,
                 question=question,
@@ -280,25 +233,8 @@ class EmailSearchEnv(CgftSearchEnv):
             pos_result, concise_result = await asyncio.gather(pos_task, concise_task)
             pos_raw = _clip01(pos_result.get("score", 0.0))
             concise_raw = _clip01(concise_result.get("score", 0.0))
-
-            # Log judge results
-            log_env(
-                rollout_id,
-                f"[EmailSearchEnv] Judge Results:\n"
-                f"  correctness_score: {pos_raw:.4f}\n"
-                f"  conciseness_score: {concise_raw:.4f}\n"
-                f"  correctness_raw: {pos_result}\n"
-                f"  conciseness_raw: {concise_result}"
-            )
-
-            if self._debug_reward and log_lines is not None:
-                log_lines.append(f"Judge completed: correctness={pos_raw:.4f}, conciseness={concise_raw:.4f}")
-                log_lines.append(f"Judge raw responses: pos={pos_result}, concise={concise_result}")
             return (pos_raw, concise_raw, True)
-        except Exception as exc:
-            log_env(rollout_id, f"[EmailSearchEnv] Judge request failed: {exc}")
-            if self._debug_reward and log_lines is not None:
-                log_lines.append(f"Judge request failed: {exc}")
+        except Exception:
             return (0.0, 0.0, False)
 
 def _clip01(value: Any) -> float:
