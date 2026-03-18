@@ -37,9 +37,7 @@ htmlcov/
 
 
 # Notebook artifacts
-notebooks/.ipynb_checkpoints/
-notebooks/samples/
-notebooks/outputs/
+notebooks/
 
 # Working Demo
 demo*/
