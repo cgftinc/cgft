@@ -36,8 +36,8 @@ htmlcov/
 *.jsonl
 
 
-# Notebook artifacts
-notebooks/
+# Notebook checkpoint artifacts
+.ipynb_checkpoints/
 
 # Working Demo
 demo*/
