@@ -298,6 +298,7 @@ class StructuralLinkerConfig:
     bm25_enrichment_top_k: int = 5
     max_related_refs: int = 3
     corpus_pool_size: int = 200
+    search_mode: str = "auto"  # "auto" | "lexical" | "hybrid" | "vector"
 
 
 @dataclass
@@ -312,6 +313,7 @@ class LLMGuidedLinkerConfig:
     top_k_bm25: int = 5
     top_related_chunks: int = 3
     context_preview_chars: int = 200
+    search_mode: str = "auto"  # "auto" | "lexical" | "hybrid" | "vector"
 
 
 @dataclass

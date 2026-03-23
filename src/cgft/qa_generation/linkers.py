@@ -118,6 +118,7 @@ class StructuralChunkLinker:
         bm25_enrichment_top_k: int = 5,
         max_related_refs: int = 3,
         entity_extraction: EntityExtractionConfig | None = None,
+        search_mode: str = "auto",
     ) -> None:
         self.source = source
         self.capabilities = capabilities
@@ -127,6 +128,7 @@ class StructuralChunkLinker:
         self.bm25_enrichment_top_k = bm25_enrichment_top_k
         self.max_related_refs = max_related_refs
         self.entity_extraction = entity_extraction
+        self.search_mode = _resolve_search_mode(source, search_mode)
         self._selector: AnchorSelector | None = None
 
     def _ensure_selector(self, corpus_pool: list[Any]) -> AnchorSelector:
@@ -165,6 +167,7 @@ class StructuralChunkLinker:
             max_related_refs=self.max_related_refs,
             qa_type=target_qa_type,
             prebuilt_queries=queries,
+            search_mode=self.search_mode,
         )
         if isinstance(bundle, tuple):
             bundle = bundle[0]
@@ -172,6 +175,23 @@ class StructuralChunkLinker:
             bundle.target_hop_count = int(target_hop_count)
         bundle.connecting_queries = queries
         return bundle
+
+
+def _resolve_search_mode(source: Any, mode: str) -> str | None:
+    """Resolve ``"auto"`` to the best mode the source supports.
+
+    Returns a concrete mode string (``"hybrid"``, ``"vector"``,
+    ``"lexical"``) or ``None`` (let source use its default).
+    """
+    if mode != "auto":
+        return mode if mode != "lexical" else None
+    caps: dict[str, Any] = getattr(source, "get_search_capabilities", lambda: {})()
+    supported = caps.get("modes", set())
+    if "hybrid" in supported:
+        return "hybrid"
+    if "vector" in supported:
+        return "vector"
+    return None  # lexical is the default, no need to pass explicitly
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +218,7 @@ class LLMGuidedChunkLinker:
         top_k_bm25: int = 5,
         top_related_chunks: int = 3,
         context_preview_chars: int = 200,
+        search_mode: str = "auto",
     ) -> None:
         self.source = source
         self.client = client
@@ -208,6 +229,7 @@ class LLMGuidedChunkLinker:
         self.top_k_bm25 = top_k_bm25
         self.top_related_chunks = top_related_chunks
         self.context_preview_chars = context_preview_chars
+        self.search_mode = _resolve_search_mode(source, search_mode)
 
     def link(
         self,
@@ -242,7 +264,9 @@ class LLMGuidedChunkLinker:
                 connecting_queries=queries,
             )
 
-        search_results = self.source.search_related(primary_chunk, queries, top_k=self.top_k_bm25)
+        search_results = self.source.search_related(
+            primary_chunk, queries, top_k=self.top_k_bm25, mode=self.search_mode,
+        )
         secondary_chunks = [r["chunk"] for r in search_results[: self.top_related_chunks]]
 
         return AnchorBundle(

@@ -6,9 +6,6 @@ import random
 from collections.abc import Callable
 from typing import Any
 
-from tqdm.auto import tqdm
-
-from .filter_mapper import to_turbopuffer_filters
 from cgft.chunkers.models import Chunk, ChunkCollection
 from cgft.corpus.search_schema.search_exceptions import (
     InvalidSearchSpecError,
@@ -23,9 +20,12 @@ from cgft.corpus.search_schema.search_types import (
     validate_search_spec_shape,
 )
 
-from .namespace import TpufNamespace
 from .files import FileAwareness
 from .filter_mapper import to_turbopuffer_filters
+from .namespace import TpufNamespace
+
+_DEFAULT_RELATED_SEARCH_MODE: SearchMode = "lexical"
+_HYBRID_FUSION_RRF_K = 60.0
 
 
 class TpufChunkSource:
@@ -51,6 +51,9 @@ class TpufChunkSource:
             searchable text content. Defaults to ["content"]. For pre-existing
             namespaces, supply the BM25-indexed field(s), e.g. ["description"]
             or ["title", "content"].
+        vector_attr: Name of the vector attribute in the namespace. Defaults to
+            "vector". Set this if your namespace stores embeddings under a
+            different attribute name.
 
     Example:
         >>> # Managed docs — populate from folder
@@ -73,6 +76,7 @@ class TpufChunkSource:
         region: str = "aws-us-east-1",
         content_attr: list[str] | None = None,
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+        vector_attr: str = "vector",
         distance_metric: str = "cosine_distance",
     ) -> None:
         self._client = TpufNamespace(
@@ -81,6 +85,7 @@ class TpufChunkSource:
             region=region,
             content_attr=content_attr,
             embed_fn=embed_fn,
+            vector_attr=vector_attr,
             distance_metric=distance_metric,
         )
         self._files = FileAwareness(self._client)
@@ -89,7 +94,7 @@ class TpufChunkSource:
         ranking: set[str] = {"bm25"}
         if embed_fn is not None:
             modes |= {"vector", "hybrid"}
-            ranking.add("cosine")
+            ranking |= {"cosine", "rrf"}
 
         self._search_capabilities: SearchCapabilities = {
             "backend": "turbopuffer",
@@ -99,7 +104,11 @@ class TpufChunkSource:
                 "logical": {"and", "or", "not"},
             },
             "ranking": ranking,
-            "constraints": {"max_top_k": 10000, "vector_dimensions": None},
+            "constraints": {
+                "max_top_k": 10000,
+                "vector_dimensions": None,
+                "vector_field": self._client.vector_field,
+            },
             "graph_expansion": False,
         }
 
@@ -190,36 +199,55 @@ class TpufChunkSource:
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
         """Return n randomly sampled chunks, optionally filtered by
         minimum length.
+
+        Uses random ID generation instead of paginating all IDs, making
+        this O(1) queries regardless of namespace size.
         """
-        all_ids = self._client.paginate_all_ids()
-        if not all_ids:
+        max_id = self._client.get_max_id()
+        if max_id is None:
             return []
 
-        if min_chars == 0:
-            sampled_ids = random.sample(all_ids, min(n, len(all_ids)))
-            rows = self._client.query_rows_by_ids(sampled_ids)
-            return [self._client.row_to_chunk(row) for row in rows]
-
-        # With min_chars, fetch in batches until n chunks pass
-        pool = list(all_ids)
-        random.shuffle(pool)
+        # Over-sample to account for gaps in ID space and min_chars filtering.
+        # With min_chars, we need more candidates since some will be too short.
+        oversample = 3 if min_chars > 0 else 1.2
+        max_attempts = 5
         collected: list[Chunk] = []
-        batch_size = max(n * 2, 50)
-        pos = 0
+        seen_ids: set[int] = set()
 
-        while pos < len(pool) and len(collected) < n:
-            batch_ids = pool[pos : pos + batch_size]
-            pos += batch_size
-            rows = self._client.query_rows_by_ids(batch_ids)
+        for attempt in range(max_attempts):
+            if len(collected) >= n:
+                break
 
-            for row in rows:
-                chunk = self._client.row_to_chunk(row)
-                if len(chunk.content) >= min_chars:
+            remaining = n - len(collected)
+            sample_size = min(int(remaining * oversample), max_id)
+            candidate_ids = []
+            while len(candidate_ids) < sample_size:
+                rid = random.randint(1, max_id)
+                if rid not in seen_ids:
+                    seen_ids.add(rid)
+                    candidate_ids.append(rid)
+                # Safety: if we've tried most of the ID space, stop
+                if len(seen_ids) >= max_id:
+                    break
+
+            if not candidate_ids:
+                break
+
+            # Fetch in batches of 500 to avoid oversized requests
+            for batch_start in range(0, len(candidate_ids), 500):
+                batch_ids = candidate_ids[batch_start : batch_start + 500]
+                rows = self._client.query_rows_by_ids(batch_ids)
+                for row in rows:
+                    chunk = self._client.row_to_chunk(row)
+                    if min_chars > 0 and len(chunk.content) < min_chars:
+                        continue
                     collected.append(chunk)
-                    if len(collected) == n:
+                    if len(collected) >= n:
                         break
+                if len(collected) >= n:
+                    break
 
-        return collected
+        return collected[:n]
 
     # ------------------------------------------------------------------
     # Context & structure
@@ -282,9 +310,15 @@ class TpufChunkSource:
     def get_top_level_chunks(self) -> list[Chunk]:
         """Return chunks from files at the shallowest directory depth.
 
-        Returns an empty list when file-structure metadata is unavailable.
+        Returns an empty list when file-structure metadata is unavailable
+        or the namespace is too large (>50K rows) to enumerate efficiently.
         """
         if not self._files.check():
+            return []
+
+        # Skip expensive full-namespace pagination for large namespaces.
+        max_id = self._client.get_max_id()
+        if max_id is not None and max_id > 50_000:
             return []
 
         all_paths = self._files.get_all_file_paths()
@@ -307,9 +341,20 @@ class TpufChunkSource:
     # ------------------------------------------------------------------
 
     def search_related(
-        self, source: Chunk, queries: list[str], top_k: int = 5
+        self,
+        source: Chunk,
+        queries: list[str],
+        top_k: int = 5,
+        mode: SearchMode | None = None,
+        hybrid: HybridOptions | None = None,
     ) -> list[dict]:
-        """Search for chunks related to *source* using BM25 queries.
+        """Search for chunks related to *source*.
+
+        Args:
+            mode: Search mode override. Defaults to lexical. Set to "hybrid"
+                or "vector" to use embeddings (requires embed_fn).
+            hybrid: Optional hybrid weight overrides (lexical_weight,
+                vector_weight).
 
         Deduplicates by row ID, skips the source chunk and adjacent
         neighbors when file-structure metadata is available.
@@ -329,26 +374,34 @@ class TpufChunkSource:
             self._files.chunk_index(source) if file_aware else None
         )
 
-        # Batch-embed all queries when embed_fn is available
+        effective_mode = mode or _DEFAULT_RELATED_SEARCH_MODE
+
+        # Batch-embed all queries only when vector/hybrid is explicitly requested.
         vectors: list[list[float]] | None = None
-        if self._client.embed_fn is not None:
+        if effective_mode in {"vector", "hybrid"}:
+            if self._client.embed_fn is None:
+                raise UnsupportedSearchModeError(
+                    backend="turbopuffer",
+                    mode=effective_mode,
+                    supported_modes={str(m) for m in self._search_capabilities["modes"]},
+                )
             vectors = self._client.embed_fn(queries)
 
         for i, query in enumerate(queries):
-            if vectors is not None:
-                rank_by = self._client.build_hybrid_rank_by(
-                    query, vectors[i], None
-                )
-            else:
-                rank_by = self._client.build_bm25_rank_by(query)
+            spec: SearchSpec = {
+                "mode": effective_mode,
+                "top_k": top_k,
+            }
+            if effective_mode in {"lexical", "hybrid"}:
+                spec["text_query"] = query
+            if effective_mode in {"vector", "hybrid"} and vectors is not None:
+                spec["vector_query"] = vectors[i]
+            if hybrid is not None and effective_mode == "hybrid":
+                spec["hybrid"] = hybrid
 
-            result = self._client.ns.query(
-                rank_by=rank_by,
-                top_k=top_k,
-                include_attributes=True,
-            )
+            rows = self._query_rows(spec)
 
-            for row in result.rows:
+            for row in rows:
                 # Skip source chunk
                 if source_tpuf_id is not None:
                     if row.id == source_tpuf_id:
@@ -399,13 +452,64 @@ class TpufChunkSource:
             reverse=True,
         )
 
+    def probe_rank_by_payloads(
+        self, query: str = "cgft hybrid probe"
+    ) -> dict[str, dict[str, Any]]:
+        """Probe which rank_by payload shapes are accepted by the live namespace.
+
+        This is a diagnostic tool — it fires real queries against the namespace.
+        It is *not* called automatically; use it to debug namespace compatibility.
+
+        Returns a dict keyed by payload type ("lexical", "vector",
+        "native_hybrid") with "accepted", "payload", and "error" for each.
+        """
+        results: dict[str, dict[str, Any]] = {}
+
+        # Lexical probe
+        bm25_payload = self._client.build_bm25_rank_by(query)
+        results["lexical"] = self._probe_rank_payload(bm25_payload)
+
+        # Vector / native hybrid probes require embeddings
+        if self._client.embed_fn is None:
+            msg = "embed_fn unavailable"
+            results["vector"] = {"accepted": False, "payload": None, "error": msg}
+            results["native_hybrid"] = {"accepted": False, "payload": None, "error": msg}
+            return results
+
+        try:
+            vector_query = self._client.embed_fn([query])[0]
+        except Exception as exc:
+            msg = str(exc)
+            results["vector"] = {"accepted": False, "payload": None, "error": msg}
+            results["native_hybrid"] = {"accepted": False, "payload": None, "error": msg}
+            return results
+
+        results["vector"] = self._probe_rank_payload(
+            self._client.build_vector_rank_by(vector_query)
+        )
+        results["native_hybrid"] = self._probe_rank_payload(
+            self._client.build_native_hybrid_rank_by(query, vector_query, None)
+        )
+        return results
+
+    def _probe_rank_payload(self, payload: Any) -> dict[str, Any]:
+        try:
+            self._client.ns.query(rank_by=payload, top_k=1, include_attributes=True)
+            return {"accepted": True, "payload": payload, "error": None}
+        except Exception as exc:
+            return {"accepted": False, "payload": payload, "error": str(exc)}
+
     def _build_query_kwargs(self, spec: SearchSpec) -> dict[str, Any]:
-        """Validate spec and build turbopuffer query kwargs."""
+        """Validate spec and build turbopuffer query kwargs.
+
+        Handles lexical and vector modes. Hybrid is routed through
+        ``_query_rows_hybrid_fused`` before reaching this method.
+        """
         mode = spec.get("mode")
-        supported_modes = set(self._search_capabilities.get("modes", set()))
+        supported_modes = self._search_capabilities["modes"]
         if mode not in supported_modes:
             raise UnsupportedSearchModeError(
-                backend=str(self._search_capabilities.get("backend", "unknown")),
+                backend="turbopuffer",
                 mode=str(mode),
                 supported_modes={str(m) for m in supported_modes},
             )
@@ -413,21 +517,24 @@ class TpufChunkSource:
         shape_errors = validate_search_spec_shape(spec)
         if shape_errors:
             raise InvalidSearchSpecError(
-                backend=str(self._search_capabilities.get("backend", "unknown")),
+                backend="turbopuffer",
                 message="; ".join(shape_errors),
                 spec=spec,
             )
 
         text_query = str(spec.get("text_query") or "")
         vector_query: list[float] | None = spec.get("vector_query")
-        hybrid_opts: HybridOptions | None = spec.get("hybrid")
 
         if mode == "lexical":
             rank_by = self._client.build_bm25_rank_by(text_query)
         elif mode == "vector":
             rank_by = self._client.build_vector_rank_by(vector_query)  # type: ignore[arg-type]
-        else:  # hybrid
-            rank_by = self._client.build_hybrid_rank_by(text_query, vector_query, hybrid_opts)  # type: ignore[arg-type]
+        else:
+            # Hybrid specs that reach here have already been validated
+            # by _query_rows; build native hybrid rank_by.
+            rank_by = self._client.build_native_hybrid_rank_by(
+                text_query, vector_query, spec.get("hybrid")  # type: ignore[arg-type]
+            )
 
         query_kwargs: dict[str, Any] = {
             "rank_by": rank_by,
@@ -442,11 +549,79 @@ class TpufChunkSource:
 
         return query_kwargs
 
-    def search(self, spec: SearchSpec) -> list[Chunk]:
-        """Search chunks using a structured search spec."""
+    def _query_rows(self, spec: SearchSpec) -> list[Any]:
+        """Execute a search spec and return raw tpuf rows.
+
+        Hybrid mode always uses client-side RRF fusion (two separate
+        lexical + vector queries merged by reciprocal rank).
+        """
+        mode = spec.get("mode")
+        if mode == "hybrid":
+            return self._query_rows_hybrid_fused(spec)
+
         query_kwargs = self._build_query_kwargs(spec)
         result = self._client.ns.query(**query_kwargs)
-        return [self._client.row_to_chunk(row) for row in result.rows]
+        return list(result.rows)
+
+    def _query_rows_hybrid_fused(self, spec: SearchSpec) -> list[Any]:
+        """Execute hybrid search via client-side RRF fusion.
+
+        Issues separate lexical and vector queries, then merges results
+        using Reciprocal Rank Fusion.
+        """
+        text_query = str(spec.get("text_query") or "")
+        vector_query: list[float] | None = spec.get("vector_query")
+        hybrid_opts: HybridOptions | None = spec.get("hybrid")
+        if vector_query is None:
+            raise InvalidSearchSpecError(
+                backend="turbopuffer",
+                message="hybrid mode requires vector_query",
+                spec=spec,
+            )
+
+        requested_top_k = int(spec.get("top_k", 10))
+        max_top_k = int(self._search_capabilities["constraints"].get("max_top_k", 10000))
+        oversampled_top_k = min(max_top_k, requested_top_k * 2)
+
+        translated_filters = to_turbopuffer_filters(
+            spec.get("filter"), self._search_capabilities
+        )
+
+        lexical_kwargs: dict[str, Any] = {
+            "rank_by": self._client.build_bm25_rank_by(text_query),
+            "top_k": oversampled_top_k,
+            "include_attributes": True,
+        }
+        vector_kwargs: dict[str, Any] = {
+            "rank_by": self._client.build_vector_rank_by(vector_query),
+            "top_k": oversampled_top_k,
+            "include_attributes": True,
+        }
+        if translated_filters is not None:
+            lexical_kwargs["filters"] = translated_filters
+            vector_kwargs["filters"] = translated_filters
+
+        lexical_rows = list(self._client.ns.query(**lexical_kwargs).rows)
+        vector_rows = list(self._client.ns.query(**vector_kwargs).rows)
+
+        opts = hybrid_opts or {}
+        lexical_weight = float(opts.get("lexical_weight", 1.0))
+        vector_weight = float(opts.get("vector_weight", 1.0))
+
+        fused: dict[int, dict[str, Any]] = {}
+        for rank, row in enumerate(lexical_rows, start=1):
+            entry = fused.setdefault(row.id, {"row": row, "score": 0.0})
+            entry["score"] += lexical_weight / (_HYBRID_FUSION_RRF_K + rank)
+        for rank, row in enumerate(vector_rows, start=1):
+            entry = fused.setdefault(row.id, {"row": row, "score": 0.0})
+            entry["score"] += vector_weight / (_HYBRID_FUSION_RRF_K + rank)
+
+        ranked = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
+        return [item["row"] for item in ranked[:requested_top_k]]
+
+    def search(self, spec: SearchSpec) -> list[Chunk]:
+        """Search chunks using a structured search spec."""
+        return [self._client.row_to_chunk(row) for row in self._query_rows(spec)]
 
     def search_content(self, spec: SearchSpec) -> list[str]:
         """Search and return content strings without Chunk construction.
@@ -454,9 +629,7 @@ class TpufChunkSource:
         Cloudpickle-safe alternative to ``search()`` for use in remote envs
         where Pydantic models don't survive pickle roundtripping.
         """
-        query_kwargs = self._build_query_kwargs(spec)
-        result = self._client.ns.query(**query_kwargs)
-        return [self._client.row_content(row) for row in result.rows]
+        return [self._client.row_content(row) for row in self._query_rows(spec)]
 
     def embed_query(self, text: str) -> list[float] | None:
         """Return an embedding vector for *text*, or ``None``."""
