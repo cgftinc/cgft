@@ -34,6 +34,7 @@ class TpufNamespace:
         region: str = "aws-us-east-1",
         content_attr: list[str] | None = None,
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+        vector_attr: str = "vector",
         distance_metric: str = "cosine_distance",
     ) -> None:
         import turbopuffer
@@ -44,6 +45,7 @@ class TpufNamespace:
         self.fields: list[str] = (
             content_attr if content_attr is not None else ["content"]
         )
+        self.vector_field = str(vector_attr or "vector").strip() or "vector"
         self.embed_fn = embed_fn
         self.distance_metric = distance_metric
 
@@ -60,8 +62,12 @@ class TpufNamespace:
     # Query builders
     # ------------------------------------------------------------------
 
+    _TPUF_BM25_MAX_QUERY_LEN = 1024
+
     def build_bm25_rank_by(self, query: str) -> Any:
         """Build the ``rank_by`` argument for a BM25 query."""
+        # Turbopuffer caps BM25 queries at 1024 unicode code points.
+        query = query[: self._TPUF_BM25_MAX_QUERY_LEN]
         if len(self.fields) == 1:
             return (self.fields[0], "BM25", query)
         return (
@@ -71,9 +77,9 @@ class TpufNamespace:
 
     def build_vector_rank_by(self, vector: list[float]) -> Any:
         """Build the ``rank_by`` argument for a vector ANN query."""
-        return ("vector", "ANN", vector)
+        return (self.vector_field, "ANN", vector)
 
-    def build_hybrid_rank_by(
+    def build_native_hybrid_rank_by(
         self,
         query: str,
         vector: list[float],
@@ -93,7 +99,7 @@ class TpufNamespace:
             {
                 "type": "vector",
                 "vector": vector,
-                "field": "vector",
+                "field": self.vector_field,
                 "weight": vector_weight,
             },
         ]
@@ -123,7 +129,7 @@ class TpufNamespace:
             attrs: dict = {
                 k: v
                 for k, v in raw.items()
-                if not k.startswith("$") and k not in ("id", "vector")
+                if not k.startswith("$") and k not in ("id", self.vector_field)
             }
         except TypeError:
             attrs = {f: getattr(row, f, "") for f in self.fields}
@@ -162,14 +168,16 @@ class TpufNamespace:
         ):
             batch = all_chunks[batch_start : batch_start + batch_size]
 
+            _TPUF_ATTR_LIMIT = 4000  # Turbopuffer 4096 byte limit, leave margin
+
             upsert_rows = [
                 {
                     "id": batch_start + i + 1,
                     "content": chunk.content,
-                    "file_path": chunk.get_metadata("file", ""),
-                    "h1": chunk.get_metadata("h1", ""),
-                    "h2": chunk.get_metadata("h2", ""),
-                    "h3": chunk.get_metadata("h3", ""),
+                    "file_path": chunk.get_metadata("file", "")[:_TPUF_ATTR_LIMIT],
+                    "h1": chunk.get_metadata("h1", "")[:_TPUF_ATTR_LIMIT],
+                    "h2": chunk.get_metadata("h2", "")[:_TPUF_ATTR_LIMIT],
+                    "h3": chunk.get_metadata("h3", "")[:_TPUF_ATTR_LIMIT],
                     "chunk_index": chunk.get_metadata("index", 0),
                     "chunk_hash": chunk.hash,
                     "char_count": len(chunk),
@@ -187,7 +195,7 @@ class TpufNamespace:
             if embed_fn:
                 vectors = embed_fn([chunk.content for chunk in batch])
                 for row, v in zip(upsert_rows, vectors):
-                    row["vector"] = v
+                    row[self.vector_field] = v
                 write_kwargs["distance_metric"] = self.distance_metric
 
             self._ns.write(**write_kwargs)
@@ -203,6 +211,17 @@ class TpufNamespace:
     # ------------------------------------------------------------------
     # ID pagination
     # ------------------------------------------------------------------
+
+    def get_max_id(self) -> int | None:
+        """Return the highest row ID in the namespace, or None if empty."""
+        result = self._ns.query(
+            rank_by=["id", "desc"],
+            top_k=1,
+        )
+        rows = result.rows
+        if not rows:
+            return None
+        return rows[0].id
 
     def paginate_all_ids(self, page_size: int = 1000) -> list[int]:
         """Return all row IDs in the namespace via cursor pagination."""

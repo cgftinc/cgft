@@ -5,8 +5,6 @@ from __future__ import annotations
 import random
 from typing import TYPE_CHECKING
 
-from .client import CorpusClient
-from .filter_mapper import to_corpora_filters
 from cgft.chunkers.inspector import ChunkInspector
 from cgft.chunkers.markdown import MarkdownChunker
 from cgft.chunkers.models import Chunk, ChunkCollection
@@ -16,10 +14,15 @@ from cgft.corpus.search_schema.search_exceptions import (
 )
 from cgft.corpus.search_schema.search_types import (
     FilterPredicate,
+    HybridOptions,
     SearchCapabilities,
+    SearchMode,
     SearchSpec,
     validate_search_spec_shape,
 )
+
+from .client import CorpusClient
+from .filter_mapper import to_corpora_filters
 
 if TYPE_CHECKING:
     from .models import Corpus
@@ -105,7 +108,7 @@ class CorporaChunkSource:
 
     def populate_from_chunks(
         self,
-        collection: "ChunkCollection",
+        collection: ChunkCollection,
         batch_size: int = 100,
         show_summary: bool = True,
     ) -> None:
@@ -245,7 +248,14 @@ class CorporaChunkSource:
         self._assert_ready()
         return self.collection.get_top_level_chunks()
 
-    def search_related(self, source: Chunk, queries: list[str], top_k: int = 5) -> list[dict]:
+    def search_related(
+        self,
+        source: Chunk,
+        queries: list[str],
+        top_k: int = 5,
+        mode: SearchMode | None = None,
+        hybrid: HybridOptions | None = None,
+    ) -> list[dict]:
         """Search for chunks related to source using BM25 queries via the Corpora API.
 
         Runs each query, deduplicates results by chunk hash, skips the source chunk

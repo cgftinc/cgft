@@ -138,15 +138,18 @@ def select_anchor_bundle_with_enrichment(
     include_search_payload: bool = False,
     prebuilt_queries: list[str] | None = None,
     filter_same_file: bool = True,
+    search_mode: str | None = None,
 ) -> AnchorBundle | tuple[AnchorBundle, list[str], list[dict[str, Any]]]:
-    """Select an anchor bundle and attach BM25-related chunks as structural hints."""
+    """Select an anchor bundle and attach related chunks as structural hints."""
     bundle = selector.select(primary_chunk, corpus_pool, qa_type=qa_type)
     queries = (
         prebuilt_queries
         if prebuilt_queries is not None
         else generate_bm25_queries(primary_chunk, bm25_enrichment_queries)
     )
-    bm25_related = source.search_related(primary_chunk, queries, top_k=bm25_enrichment_top_k)
+    bm25_related = source.search_related(
+        primary_chunk, queries, top_k=bm25_enrichment_top_k, mode=search_mode,
+    )
     if filter_same_file:
         primary_file = _get_chunk_file(primary_chunk)
         if primary_file:

@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from cgft.corpus.search_schema.search_types import (
     FilterPredicate,
+    HybridOptions,
     SearchCapabilities,
+    SearchMode,
     SearchSpec,
 )
 
@@ -74,6 +76,8 @@ class ChunkSource(Protocol):
         source: Chunk,
         queries: list[str],
         top_k: int = 5,
+        mode: SearchMode | None = None,
+        hybrid: HybridOptions | None = None,
     ) -> list[dict]:
         """Search for chunks related to source using BM25 queries.
 

@@ -189,6 +189,7 @@ def _build_linker(cfg: CgftPipelineConfig, source: Any) -> ChunkLinker:
             top_k_bm25=linker_cfg.top_k_bm25,
             top_related_chunks=linker_cfg.top_related_chunks,
             context_preview_chars=linker_cfg.context_preview_chars,
+            search_mode=linker_cfg.search_mode,
         )
 
     structural_cfg = cfg.linker.structural
@@ -200,6 +201,7 @@ def _build_linker(cfg: CgftPipelineConfig, source: Any) -> ChunkLinker:
         bm25_enrichment_top_k=structural_cfg.bm25_enrichment_top_k,
         max_related_refs=structural_cfg.max_related_refs,
         entity_extraction=cfg.corpus_context.entity_extraction,
+        search_mode=structural_cfg.search_mode,
     )
 
 
