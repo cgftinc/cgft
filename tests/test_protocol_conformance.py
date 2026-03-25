@@ -189,7 +189,7 @@ def _fake_pinecone_source() -> PineconeChunkSource:
             )
 
         def describe_index_stats(self):
-            return SimpleNamespace(dimension=3)
+            return SimpleNamespace(dimension=3, total_vector_count=2)
 
     class FakeFiles:
         def check(self):
@@ -223,6 +223,9 @@ def _fake_pinecone_source() -> PineconeChunkSource:
 
         def query(self, **kw):
             return self._index.query(**kw)
+
+        def _get_index(self):
+            return self._index
 
         def _pc_field(self, name):
             return self._reverse_mapping.get(name, name)

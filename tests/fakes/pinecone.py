@@ -49,7 +49,8 @@ class FakeIndex:
         return SimpleNamespace(matches=list(matches))
 
     def describe_index_stats(self):
-        return SimpleNamespace(dimension=self._dimension)
+        total = sum(len(m) for m in self.matches_per_call)
+        return SimpleNamespace(dimension=self._dimension, total_vector_count=total)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +142,9 @@ class FakeClient:
 
     def query(self, **kwargs):
         return self._index.query(**kwargs)
+
+    def _get_index(self):
+        return self._index
 
     def _pc_field(self, internal_name: str) -> str:
         return self._reverse_mapping.get(internal_name, internal_name)

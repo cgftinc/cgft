@@ -7,9 +7,12 @@ metadata fields.  Gracefully degrades when those fields are absent.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from cgft.chunkers.models import Chunk
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .index_client import PineconeIndexClient
@@ -118,31 +121,26 @@ class FileAwareness:
     def get_all_file_paths(self) -> list[str]:
         """Return all unique ``file_path`` values in the index.
 
-        Uses a single large vector query to pull metadata efficiently
-        rather than paginating IDs + fetching.  Cached until
-        :meth:`invalidate` is called.
+        Paginates all vector IDs via ``list_paginated``, then batch-fetches
+        metadata to extract file paths.  Slower than a single query but
+        complete for indexes of any size.  Cached until :meth:`invalidate`
+        is called.
         """
         if self._all_file_paths is not None:
             return self._all_file_paths
 
+        all_ids = self._client.list_all_ids()
         paths: set[str] = set()
-        zero_vec = self._client.zero_vector()
         fp_key = self._client._pc_field("file_path")
+        batch_size = 100
 
-        # Pull up to 10000 results (Pinecone max top_k) in one query.
-        # Indexes with >10K vectors may miss some file paths here.
-        # This trades completeness for speed — a full pagination would
-        # require list_paginated + fetch, which is very slow at scale.
-        result = self._client.query(
-            vector=zero_vec,
-            top_k=10000,
-            include_metadata=True,
-        )
-        for match in result.matches or []:
-            metadata = getattr(match, "metadata", {}) or {}
-            fp = metadata.get(fp_key)
-            if fp:
-                paths.add(str(fp))
+        for i in range(0, len(all_ids), batch_size):
+            batch_ids = all_ids[i : i + batch_size]
+            chunks = self._client.fetch_by_ids(batch_ids)
+            for chunk in chunks:
+                fp = chunk.get_metadata(fp_key) or chunk.get_metadata("file_path")
+                if fp:
+                    paths.add(str(fp))
 
         self._all_file_paths = sorted(paths)
         return self._all_file_paths

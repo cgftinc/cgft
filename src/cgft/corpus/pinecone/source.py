@@ -291,9 +291,26 @@ class PineconeChunkSource:
             "next_chunk_preview": next_preview,
         }
 
+    _TOP_LEVEL_MAX_VECTORS = 50_000
+
     def get_top_level_chunks(self) -> list[Chunk]:
-        """Return chunks from files at the shallowest directory depth."""
+        """Return chunks from files at the shallowest directory depth.
+
+        Returns an empty list when file-structure metadata is unavailable
+        or the index is too large (>50K vectors) to enumerate efficiently.
+        """
         if not self._files.check():
+            return []
+
+        # Skip expensive full-index pagination for large indexes.
+        index = self._client._get_index()
+        stats = index.describe_index_stats()
+        if stats.total_vector_count > self._TOP_LEVEL_MAX_VECTORS:
+            logger.warning(
+                "Skipping get_top_level_chunks: index has %d vectors (limit %d)",
+                stats.total_vector_count,
+                self._TOP_LEVEL_MAX_VECTORS,
+            )
             return []
 
         all_paths = self._files.get_all_file_paths()
