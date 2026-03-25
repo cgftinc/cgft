@@ -28,6 +28,7 @@ class ChunkSource(Protocol):
         CorporaChunkSource: chunks stored locally + uploaded to Corpora API (BM25)
         TpufChunkSource: chunks stored and searched in Turbopuffer (BM25/vector/hybrid)
         PineconeChunkSource: chunks stored and searched in Pinecone (vector only)
+        ChromaChunkSource: chunks stored and searched in ChromaDB (vector/BM25/hybrid)
     """
 
     def populate_from_folder(
@@ -104,10 +105,6 @@ class ChunkSource(Protocol):
         """
         ...
 
-    def embed_query(self, text: str) -> list[float] | None:
-        """Return an embedding vector for *text*, or ``None`` if unsupported."""
-        ...
-
     def search_text(
         self,
         text_query: str,
@@ -115,6 +112,10 @@ class ChunkSource(Protocol):
         filter: FilterPredicate | None = None,
     ) -> list[Chunk]:
         """Search for chunks with a text query and optional filter."""
+        ...
+
+    def embed_query(self, text: str) -> list[float] | None:
+        """Return an embedding vector for *text*, or ``None`` if unsupported."""
         ...
 
     def get_search_capabilities(self) -> SearchCapabilities:
