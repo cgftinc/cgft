@@ -164,9 +164,7 @@ def test_search_related_explicit_hybrid_uses_rrf_fusion():
     )
     source = _make_source(ns=ns, embed_fn=embed_fn, vector_field="embedding")
 
-    results = source.search_related(
-        Chunk(content="seed"), ["alpha"], top_k=2, mode="hybrid"
-    )
+    results = source.search_related(Chunk(content="seed"), ["alpha"], top_k=2, mode="hybrid")
 
     assert [r["chunk"].content for r in results] == ["lexical winner", "vector winner"]
     assert embed_calls == [["alpha"]]

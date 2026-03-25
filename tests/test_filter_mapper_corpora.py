@@ -51,9 +51,7 @@ class TestFieldPredicates:
         }
 
     def test_contains_all(self):
-        pred = FieldPredicate(
-            field="tags", op="contains_all", value=["x", "y"]
-        )
+        pred = FieldPredicate(field="tags", op="contains_all", value=["x", "y"])
         result = to_corpora_filters(pred, _CORPORA_CAPS)
         assert result == {
             "field": "tags",
@@ -94,21 +92,15 @@ class TestLogicalPredicates:
         }
 
     def test_not(self):
-        pred = NotPredicate(
-            clause=FieldPredicate(field="z", op="eq", value="deleted")
-        )
+        pred = NotPredicate(clause=FieldPredicate(field="z", op="eq", value="deleted"))
         result = to_corpora_filters(pred, _CORPORA_CAPS)
-        assert result == {
-            "not": {"field": "z", "op": "eq", "value": "deleted"}
-        }
+        assert result == {"not": {"field": "z", "op": "eq", "value": "deleted"}}
 
     def test_nested(self):
         pred = AndPredicate(
             clauses=(
                 FieldPredicate(field="type", op="eq", value="doc"),
-                NotPredicate(
-                    clause=FieldPredicate(field="status", op="eq", value="draft")
-                ),
+                NotPredicate(clause=FieldPredicate(field="status", op="eq", value="draft")),
             )
         )
         result = to_corpora_filters(pred, _CORPORA_CAPS)
@@ -148,8 +140,6 @@ class TestUnsupported:
             "constraints": {},
             "graph_expansion": False,
         }
-        pred = AndPredicate(
-            clauses=(FieldPredicate(field="x", op="eq", value=1),)
-        )
+        pred = AndPredicate(clauses=(FieldPredicate(field="x", op="eq", value=1),))
         with pytest.raises(UnsupportedFilterError):
             to_corpora_filters(pred, restricted)

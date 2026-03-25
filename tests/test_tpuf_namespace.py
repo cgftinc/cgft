@@ -119,9 +119,7 @@ class TestRowToChunk:
 
     def test_multi_field_content_json(self):
         ns = _make_namespace(fields=["title", "body"])
-        row = SimpleNamespace(
-            id=1, title="Title", body="Body text"
-        )
+        row = SimpleNamespace(id=1, title="Title", body="Body text")
         chunk = ns.row_to_chunk(row)
         # Multi-field: content is JSON-encoded
         assert "Title" in chunk.content

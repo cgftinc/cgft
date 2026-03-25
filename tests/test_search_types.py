@@ -71,9 +71,7 @@ class TestValidateVector:
 
 class TestValidateHybrid:
     def test_valid_hybrid(self):
-        spec = SearchSpec(
-            mode="hybrid", top_k=5, text_query="hi", vector_query=[0.1]
-        )
+        spec = SearchSpec(mode="hybrid", top_k=5, text_query="hi", vector_query=[0.1])
         assert validate_search_spec_shape(spec) == []
 
     def test_missing_text_query(self):
@@ -168,9 +166,7 @@ class TestRequiredOperators:
         assert logical_ops == {"and", "or"}
 
     def test_not_predicate(self):
-        pred = NotPredicate(
-            clause=FieldPredicate(field="x", op="eq", value="deleted")
-        )
+        pred = NotPredicate(clause=FieldPredicate(field="x", op="eq", value="deleted"))
         field_ops, logical_ops = required_operators(pred)
         assert field_ops == {"eq"}
         assert logical_ops == {"not"}

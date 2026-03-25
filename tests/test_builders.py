@@ -18,9 +18,7 @@ class TestFieldRef:
 
     def test_in(self):
         pred = f("color").in_(["red", "blue"])
-        assert pred == FieldPredicate(
-            field="color", op="in", value=["red", "blue"]
-        )
+        assert pred == FieldPredicate(field="color", op="in", value=["red", "blue"])
 
     def test_gte(self):
         pred = f("score").gte(0.5)
@@ -32,15 +30,11 @@ class TestFieldRef:
 
     def test_contains_any(self):
         pred = f("tags").contains_any(["python", "rust"])
-        assert pred == FieldPredicate(
-            field="tags", op="contains_any", value=["python", "rust"]
-        )
+        assert pred == FieldPredicate(field="tags", op="contains_any", value=["python", "rust"])
 
     def test_contains_all(self):
         pred = f("tags").contains_all(["a", "b"])
-        assert pred == FieldPredicate(
-            field="tags", op="contains_all", value=["a", "b"]
-        )
+        assert pred == FieldPredicate(field="tags", op="contains_all", value=["a", "b"])
 
 
 class TestLogicalCombinators:

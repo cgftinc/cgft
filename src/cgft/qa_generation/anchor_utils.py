@@ -1,14 +1,64 @@
-"""Shared anchor/BM25 helper utilities for Cgft QA generation."""
+"""Shared anchor/search helper utilities for Cgft QA generation."""
 
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from .anchor_selector import AnchorBundle
 
 if TYPE_CHECKING:
     from .cgft_models import EntityExtractionConfig
+
+
+def _best_search_mode(source: Any) -> str:
+    """Return the best search mode for *source*.
+
+    Checks ``get_search_capabilities()`` when available. Falls back to
+    ``"lexical"`` for backward compatibility.
+    """
+    if not hasattr(source, "get_search_capabilities"):
+        return "lexical"
+    try:
+        caps = source.get_search_capabilities()
+        modes = caps.get("modes", set())
+    except Exception:
+        return "lexical"
+    if "hybrid" in modes:
+        return "hybrid"
+    if "vector" in modes:
+        return "vector"
+    return "lexical"
+
+
+def generate_search_queries(
+    chunk: Any,
+    n: int = 3,
+    *,
+    source: Any | None = None,
+    entity_extraction: Any | None = None,
+) -> list[str]:
+    """Generate search queries appropriate for the source's best mode.
+
+    Delegates to ``generate_bm25_queries_from_extraction`` /
+    ``generate_bm25_queries`` for lexical/hybrid backends, and to
+    ``generate_vector_queries`` for vector-only backends.
+
+    This is the preferred entry point; callers that don't have a
+    ``source`` reference can still call the lower-level functions
+    directly.
+    """
+    mode = _best_search_mode(source) if source else "lexical"
+
+    if entity_extraction is not None:
+        queries = generate_bm25_queries_from_extraction(chunk, entity_extraction, n)
+        if queries:
+            return queries
+
+    if mode == "vector":
+        return generate_vector_queries(chunk, n)
+    return generate_bm25_queries(chunk, n)
 
 
 def generate_bm25_queries(chunk: Any, n: int = 3) -> list[str]:
@@ -71,7 +121,7 @@ def generate_bm25_queries_from_extraction(
 
     extracted: list[tuple[str, str]] = []
 
-    for entity in (extraction_config.entity_names or []):
+    for entity in extraction_config.entity_names or []:
         if entity and entity.lower() in content_lower:
             extracted.append(("entity", entity))
 
@@ -86,7 +136,7 @@ def generate_bm25_queries_from_extraction(
         except re.error:
             continue
 
-    for term in (extraction_config.domain_terms or []):
+    for term in extraction_config.domain_terms or []:
         if term and term.lower() in content_lower:
             extracted.append(("domain", term))
 
@@ -109,6 +159,59 @@ def generate_bm25_queries_from_extraction(
             queries.append(entity)
         if len(queries) >= n:
             break
+
+    return queries[:n]
+
+
+def generate_vector_queries(chunk: Any, n: int = 3) -> list[str]:
+    """Generate natural-language queries suited for vector/embedding search.
+
+    Vector search benefits from full-sentence queries rather than
+    keyword-focused ones, because the embedding model captures semantic
+    meaning.
+    """
+    if n <= 0:
+        return []
+
+    queries: list[str] = []
+
+    meta: dict[str, Any] = {}
+    if hasattr(chunk, "metadata_dict"):
+        meta = dict(getattr(chunk, "metadata_dict") or {})
+    elif hasattr(chunk, "metadata"):
+        raw_meta = getattr(chunk, "metadata")
+        if isinstance(raw_meta, dict):
+            meta = dict(raw_meta)
+        else:
+            try:
+                meta = dict(raw_meta or {})
+            except Exception:
+                meta = {}
+
+    # Build a natural-language query from header hierarchy
+    headers = []
+    for key in ("h1", "h2", "h3", "header", "section_header", "title"):
+        value = meta.get(key)
+        if value:
+            headers.append(str(value).strip())
+    if headers:
+        queries.append(" - ".join(headers))
+
+    content = chunk.content if hasattr(chunk, "content") else str(chunk)
+
+    # Use first two sentences as a natural-language query
+    sentences = [s.strip() for s in str(content).split(".") if s.strip()]
+    if sentences:
+        first_query = ". ".join(sentences[:2]).strip()
+        if first_query and first_query not in queries:
+            queries.append(first_query[:300])
+
+    # Use a mid-section excerpt for diversity
+    if len(content) > 200:
+        mid = len(content) // 2
+        excerpt = content[mid - 100 : mid + 100].strip()
+        if excerpt and excerpt not in queries:
+            queries.append(excerpt)
 
     return queries[:n]
 
@@ -145,7 +248,7 @@ def select_anchor_bundle_with_enrichment(
     queries = (
         prebuilt_queries
         if prebuilt_queries is not None
-        else generate_bm25_queries(primary_chunk, bm25_enrichment_queries)
+        else generate_search_queries(primary_chunk, bm25_enrichment_queries, source=source)
     )
     bm25_related = source.search_related(
         primary_chunk, queries, top_k=bm25_enrichment_top_k, mode=search_mode,
@@ -154,7 +257,8 @@ def select_anchor_bundle_with_enrichment(
         primary_file = _get_chunk_file(primary_chunk)
         if primary_file:
             bm25_related = [
-                row for row in bm25_related
+                row
+                for row in bm25_related
                 if row.get("chunk") is not None and _get_chunk_file(row["chunk"]) != primary_file
             ]
     bundle.structural_hints["bm25_related"] = [

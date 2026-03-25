@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 from .anchor_selector import AnchorBundle, AnchorSelector
 from .anchor_utils import (
-    generate_bm25_queries,
-    generate_bm25_queries_from_extraction,
+    _best_search_mode,
+    generate_search_queries,
     select_anchor_bundle_with_enrichment,
 )
 from .corpus_capabilities import CorpusCapabilities
@@ -93,6 +93,46 @@ Queries should target content from the main chunk only.
 Return JSON with keys: keywords, confidence, queries
 """
 
+# ---------------------------------------------------------------------------
+# Vector-friendly prompt variant for embedding-based backends (no BM25)
+# ---------------------------------------------------------------------------
+
+RELATED_CHUNK_VECTOR_SYSTEM_PROMPT = """\
+You are generating semantic search queries to find chunks that have meaningful \
+relationships with the given chunk.
+
+## Semantic Search Behavior
+Semantic (vector) search matches by meaning, not exact keywords. This means:
+- Natural-language questions and descriptions work well
+- Synonyms, paraphrases, and related concepts are found automatically
+- Longer, descriptive queries often outperform short keyword lists
+- The query should express the *idea* you're searching for
+
+## Query Strategies
+
+**1. Conceptual neighbors**: Describe related concepts that might appear elsewhere
+  - If this chunk discusses Redis caching → "database caching strategies and configuration"
+
+**2. Reference-chasing**: If this chunk mentions other docs/sections, describe them
+  - "see the deployment guide" → "how to deploy the application step by step"
+
+**3. Inverse references**: Describe what other chunks might say that relates to this one
+  - If this is the auth setup guide → "authentication flow and login process"
+
+**4. Semantic expansion**: Rephrase key concepts in different ways
+  - "container orchestration" / "managing Docker services at scale"
+
+## Query Format
+- Use full natural-language phrases or questions
+- Each query should target a *different* potential related chunk
+- If the chunk is boilerplate, set confidence to "low"
+
+Return JSON with:
+- keywords: Distinctive concepts from this chunk
+- confidence: "low" | "mid" | "high"
+- queries: ["q1", "q2", ...] - diverse queries targeting different relationships
+"""
+
 
 # ---------------------------------------------------------------------------
 # StructuralChunkLinker
@@ -151,12 +191,12 @@ class StructuralChunkLinker:
     ) -> AnchorBundle:
         pool = corpus_pool or []
         selector = self._ensure_selector(pool)
-        if self.entity_extraction is not None:
-            queries = generate_bm25_queries_from_extraction(
-                primary_chunk, self.entity_extraction, self.bm25_enrichment_queries
-            ) or generate_bm25_queries(primary_chunk, self.bm25_enrichment_queries)
-        else:
-            queries = generate_bm25_queries(primary_chunk, self.bm25_enrichment_queries)
+        queries = generate_search_queries(
+            primary_chunk,
+            self.bm25_enrichment_queries,
+            source=self.source,
+            entity_extraction=self.entity_extraction,
+        )
         bundle = select_anchor_bundle_with_enrichment(
             selector=selector,
             primary_chunk=primary_chunk,
@@ -347,7 +387,7 @@ class AdaptiveChunkLinker:
         client: Any | None = None,
         model: str = "",
         *,
-        system_prompt: str = RELATED_CHUNK_SYSTEM_PROMPT,
+        system_prompt: str | None = None,
         user_template: str = RELATED_CHUNK_USER_TEMPLATE,
         capabilities: CorpusCapabilities | None = None,
         type_distribution: dict[str, float] | None = None,
@@ -362,8 +402,20 @@ class AdaptiveChunkLinker:
 
         Uses ``StructuralChunkLinker`` when corpus has document IDs,
         falls back to ``LLMGuidedChunkLinker`` (if client provided)
-        or deterministic BM25 otherwise.
+        or deterministic search otherwise.
+
+        When *system_prompt* is ``None`` (default), automatically picks
+        a BM25-focused or vector-focused prompt based on the source's
+        search capabilities.
         """
+        # Auto-select prompt based on source capabilities
+        if system_prompt is None:
+            mode = _best_search_mode(source)
+            if mode == "vector":
+                system_prompt = RELATED_CHUNK_VECTOR_SYSTEM_PROMPT
+            else:
+                system_prompt = RELATED_CHUNK_SYSTEM_PROMPT
+
         entries: list[tuple[Callable[[CorpusCapabilities], bool], ChunkLinker]] = []
 
         structural = StructuralChunkLinker(

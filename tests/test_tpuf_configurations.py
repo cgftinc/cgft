@@ -23,9 +23,7 @@ from cgft.corpus.search_schema.search_exceptions import (
 from cgft.corpus.search_schema.search_types import SearchSpec
 from cgft.corpus.turbopuffer.source import TpufChunkSource
 
-_SEARCH_RELATED_HAS_MODE = "mode" in _inspect.signature(
-    TpufChunkSource.search_related
-).parameters
+_SEARCH_RELATED_HAS_MODE = "mode" in _inspect.signature(TpufChunkSource.search_related).parameters
 
 # ---------------------------------------------------------------------------
 # Fakes — same pattern as test_tpuf_search_related.py
@@ -84,9 +82,7 @@ class FakeClient:
         if len(self.fields) == 1:
             content = str(getattr(row, self.fields[0], ""))
         else:
-            content = json.dumps(
-                {f: getattr(row, f, "") for f in self.fields}, default=str
-            )
+            content = json.dumps({f: getattr(row, f, "") for f in self.fields}, default=str)
         try:
             raw = vars(row)
             attrs = {
@@ -104,9 +100,7 @@ class FakeClient:
 
         if len(self.fields) == 1:
             return str(getattr(row, self.fields[0], ""))
-        return json.dumps(
-            {f: getattr(row, f, "") for f in self.fields}, default=str
-        )
+        return json.dumps({f: getattr(row, f, "") for f in self.fields}, default=str)
 
 
 def _row(row_id: int, content: str, **attrs):
@@ -202,10 +196,12 @@ class TestNoEmbedFnModeValidation:
 class TestNoFileMetadata:
     def test_search_related_no_neighbor_skip(self):
         """Without file metadata, adjacent chunks are NOT skipped."""
-        ns = FakeNamespace(rows=[
-            _row(1, "adjacent chunk"),
-            _row(2, "another chunk"),
-        ])
+        ns = FakeNamespace(
+            rows=[
+                _row(1, "adjacent chunk"),
+                _row(2, "another chunk"),
+            ]
+        )
         source = _make_source(ns, files=NoFileFakeFiles())
         primary = Chunk(content="seed", metadata=(("_tpuf_id", 99),))
         results = source.search_related(primary, ["query"], top_k=5)
@@ -258,9 +254,7 @@ class TestMinimalRowAttributes:
         """Customer row has extra fields not in standard schema."""
         ns = FakeNamespace()
         source = _make_source(ns)
-        row = SimpleNamespace(
-            id=1, content="text", custom_tag="important", priority=5
-        )
+        row = SimpleNamespace(id=1, content="text", custom_tag="important", priority=5)
         chunk = source._client.row_to_chunk(row)
         assert chunk.get_metadata("custom_tag") == "important"
         assert chunk.get_metadata("priority") == 5

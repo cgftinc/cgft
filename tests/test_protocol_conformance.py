@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from cgft.chunkers.models import Chunk
+from cgft.corpus.pinecone.source import PineconeChunkSource
 from cgft.corpus.search_schema.search_types import SearchCapabilities, SearchSpec
 from cgft.corpus.source import ChunkSource
 
@@ -52,20 +55,27 @@ class StubChunkSource:
         mode=None,
         hybrid=None,
     ) -> list[dict]:
-        return [
-            {
-                "chunk": self._CHUNK,
-                "queries": queries[:1],
-                "same_file": False,
-                "max_score": 0.5,
-            }
-        ] if queries else []
+        return (
+            [
+                {
+                    "chunk": self._CHUNK,
+                    "queries": queries[:1],
+                    "same_file": False,
+                    "max_score": 0.5,
+                }
+            ]
+            if queries
+            else []
+        )
 
     def search(self, spec: SearchSpec) -> list[Chunk]:
         return [self._CHUNK]
 
     def search_content(self, spec: SearchSpec) -> list[str]:
         return ["stub content"]
+
+    def embed_query(self, text: str) -> list[float] | None:
+        return [0.1, 0.2, 0.3]
 
     def search_text(
         self,
@@ -94,7 +104,7 @@ class StubChunkSource:
 _stub = StubChunkSource()
 
 
-class TestProtocolConformance:
+class TestStubProtocolConformance:
     def test_isinstance_check(self):
         assert isinstance(_stub, ChunkSource)
 
@@ -108,9 +118,7 @@ class TestProtocolConformance:
         assert "graph_expansion" in caps
 
     def test_search_related_shape(self):
-        result = _stub.search_related(
-            StubChunkSource._CHUNK, ["test query"], top_k=3
-        )
+        result = _stub.search_related(StubChunkSource._CHUNK, ["test query"], top_k=3)
         assert isinstance(result, list)
         for item in result:
             assert "chunk" in item
@@ -145,3 +153,175 @@ class TestProtocolConformance:
         result = _stub.get_top_level_chunks()
         assert isinstance(result, list)
         assert all(isinstance(c, Chunk) for c in result)
+
+
+# ---------------------------------------------------------------------------
+# PineconeChunkSource protocol conformance (via fakes)
+# ---------------------------------------------------------------------------
+
+
+def _fake_pinecone_source() -> PineconeChunkSource:
+    """Build a PineconeChunkSource with fakes injected, no real Pinecone."""
+
+    class FakeIndex:
+        def query(self, **kw):
+            return SimpleNamespace(
+                matches=[
+                    SimpleNamespace(
+                        id="1",
+                        metadata={
+                            "content": "pinecone chunk",
+                            "file_path": "pc.md",
+                            "chunk_index": 0,
+                        },
+                        score=0.9,
+                    ),
+                    SimpleNamespace(
+                        id="2",
+                        metadata={
+                            "content": "second chunk",
+                            "file_path": "pc2.md",
+                            "chunk_index": 0,
+                        },
+                        score=0.8,
+                    ),
+                ]
+            )
+
+        def describe_index_stats(self):
+            return SimpleNamespace(dimension=3)
+
+    class FakeFiles:
+        def check(self):
+            return True
+
+        @staticmethod
+        def chunk_file_path(chunk):
+            return chunk.get_metadata("file_path") or None
+
+        @staticmethod
+        def chunk_index(chunk):
+            val = chunk.get_metadata("chunk_index")
+            return int(val) if val is not None else None
+
+        def get_file_chunks(self, _path):
+            return []
+
+        def get_all_file_paths(self):
+            return ["pc.md"]
+
+        def invalidate(self):
+            pass
+
+    class FakeClient:
+        def __init__(self):
+            self._index = FakeIndex()
+            self.embed_fn = lambda texts: [[0.1, 0.2, 0.3]] * len(texts)
+            self._field_mapping = {"content": "content", "file_path": "file_path"}
+            self._reverse_mapping = {"content": "content", "file_path": "file_path"}
+            self._vector_dim = 3
+
+        def query(self, **kw):
+            return self._index.query(**kw)
+
+        def _pc_field(self, name):
+            return self._reverse_mapping.get(name, name)
+
+        def _internal_field(self, name):
+            return self._field_mapping.get(name, name)
+
+        def zero_vector(self):
+            return [0.0] * self._vector_dim
+
+        def match_content(self, match):
+            return str((getattr(match, "metadata", {}) or {}).get("content", ""))
+
+        def match_to_chunk(self, match):
+            meta = getattr(match, "metadata", {}) or {}
+            content = str(meta.get("content", ""))
+            attrs = {k: v for k, v in meta.items() if k != "content"}
+            attrs["_pinecone_id"] = match.id
+            return Chunk(content=content, metadata=tuple(attrs.items()))
+
+    source = PineconeChunkSource.__new__(PineconeChunkSource)
+    source._client = FakeClient()
+    source._files = FakeFiles()
+    source._search_capabilities = {
+        "backend": "pinecone",
+        "modes": {"vector"},
+        "filter_ops": {"field": {"eq", "in", "gte", "lte"}, "logical": {"and", "or", "not"}},
+        "ranking": {"cosine"},
+        "constraints": {"max_top_k": 10000, "vector_dimensions": None},
+        "graph_expansion": False,
+    }
+    return source
+
+
+_pc_source = _fake_pinecone_source()
+_PC_CHUNK = Chunk(
+    content="pinecone chunk",
+    metadata=(("file_path", "pc.md"), ("chunk_index", 0), ("_pinecone_id", "src-99")),
+)
+
+
+class TestPineconeProtocolConformance:
+    def test_isinstance_check(self):
+        assert isinstance(_pc_source, ChunkSource)
+
+    def test_capabilities_keys(self):
+        caps = _pc_source.get_search_capabilities()
+        assert "backend" in caps
+        assert "modes" in caps
+        assert "filter_ops" in caps
+        assert "ranking" in caps
+        assert "constraints" in caps
+        assert "graph_expansion" in caps
+
+    def test_capabilities_vector_only(self):
+        caps = _pc_source.get_search_capabilities()
+        assert caps["backend"] == "pinecone"
+        assert "vector" in caps["modes"]
+        assert "lexical" not in caps["modes"]
+
+    def test_search_related_shape(self):
+        result = _pc_source.search_related(_PC_CHUNK, ["test query"], top_k=3)
+        assert isinstance(result, list)
+        assert len(result) > 0, "search_related should return results (not vacuously empty)"
+        for item in result:
+            assert "chunk" in item
+            assert "queries" in item
+            assert "same_file" in item
+            assert "max_score" in item
+            assert isinstance(item["chunk"], Chunk)
+
+    def test_get_chunk_with_context_shape(self):
+        ctx = _pc_source.get_chunk_with_context(_PC_CHUNK)
+        assert "chunk_content" in ctx
+        assert "prev_chunk_preview" in ctx
+        assert "next_chunk_preview" in ctx
+
+    def test_search_returns_chunks(self):
+        spec = SearchSpec(mode="vector", top_k=5, vector_query=[0.1, 0.2, 0.3])
+        result = _pc_source.search(spec)
+        assert isinstance(result, list)
+        assert all(isinstance(c, Chunk) for c in result)
+
+    def test_search_content_returns_strings(self):
+        spec = SearchSpec(mode="vector", top_k=5, vector_query=[0.1, 0.2, 0.3])
+        result = _pc_source.search_content(spec)
+        assert isinstance(result, list)
+        assert all(isinstance(r, str) for r in result)
+
+    def test_search_text_returns_chunks(self):
+        result = _pc_source.search_text("test", top_k=5)
+        assert isinstance(result, list)
+        assert all(isinstance(c, Chunk) for c in result)
+
+    def test_embed_query_returns_vector(self):
+        result = _pc_source.embed_query("test")
+        assert isinstance(result, list)
+        assert all(isinstance(v, float) for v in result)
+
+    def test_get_top_level_returns_chunks(self):
+        result = _pc_source.get_top_level_chunks()
+        assert isinstance(result, list)

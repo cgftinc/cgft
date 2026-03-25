@@ -79,9 +79,7 @@ class TestLogicalPredicates:
         assert result == ["Or", [["x", "Eq", "foo"], ["y", "Eq", "bar"]]]
 
     def test_not(self):
-        pred = NotPredicate(
-            clause=FieldPredicate(field="z", op="eq", value="deleted")
-        )
+        pred = NotPredicate(clause=FieldPredicate(field="z", op="eq", value="deleted"))
         result = to_turbopuffer_filters(pred, _TPUF_CAPS)
         assert result == ["Not", ["z", "Eq", "deleted"]]
 

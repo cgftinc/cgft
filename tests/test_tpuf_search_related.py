@@ -39,11 +39,7 @@ class FileAwareFakeFiles:
 
     @staticmethod
     def chunk_file_path(chunk: Chunk) -> str | None:
-        return (
-            chunk.get_metadata("file_path")
-            or chunk.get_metadata("file")
-            or None
-        )
+        return chunk.get_metadata("file_path") or chunk.get_metadata("file") or None
 
     @staticmethod
     def chunk_index(chunk: Chunk) -> int | None:
@@ -137,9 +133,11 @@ def _make_source(
 
 class TestSkipSourceChunk:
     def test_skips_by_tpuf_id(self):
-        ns = FakeNamespace(rows_per_call=[
-            [_row(10, "source"), _row(20, "other")],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [_row(10, "source"), _row(20, "other")],
+            ]
+        )
         source = _make_source(ns)
         primary = Chunk(content="source", metadata=(("_tpuf_id", 10),))
         results = source.search_related(primary, ["query"], top_k=5)
@@ -147,9 +145,11 @@ class TestSkipSourceChunk:
         assert results[0]["chunk"].content == "other"
 
     def test_skips_by_content_match(self):
-        ns = FakeNamespace(rows_per_call=[
-            [_row(10, "same content"), _row(20, "different")],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [_row(10, "same content"), _row(20, "different")],
+            ]
+        )
         source = _make_source(ns)
         primary = Chunk(content="same content", metadata=())
         results = source.search_related(primary, ["query"], top_k=5)
@@ -159,13 +159,15 @@ class TestSkipSourceChunk:
 
 class TestNeighborSkip:
     def test_skips_adjacent_same_file(self):
-        ns = FakeNamespace(rows_per_call=[
-            [
-                _row(1, "adj prev", file_path="a.md", chunk_index=0),
-                _row(2, "adj next", file_path="a.md", chunk_index=2),
-                _row(3, "far away", file_path="a.md", chunk_index=5),
-            ],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [
+                    _row(1, "adj prev", file_path="a.md", chunk_index=0),
+                    _row(2, "adj next", file_path="a.md", chunk_index=2),
+                    _row(3, "far away", file_path="a.md", chunk_index=5),
+                ],
+            ]
+        )
         source = _make_source(ns, files=FileAwareFakeFiles())
         primary = Chunk(
             content="source",
@@ -176,9 +178,11 @@ class TestNeighborSkip:
         assert results[0]["chunk"].content == "far away"
 
     def test_includes_non_adjacent_same_file(self):
-        ns = FakeNamespace(rows_per_call=[
-            [_row(5, "far chunk", file_path="a.md", chunk_index=10)],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [_row(5, "far chunk", file_path="a.md", chunk_index=10)],
+            ]
+        )
         source = _make_source(ns, files=FileAwareFakeFiles())
         primary = Chunk(
             content="source",
@@ -190,10 +194,12 @@ class TestNeighborSkip:
 
 class TestDedup:
     def test_deduplicates_by_row_id(self):
-        ns = FakeNamespace(rows_per_call=[
-            [_row(1, "dup")],
-            [_row(1, "dup")],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [_row(1, "dup")],
+                [_row(1, "dup")],
+            ]
+        )
         source = _make_source(ns)
         primary = Chunk(content="source", metadata=(("_tpuf_id", 99),))
         results = source.search_related(primary, ["q1", "q2"], top_k=5)
@@ -203,10 +209,12 @@ class TestDedup:
 
 class TestSorting:
     def test_more_queries_sorts_higher(self):
-        ns = FakeNamespace(rows_per_call=[
-            [_row(1, "multi"), _row(2, "single")],
-            [_row(1, "multi")],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [_row(1, "multi"), _row(2, "single")],
+                [_row(1, "multi")],
+            ]
+        )
         source = _make_source(ns)
         primary = Chunk(content="source", metadata=(("_tpuf_id", 99),))
         results = source.search_related(primary, ["q1", "q2"], top_k=5)
@@ -214,12 +222,14 @@ class TestSorting:
         assert len(results[0]["queries"]) == 2
 
     def test_cross_file_sorts_above_same_file(self):
-        ns = FakeNamespace(rows_per_call=[
-            [
-                _row(1, "same file", file_path="a.md", chunk_index=5),
-                _row(2, "cross file", file_path="b.md", chunk_index=0),
-            ],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [
+                    _row(1, "same file", file_path="a.md", chunk_index=5),
+                    _row(2, "cross file", file_path="b.md", chunk_index=0),
+                ],
+            ]
+        )
         source = _make_source(ns, files=FileAwareFakeFiles())
         primary = Chunk(
             content="source",
@@ -234,12 +244,14 @@ class TestSorting:
 
 class TestSameFileDetection:
     def test_same_file_flag(self):
-        ns = FakeNamespace(rows_per_call=[
-            [
-                _row(1, "same", file_path="a.md", chunk_index=5),
-                _row(2, "diff", file_path="b.md", chunk_index=0),
-            ],
-        ])
+        ns = FakeNamespace(
+            rows_per_call=[
+                [
+                    _row(1, "same", file_path="a.md", chunk_index=5),
+                    _row(2, "diff", file_path="b.md", chunk_index=0),
+                ],
+            ]
+        )
         source = _make_source(ns, files=FileAwareFakeFiles())
         primary = Chunk(
             content="source",

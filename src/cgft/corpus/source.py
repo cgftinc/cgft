@@ -16,17 +16,18 @@ if TYPE_CHECKING:
     from cgft.chunkers.models import Chunk, ChunkCollection
 
 
-
 @runtime_checkable
 class ChunkSource(Protocol):
     """Protocol for corpus backends that supply chunks for QA generation.
 
     Abstracts away how chunks are stored and searched, allowing pipeline code
-    to generalize across local storage + Corpora, Turbopuffer, or any other backend.
+    to generalize across different backends and retrieval modes (BM25, vector,
+    hybrid).
 
     Implementations:
-        CorporaChunkSource: chunks stored locally + uploaded to Corpora API for BM25 search
-        TpufChunkSource: chunks stored and searched in Turbopuffer
+        CorporaChunkSource: chunks stored locally + uploaded to Corpora API (BM25)
+        TpufChunkSource: chunks stored and searched in Turbopuffer (BM25/vector/hybrid)
+        PineconeChunkSource: chunks stored and searched in Pinecone (vector only)
     """
 
     def populate_from_folder(
@@ -44,13 +45,12 @@ class ChunkSource(Protocol):
 
     def populate_from_chunks(
         self,
-        collection: "ChunkCollection",
+        collection: ChunkCollection,
         batch_size: int = 100,
         show_summary: bool = True,
     ) -> None:
-        """Upload a pre-built ChunkCollection to the Corpora API.
-        """
-
+        """Upload a pre-built ChunkCollection to the backend corpus."""
+        ...
 
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
         """Return n randomly sampled chunks, filtered by minimum character length."""
@@ -79,7 +79,11 @@ class ChunkSource(Protocol):
         mode: SearchMode | None = None,
         hybrid: HybridOptions | None = None,
     ) -> list[dict]:
-        """Search for chunks related to source using BM25 queries.
+        """Search for chunks related to *source* using the backend's best mode.
+
+        Each query string is used for retrieval (BM25, vector, or hybrid
+        depending on backend capabilities).  Deduplicates results across
+        queries and skips the source chunk and adjacent neighbors.
 
         Returns:
             List of dicts with keys: chunk, queries, same_file, max_score.
@@ -89,6 +93,19 @@ class ChunkSource(Protocol):
 
     def search(self, spec: SearchSpec) -> list[Chunk]:
         """Search for chunks using a structured search spec."""
+        ...
+
+    def search_content(self, spec: SearchSpec) -> list[str]:
+        """Search and return content strings without Chunk construction.
+
+        Cloudpickle-safe alternative to ``search()`` for use in remote
+        training environments where Pydantic models may not survive
+        pickle roundtripping.
+        """
+        ...
+
+    def embed_query(self, text: str) -> list[float] | None:
+        """Return an embedding vector for *text*, or ``None`` if unsupported."""
         ...
 
     def search_text(

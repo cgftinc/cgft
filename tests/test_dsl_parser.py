@@ -23,35 +23,31 @@ class TestFieldPredicate:
         assert result.value == 1
 
     def test_value_is_list(self):
-        result = dsl_to_predicate(
-            {"field": "tags", "op": "in", "value": ["a", "b"]}
-        )
+        result = dsl_to_predicate({"field": "tags", "op": "in", "value": ["a", "b"]})
         assert isinstance(result, FieldPredicate)
         assert result.value == ["a", "b"]
 
 
 class TestLogicalPredicates:
     def test_and(self):
-        result = dsl_to_predicate(
-            {"and": [{"field": "a", "op": "eq", "value": 1}]}
-        )
+        result = dsl_to_predicate({"and": [{"field": "a", "op": "eq", "value": 1}]})
         assert isinstance(result, AndPredicate)
         assert len(result.clauses) == 1
 
     def test_or(self):
         result = dsl_to_predicate(
-            {"or": [
-                {"field": "x", "op": "eq", "value": "foo"},
-                {"field": "y", "op": "eq", "value": "bar"},
-            ]}
+            {
+                "or": [
+                    {"field": "x", "op": "eq", "value": "foo"},
+                    {"field": "y", "op": "eq", "value": "bar"},
+                ]
+            }
         )
         assert isinstance(result, OrPredicate)
         assert len(result.clauses) == 2
 
     def test_not(self):
-        result = dsl_to_predicate(
-            {"not": {"field": "x", "op": "eq", "value": "deleted"}}
-        )
+        result = dsl_to_predicate({"not": {"field": "x", "op": "eq", "value": "deleted"}})
         assert isinstance(result, NotPredicate)
         assert isinstance(result.clause, FieldPredicate)
 
@@ -60,10 +56,12 @@ class TestLogicalPredicates:
             {
                 "and": [
                     {"field": "type", "op": "eq", "value": "doc"},
-                    {"or": [
-                        {"field": "lang", "op": "eq", "value": "en"},
-                        {"field": "lang", "op": "eq", "value": "fr"},
-                    ]},
+                    {
+                        "or": [
+                            {"field": "lang", "op": "eq", "value": "en"},
+                            {"field": "lang", "op": "eq", "value": "fr"},
+                        ]
+                    },
                 ]
             }
         )
@@ -92,9 +90,7 @@ class TestEdgeCases:
         assert dsl_to_predicate({"not": None}) is None
 
     def test_and_filters_none_children(self):
-        result = dsl_to_predicate(
-            {"and": [None, {"field": "x", "op": "eq", "value": 1}]}
-        )
+        result = dsl_to_predicate({"and": [None, {"field": "x", "op": "eq", "value": 1}]})
         assert isinstance(result, AndPredicate)
         assert len(result.clauses) == 1
         assert result.clauses[0].field == "x"
@@ -124,11 +120,7 @@ class TestRoundTrip:
         assert isinstance(parsed, AndPredicate)
         assert len(parsed.clauses) == 2
         # First clause: field eq
-        assert parsed.clauses[0] == FieldPredicate(
-            field="file", op="eq", value="guide.md"
-        )
+        assert parsed.clauses[0] == FieldPredicate(field="file", op="eq", value="guide.md")
         # Second clause: not(field gte)
         assert isinstance(parsed.clauses[1], NotPredicate)
-        assert parsed.clauses[1].clause == FieldPredicate(
-            field="index", op="gte", value=5
-        )
+        assert parsed.clauses[1].clause == FieldPredicate(field="index", op="gte", value=5)
