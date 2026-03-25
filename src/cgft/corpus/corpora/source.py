@@ -97,7 +97,9 @@ class CorporaChunkSource:
         if show_summary:
             print(f"Chunking documents from {docs_path}...")
 
-        chunker = MarkdownChunker(min_char=min_chars, max_char=max_chars, chunk_overlap=overlap_chars)
+        chunker = MarkdownChunker(
+            min_char=min_chars, max_char=max_chars, chunk_overlap=overlap_chars
+        )
         collection = chunker.chunk_folder(docs_path, file_extensions=file_extensions)
 
         if show_summary:
@@ -345,6 +347,15 @@ class CorporaChunkSource:
         return self.search(
             SearchSpec(mode="lexical", text_query=text_query, top_k=top_k, filter=filter)
         )
+
+    def search_content(self, spec: SearchSpec) -> list[str]:
+        """Search and return content strings without Chunk construction."""
+        chunks = self.search(spec)
+        return [chunk.content for chunk in chunks]
+
+    def embed_query(self, text: str) -> list[float] | None:
+        """Return ``None`` — Corpora backend has no embedding support."""
+        return None
 
     def get_search_capabilities(self) -> SearchCapabilities:
         """Return search capabilities for Corpora backend."""

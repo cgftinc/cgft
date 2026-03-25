@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from .cgft_models import EntityExtractionConfig
 
 
-def _best_search_mode(source: Any) -> str:
+def best_search_mode(source: Any) -> str:
     """Return the best search mode for *source*.
 
     Checks ``get_search_capabilities()`` when available. Falls back to
@@ -49,7 +49,7 @@ def generate_search_queries(
     ``source`` reference can still call the lower-level functions
     directly.
     """
-    mode = _best_search_mode(source) if source else "lexical"
+    mode = best_search_mode(source) if source else "lexical"
 
     if entity_extraction is not None:
         queries = generate_bm25_queries_from_extraction(chunk, entity_extraction, n)
@@ -251,7 +251,10 @@ def select_anchor_bundle_with_enrichment(
         else generate_search_queries(primary_chunk, bm25_enrichment_queries, source=source)
     )
     bm25_related = source.search_related(
-        primary_chunk, queries, top_k=bm25_enrichment_top_k, mode=search_mode,
+        primary_chunk,
+        queries,
+        top_k=bm25_enrichment_top_k,
+        mode=search_mode,
     )
     if filter_same_file:
         primary_file = _get_chunk_file(primary_chunk)

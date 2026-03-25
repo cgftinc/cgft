@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from .anchor_selector import AnchorBundle, AnchorSelector
 from .anchor_utils import (
-    _best_search_mode,
+    best_search_mode,
     generate_search_queries,
     select_anchor_bundle_with_enrichment,
 )
@@ -305,7 +305,10 @@ class LLMGuidedChunkLinker:
             )
 
         search_results = self.source.search_related(
-            primary_chunk, queries, top_k=self.top_k_bm25, mode=self.search_mode,
+            primary_chunk,
+            queries,
+            top_k=self.top_k_bm25,
+            mode=self.search_mode,
         )
         secondary_chunks = [r["chunk"] for r in search_results[: self.top_related_chunks]]
 
@@ -410,7 +413,7 @@ class AdaptiveChunkLinker:
         """
         # Auto-select prompt based on source capabilities
         if system_prompt is None:
-            mode = _best_search_mode(source)
+            mode = best_search_mode(source)
             if mode == "vector":
                 system_prompt = RELATED_CHUNK_VECTOR_SYSTEM_PROMPT
             else:

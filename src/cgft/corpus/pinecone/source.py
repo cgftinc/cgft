@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import random
+import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -21,6 +23,8 @@ from cgft.corpus.search_schema.search_types import (
 from .files import FileAwareness
 from .filter_mapper import to_pinecone_filters
 from .index_client import PineconeIndexClient
+
+logger = logging.getLogger(__name__)
 
 
 class PineconeChunkSource:
@@ -145,6 +149,14 @@ class PineconeChunkSource:
         from cgft.chunkers.inspector import ChunkInspector
         from cgft.chunkers.markdown import MarkdownChunker
 
+        if embed_fn is not None:
+            warnings.warn(
+                "PineconeChunkSource.populate_from_folder: embed_fn argument "
+                "is ignored — the instance-level embed_fn is always used.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if file_extensions is None:
             file_extensions = [".md", ".mdx"]
 
@@ -203,11 +215,9 @@ class PineconeChunkSource:
         Uses a random vector query to get pseudo-random results
         efficiently in a single API call.
         """
-        # Generate a random unit vector for pseudo-random sampling
-        import numpy as np
-
+        # Generate a random vector for pseudo-random sampling
         dim = len(self._client.zero_vector())
-        rand_vec = np.random.randn(dim).tolist()
+        rand_vec = [random.gauss(0, 1) for _ in range(dim)]
 
         # Fetch more than needed to allow for min_chars filtering
         fetch_k = min(n * 3, 10000) if min_chars > 0 else min(n, 10000)
@@ -303,12 +313,24 @@ class PineconeChunkSource:
     # Search
     # ------------------------------------------------------------------
 
-    def search_related(self, source: Chunk, queries: list[str], top_k: int = 5) -> list[dict]:
+    def search_related(
+        self,
+        source: Chunk,
+        queries: list[str],
+        top_k: int = 5,
+        mode: str | None = None,
+        hybrid: dict | None = None,
+    ) -> list[dict]:
         """Search for chunks related to *source* using vector queries.
 
         Each query string is embedded and used for ANN search.
         Deduplicates by vector ID, skips the source chunk and adjacent
         neighbors when file-structure metadata is available.
+
+        Args:
+            mode: Accepted for protocol compatibility but ignored —
+                Pinecone always uses vector search.
+            hybrid: Accepted for protocol compatibility but ignored.
 
         Returns:
             List of dicts sorted by relevance, each containing:
@@ -433,7 +455,7 @@ class PineconeChunkSource:
         result = self._client.query(**query_kwargs)
         return [self._client.match_content(match) for match in (result.matches or [])]
 
-    def embed_query(self, text: str) -> list[float]:
+    def embed_query(self, text: str) -> list[float] | None:
         """Return an embedding vector for *text*."""
         return self._client.embed_fn([text])[0]
 

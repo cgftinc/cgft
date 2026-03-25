@@ -93,17 +93,23 @@ class PineconeIndexClient:
     def _build_pinecone_embed_fn(self) -> Callable[[list[str]], list[list[float]]]:
         """Build an embed_fn using Pinecone's hosted Inference API.
 
-        Includes retry with exponential backoff for rate limits (429).
+        The Pinecone client is created once (lazily on first call) and
+        reused for all subsequent embed calls.  Includes retry with
+        exponential backoff for rate limits (429).
         """
         import time as _time
 
         api_key = self._api_key
         model = self._embed_model
+        _pc_cache: list = []  # lazy singleton — avoids creating client on init
 
         def embed_fn(texts: list[str]) -> list[list[float]]:
-            from pinecone import Pinecone
+            if not _pc_cache:
+                from pinecone import Pinecone
 
-            pc = Pinecone(api_key=api_key)
+                _pc_cache.append(Pinecone(api_key=api_key))
+            pc = _pc_cache[0]
+
             max_retries = 5
             for attempt in range(max_retries):
                 try:
@@ -115,7 +121,7 @@ class PineconeIndexClient:
                     return [item.values for item in result.data]
                 except Exception as exc:
                     if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
-                        wait = 2 ** attempt
+                        wait = 2**attempt
                         print(
                             f"Rate limited, retrying in {wait}s"
                             f" (attempt {attempt + 1}/{max_retries})..."

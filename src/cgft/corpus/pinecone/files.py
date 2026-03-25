@@ -129,7 +129,10 @@ class FileAwareness:
         zero_vec = self._client.zero_vector()
         fp_key = self._client._pc_field("file_path")
 
-        # Pull up to 10000 results (Pinecone max) in one query.
+        # Pull up to 10000 results (Pinecone max top_k) in one query.
+        # Indexes with >10K vectors may miss some file paths here.
+        # This trades completeness for speed — a full pagination would
+        # require list_paginated + fetch, which is very slow at scale.
         result = self._client.query(
             vector=zero_vec,
             top_k=10000,

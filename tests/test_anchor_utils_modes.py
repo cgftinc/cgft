@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from cgft.chunkers.models import Chunk
 from cgft.qa_generation.anchor_utils import (
-    _best_search_mode,
+    best_search_mode,
     generate_search_queries,
     generate_vector_queries,
 )
@@ -20,19 +20,19 @@ class _FakeSource:
 
 class TestBestSearchMode:
     def test_no_capabilities(self):
-        assert _best_search_mode(object()) == "lexical"
+        assert best_search_mode(object()) == "lexical"
 
     def test_lexical_only(self):
-        assert _best_search_mode(_FakeSource({"lexical"})) == "lexical"
+        assert best_search_mode(_FakeSource({"lexical"})) == "lexical"
 
     def test_vector_only(self):
-        assert _best_search_mode(_FakeSource({"vector"})) == "vector"
+        assert best_search_mode(_FakeSource({"vector"})) == "vector"
 
     def test_hybrid_preferred(self):
-        assert _best_search_mode(_FakeSource({"lexical", "vector", "hybrid"})) == "hybrid"
+        assert best_search_mode(_FakeSource({"lexical", "vector", "hybrid"})) == "hybrid"
 
     def test_none_source(self):
-        assert _best_search_mode(None) == "lexical"
+        assert best_search_mode(None) == "lexical"
 
 
 class TestGenerateSearchQueries:
