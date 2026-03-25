@@ -18,6 +18,7 @@ The train() function handles everything automatically:
 - Returns the experiment ID
 
 For more control, you can use the lower-level functions:
+- validate_env_only() - Validate environment without launching a training job
 - upload_dataset() - Upload a list of dicts as JSONL
 - upload_env() - Bundle and upload environment class
 - launch_job() - Launch from pre-uploaded paths
@@ -339,3 +340,127 @@ def train(
         print(f"View experiment: {base_url}/experiments/{experiment_id}")
 
     return experiment_id
+
+
+def validate_env_only(
+    env_class: type,
+    env_args: dict[str, Any],
+    eval_dataset: list[dict],
+    api_key: str,
+    base_url: str = "https://app.cgft.io",
+    prefix: str = "validate",
+    pip_dependencies: list[str] | None = None,
+    local_modules: list | None = None,
+    validate_locally: bool = True,
+    validate_remotely: bool = True,
+    show_summary: bool = True,
+) -> bool:
+    """Validate an environment without launching a training job.
+
+    Runs the same validation steps as ``train()`` — local bundle
+    validation and remote rollout server validation — but stops before
+    uploading datasets or launching the experiment.
+
+    Use this to verify your environment works before committing to a
+    full training run.
+
+    Args:
+        env_class: Environment class to validate.
+        env_args: Constructor arguments for the environment.
+        eval_dataset: Eval examples used for remote validation.
+        api_key: CGFT API key.
+        base_url: CGFT API base URL.
+        prefix: Upload path prefix (default: ``"validate"``).
+        pip_dependencies: Pip dependencies for the environment.
+        local_modules: Local modules to include in the bundle.
+        validate_locally: Run local pickle/structure validation.
+        validate_remotely: Run remote rollout server validation.
+        show_summary: Print progress.
+
+    Returns:
+        True if all requested validations pass, False otherwise.
+    """
+    from benchmax.bundle.bundler import bundle_env, write_bundle_files
+    from benchmax.bundle.validator import validate_bundle
+
+    if pip_dependencies is None:
+        pip_dependencies = []
+    if local_modules is None:
+        local_modules = []
+
+    env_module = sys.modules.get(env_class.__module__)
+    if env_module and env_module not in local_modules:
+        local_modules.append(env_module)
+
+    if show_summary:
+        print(f"Bundling {env_class.__name__}...")
+
+    bundle = bundle_env(
+        env_class,
+        pip_dependencies=pip_dependencies,
+        local_modules=local_modules,
+        constructor_args=env_args,
+    )
+
+    if show_summary:
+        print(f"  Pickled class: {len(bundle.pickled_class) / 1024:.2f} KB")
+        print(f"  Dependencies: {bundle.metadata.pip_dependencies}")
+
+    # --- Local validation ---
+    if validate_locally:
+        if show_summary:
+            print(f"\nLocal validation (pickle roundtrip + structure)...")
+
+        warnings = validate_bundle(bundle, constructor_args=env_args)
+        if warnings:
+            print(f"  Warnings: {warnings}")
+            return False
+        if show_summary:
+            print("  Local validation PASSED")
+
+    # --- Remote validation ---
+    if validate_remotely:
+        if show_summary:
+            print(f"\nRemote validation (rollout server)...")
+
+        # Upload env temporarily
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            pickle_path = tmp_path / "env-cls.pkl"
+            metadata_path = tmp_path / "env-metadata.json"
+            write_bundle_files(bundle, pickle_path, metadata_path)
+            env_cls_bytes = pickle_path.read_bytes()
+            env_meta_bytes = metadata_path.read_bytes()
+
+        content_hash = hashlib.sha256(env_cls_bytes + env_meta_bytes).hexdigest()[:8]
+        storage_client = StorageClient(api_key=api_key, base_url=base_url)
+
+        env_path = f"envs/{prefix}/{content_hash}/env-cls.pkl"
+        env_result = storage_client.upload_file(
+            path=env_path,
+            content=env_cls_bytes,
+            mime_type="application/octet-stream",
+        )
+        env_meta_path = f"envs/{prefix}/{content_hash}/env-metadata.json"
+        env_meta_result = storage_client.upload_file(
+            path=env_meta_path,
+            content=env_meta_bytes,
+            mime_type="application/json",
+        )
+
+        rollout_client = RolloutClient(api_key=api_key)
+        passed = rollout_client.validate_examples(
+            examples=eval_dataset,
+            env_cls_path=env_result["blobPath"],
+            env_metadata_path=env_meta_result["blobPath"],
+        )
+        if not passed:
+            if show_summary:
+                print("  Remote validation FAILED")
+            return False
+        if show_summary:
+            print("  Remote validation PASSED")
+
+    if show_summary:
+        print(f"\nAll validations passed for {env_class.__name__}!")
+    return True
