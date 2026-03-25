@@ -1,7 +1,11 @@
 """PineconeIndexClient — low-level Pinecone SDK wrapper.
 
-Handles query building, row ↔ Chunk conversion, batch upsert, and ID
-pagination.  Used by ``PineconeChunkSource`` so the source module stays thin.
+Handles query building, batch upsert, and ID pagination.  Used by both
+``PineconeChunkSource`` (data prep) and ``PineconeSearch`` (RL env).
+
+**No Chunk / Pydantic imports.**  All methods accept and return plain
+Python types (dicts, lists, strings).  Chunk conversion is handled by
+the source layer.
 
 Pickle safety: the Pinecone ``Index`` object is created lazily on first use,
 so only serializable config (api_key, index_name, etc.) is stored.
@@ -14,8 +18,6 @@ from collections.abc import Callable
 from typing import Any
 
 from tqdm.auto import tqdm
-
-from cgft.chunkers.models import Chunk, ChunkCollection
 
 #: Default mapping from Pinecone metadata keys → internal field names.
 #: Used when no ``field_mapping`` is provided to :class:`PineconeIndexClient`.
@@ -181,7 +183,7 @@ class PineconeIndexClient:
         return self._field_mapping.get(pc_name, pc_name)
 
     # ------------------------------------------------------------------
-    # Row ↔ Chunk conversion
+    # Raw result conversion (no Chunk dependency)
     # ------------------------------------------------------------------
 
     def match_content(self, match: Any) -> str:
@@ -190,10 +192,12 @@ class PineconeIndexClient:
         content_key = self._pc_field("content")
         return str(metadata.get(content_key, ""))
 
-    def match_to_chunk(self, match: Any) -> Chunk:
-        """Convert a Pinecone query match to a :class:`Chunk`.
+    def match_to_raw(self, match: Any) -> dict[str, Any]:
+        """Convert a Pinecone query match to a plain dict.
 
-        Stores the Pinecone vector ID in metadata as ``_pinecone_id``.
+        Returns:
+            Dict with keys: ``id``, ``content``, ``metadata``, ``score``.
+            Metadata keys are mapped to internal field names.
         """
         metadata = getattr(match, "metadata", {}) or {}
         content_key = self._pc_field("content")
@@ -206,10 +210,15 @@ class PineconeIndexClient:
                 attrs[internal] = value
 
         attrs["_pinecone_id"] = match.id
-        return Chunk(content=content, metadata=tuple(attrs.items()))
+        return {
+            "id": match.id,
+            "content": content,
+            "metadata": attrs,
+            "score": getattr(match, "score", 0.0) or 0.0,
+        }
 
-    def _fetch_to_chunk(self, vec_id: str, vector_data: Any) -> Chunk:
-        """Convert a Pinecone fetch result entry to a :class:`Chunk`."""
+    def fetch_to_raw(self, vec_id: str, vector_data: Any) -> dict[str, Any]:
+        """Convert a Pinecone fetch result entry to a plain dict."""
         metadata = getattr(vector_data, "metadata", {}) or {}
         content_key = self._pc_field("content")
         content = str(metadata.get(content_key, ""))
@@ -221,68 +230,69 @@ class PineconeIndexClient:
                 attrs[internal] = value
 
         attrs["_pinecone_id"] = vec_id
-        return Chunk(content=content, metadata=tuple(attrs.items()))
+        return {
+            "id": vec_id,
+            "content": content,
+            "metadata": attrs,
+            "score": 0.0,
+        }
 
     # ------------------------------------------------------------------
     # Batch upsert
     # ------------------------------------------------------------------
 
-    def upsert_chunks(
+    def upsert_raw(
         self,
-        collection: ChunkCollection,
+        ids: list[str],
+        documents: list[str],
+        metadatas: list[dict[str, Any]],
         batch_size: int = 96,
         show_summary: bool = True,
     ) -> int:
-        """Upload a :class:`ChunkCollection` to the index.
+        """Upload raw documents to the index.
 
-        Uses deterministic IDs derived from chunk hashes, so re-populating
-        with the same content is idempotent (upsert overwrites existing
-        vectors with the same ID).  Does **not** delete existing data —
-        the index may contain vectors from prior runs or user data.
+        Accepts plain lists — no Chunk dependency.  Embedding is done
+        internally via ``embed_fn``.
 
-        Returns the total number of chunks written.
+        Returns the total number of documents written.
         """
         index = self._get_index()
-        all_chunks = list(collection)
 
         if show_summary:
-            print(f"\nUploading {len(all_chunks)} chunks to Pinecone index '{self._index_name}'...")
+            print(
+                f"\nUploading {len(documents)} chunks to Pinecone"
+                f" index '{self._index_name}'..."
+            )
 
         all_ids: list[str] = []
 
         for batch_start in tqdm(
-            range(0, len(all_chunks), batch_size),
+            range(0, len(documents), batch_size),
             desc="Uploading batches",
             disable=not show_summary,
         ):
-            batch = all_chunks[batch_start : batch_start + batch_size]
-            contents = [chunk.content for chunk in batch]
-            vectors = self.embed_fn(contents)
+            batch_docs = documents[batch_start : batch_start + batch_size]
+            batch_ids = ids[batch_start : batch_start + batch_size]
+            batch_metas = metadatas[batch_start : batch_start + batch_size]
+            vectors = self.embed_fn(batch_docs)
 
             upsert_batch: list[dict[str, Any]] = []
-            for i, chunk in enumerate(batch):
-                vec_id = chunk.hash or f"chunk-{batch_start + i + 1}"
+            for i, (vec_id, meta) in enumerate(zip(batch_ids, batch_metas)):
                 all_ids.append(vec_id)
-                metadata = {
-                    self._pc_field("content"): chunk.content,
-                    self._pc_field("file_path"): chunk.get_metadata("file", ""),
-                    self._pc_field("h1"): chunk.get_metadata("h1", ""),
-                    self._pc_field("h2"): chunk.get_metadata("h2", ""),
-                    self._pc_field("h3"): chunk.get_metadata("h3", ""),
-                    self._pc_field("chunk_index"): chunk.get_metadata("index", 0),
-                    self._pc_field("chunk_hash"): chunk.hash,
-                    self._pc_field("char_count"): len(chunk),
-                }
-                upsert_batch.append({"id": vec_id, "values": vectors[i], "metadata": metadata})
+                upsert_batch.append({
+                    "id": vec_id,
+                    "values": vectors[i],
+                    "metadata": meta,
+                })
 
             index.upsert(vectors=upsert_batch, namespace=self._namespace)
 
         self._known_ids = all_ids
 
         if show_summary:
-            print(f"\nUpload complete! {len(all_chunks)} chunks written to index.")
+            print(f"\nUpload complete! {len(documents)} chunks written to index.")
 
-        return len(all_chunks)
+        return len(documents)
 
     # ------------------------------------------------------------------
     # Query
@@ -342,15 +352,17 @@ class PineconeIndexClient:
         self._known_ids = all_ids
         return list(all_ids)
 
-    def fetch_by_ids(self, ids: list[str]) -> list[Chunk]:
-        """Fetch vectors by ID and convert to Chunks."""
+    def fetch_by_ids_raw(self, ids: list[str]) -> list[dict[str, Any]]:
+        """Fetch vectors by ID and return as plain dicts."""
         if not ids:
             return []
         index = self._get_index()
         response = index.fetch(ids=ids, namespace=self._namespace)
         vectors = response.vectors or {}
         return [
-            self._fetch_to_chunk(vid, vdata) for vid, vdata in vectors.items() if vdata is not None
+            self.fetch_to_raw(vid, vdata)
+            for vid, vdata in vectors.items()
+            if vdata is not None
         ]
 
     def sample_ids(self, n: int) -> list[str]:

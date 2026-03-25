@@ -160,7 +160,7 @@ class FakeClient:
         content_key = self._pc_field("content")
         return str(metadata.get(content_key, ""))
 
-    def match_to_chunk(self, match) -> Chunk:
+    def match_to_raw(self, match) -> dict:
         metadata = getattr(match, "metadata", {}) or {}
         content_key = self._pc_field("content")
         content = str(metadata.get(content_key, ""))
@@ -170,7 +170,12 @@ class FakeClient:
             if internal != "content":
                 attrs[internal] = v
         attrs["_pinecone_id"] = match.id
-        return Chunk(content=content, metadata=tuple(attrs.items()))
+        return {
+            "id": match.id,
+            "content": content,
+            "metadata": attrs,
+            "score": getattr(match, "score", 0.0) or 0.0,
+        }
 
 
 # ---------------------------------------------------------------------------

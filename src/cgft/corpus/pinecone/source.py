@@ -27,6 +27,14 @@ from .index_client import PineconeIndexClient
 logger = logging.getLogger(__name__)
 
 
+def _raw_to_chunk(raw: dict[str, Any]) -> Chunk:
+    """Convert a raw dict from PineconeIndexClient to a Chunk."""
+    return Chunk(
+        content=raw["content"],
+        metadata=tuple(raw["metadata"].items()),
+    )
+
+
 class PineconeChunkSource:
     """ChunkSource backed by a Pinecone index.
 
@@ -197,8 +205,26 @@ class PineconeChunkSource:
             batch_size: Number of chunks per upload batch (default 100).
             show_summary: Print upload progress (default True).
         """
-        self._client.upsert_chunks(
-            collection,
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict[str, Any]] = []
+        for chunk in collection:
+            ids.append(chunk.hash or f"chunk-{len(ids) + 1}")
+            documents.append(chunk.content)
+            metadatas.append({
+                self._client._pc_field("content"): chunk.content,
+                self._client._pc_field("file_path"): chunk.get_metadata("file", ""),
+                self._client._pc_field("h1"): chunk.get_metadata("h1", ""),
+                self._client._pc_field("h2"): chunk.get_metadata("h2", ""),
+                self._client._pc_field("h3"): chunk.get_metadata("h3", ""),
+                self._client._pc_field("chunk_index"): chunk.get_metadata("index", 0),
+                self._client._pc_field("chunk_hash"): chunk.hash,
+                self._client._pc_field("char_count"): len(chunk),
+            })
+        self._client.upsert_raw(
+            ids=ids,
+            documents=documents,
+            metadatas=metadatas,
             batch_size=batch_size,
             show_summary=show_summary,
         )
@@ -231,7 +257,7 @@ class PineconeChunkSource:
         if not matches:
             return []
 
-        chunks = [self._client.match_to_chunk(m) for m in matches]
+        chunks = [_raw_to_chunk(self._client.match_to_raw(m)) for m in matches]
 
         if min_chars > 0:
             chunks = [c for c in chunks if len(c.content) >= min_chars]
@@ -379,7 +405,7 @@ class PineconeChunkSource:
                     if self._client.match_content(match) == source.content:
                         continue
 
-                result_chunk = self._client.match_to_chunk(match)
+                result_chunk = _raw_to_chunk(self._client.match_to_raw(match))
 
                 # File-awareness: detect same-file, skip adjacent
                 is_same_file = False
@@ -460,7 +486,7 @@ class PineconeChunkSource:
         """Search chunks using a structured search spec."""
         query_kwargs = self._build_query_kwargs(spec)
         result = self._client.query(**query_kwargs)
-        return [self._client.match_to_chunk(match) for match in (result.matches or [])]
+        return [_raw_to_chunk(self._client.match_to_raw(m)) for m in (result.matches or [])]
 
     def search_content(self, spec: SearchSpec) -> list[str]:
         """Search and return content strings without Chunk construction.

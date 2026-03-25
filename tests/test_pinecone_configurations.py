@@ -199,17 +199,17 @@ class TestCustomFieldMapping:
 
 
 class TestMinimalRowAttributes:
-    def test_match_to_chunk_only_id_and_content(self):
+    def test_match_to_raw_only_id_and_content(self):
         """Customer index has only id + content, no file metadata."""
         source = make_source(FakeIndex())
         match = SimpleNamespace(id="42", metadata={"content": "just text"}, score=0.5)
-        chunk = source._client.match_to_chunk(match)
-        assert chunk.content == "just text"
-        assert chunk.get_metadata("_pinecone_id") == "42"
-        assert chunk.get_metadata("file_path") is None
-        assert chunk.get_metadata("chunk_index") is None
+        raw = source._client.match_to_raw(match)
+        assert raw["content"] == "just text"
+        assert raw["metadata"]["_pinecone_id"] == "42"
+        assert raw["metadata"].get("file_path") is None
+        assert raw["metadata"].get("chunk_index") is None
 
-    def test_match_to_chunk_extra_custom_fields(self):
+    def test_match_to_raw_extra_custom_fields(self):
         """Customer index has extra fields not in standard schema."""
         source = make_source(FakeIndex())
         match = SimpleNamespace(
@@ -217,9 +217,9 @@ class TestMinimalRowAttributes:
             metadata={"content": "text", "custom_tag": "important", "priority": 5},
             score=0.5,
         )
-        chunk = source._client.match_to_chunk(match)
-        assert chunk.get_metadata("custom_tag") == "important"
-        assert chunk.get_metadata("priority") == 5
+        raw = source._client.match_to_raw(match)
+        assert raw["metadata"]["custom_tag"] == "important"
+        assert raw["metadata"]["priority"] == 5
 
 
 # ---------------------------------------------------------------------------

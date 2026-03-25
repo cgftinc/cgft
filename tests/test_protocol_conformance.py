@@ -239,12 +239,17 @@ def _fake_pinecone_source() -> PineconeChunkSource:
         def match_content(self, match):
             return str((getattr(match, "metadata", {}) or {}).get("content", ""))
 
-        def match_to_chunk(self, match):
+        def match_to_raw(self, match):
             meta = getattr(match, "metadata", {}) or {}
             content = str(meta.get("content", ""))
             attrs = {k: v for k, v in meta.items() if k != "content"}
             attrs["_pinecone_id"] = match.id
-            return Chunk(content=content, metadata=tuple(attrs.items()))
+            return {
+                "id": match.id,
+                "content": content,
+                "metadata": attrs,
+                "score": getattr(match, "score", 0.0) or 0.0,
+            }
 
     source = PineconeChunkSource.__new__(PineconeChunkSource)
     source._client = FakeClient()
