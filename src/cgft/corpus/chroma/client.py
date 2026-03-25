@@ -77,7 +77,7 @@ class ChromaClient:
         self._collection: Any = None
         self._embed_dim: int | None = None
         self._total_count: int | None = None
-        self._search_api = has_search_api()
+        self.search_api = has_search_api()
 
         # Capabilities — may be downgraded on collection creation
         modes: set[str] = {"vector"}
@@ -120,7 +120,7 @@ class ChromaClient:
             kwargs["embedding_function"] = _WrapEmbedFn(self.embed_fn)
 
         created_with_schema = False
-        if self._search_api and self.enable_bm25 and self.is_client_server:
+        if self.search_api and self.enable_bm25 and self.is_client_server:
             try:
                 schema_kwargs = {**kwargs, "schema": self._build_schema()}
                 self._collection = client.get_or_create_collection(**schema_kwargs)

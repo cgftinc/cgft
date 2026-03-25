@@ -70,6 +70,11 @@ class PineconeSearch:
         top_k: int = 10,
     ) -> list[str]:
         """Search and return content strings."""
+        if mode not in ("auto", "vector"):
+            raise ValueError(
+                f"PineconeSearch only supports 'vector' mode, got '{mode}'. "
+                f"Pinecone does not support lexical/hybrid search."
+            )
         client = self._get_client()
         vec = client.embed_fn([query])[0]
         result = client.query(vector=vec, top_k=top_k)

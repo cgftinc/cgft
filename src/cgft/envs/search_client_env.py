@@ -12,18 +12,28 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
+from benchmax.envs.base_env import BaseEnv
 from benchmax.envs.tracking import log_env
-from benchmax.envs.types import ToolDefinition
+from benchmax.envs.types import StandardizedExample, ToolDefinition
 
 from cgft.corpus.search_client import SearchClient
 
-from .search_env import SearchEnv
-
 _ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 
+SYSTEM_PROMPT = """Please use the search tool provided to find relevant information from the corpus.
+Formulate effective search queries to retrieve the most relevant chunks.
+You can filter by metadata or filename to narrow your search.
+Write your complete answer on the final line only as a concise entity, within the xml tags <answer></answer>.
+"""
+MAX_TOOL_OUTPUT_CHARS = 10000
+TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated due to character limit]"
 
-class SearchClientEnv(SearchEnv):
+
+class SearchClientEnv(BaseEnv):
     """Backend-agnostic search environment using SearchClient.
+
+    Subclasses ``BaseEnv`` directly (not ``SearchEnv``) to avoid pulling
+    Chunk/Pydantic into the pickle graph.
 
     Replaces per-backend envs (PineconeSearchEnv, ChromaSearchEnv, etc.)
     with a single composable environment.  Any backend that implements
@@ -118,6 +128,34 @@ class SearchClientEnv(SearchEnv):
             search_tool.name: (search_tool, self._search_tool)
         }
 
+    system_prompt: str = SYSTEM_PROMPT
+
+    @staticmethod
+    def _truncate_tool_output(
+        text: str,
+        max_chars: int = MAX_TOOL_OUTPUT_CHARS,
+        suffix: str = TOOL_OUTPUT_TRUNCATION_SUFFIX,
+    ) -> str:
+        if len(text) <= max_chars:
+            return text
+        keep = max(0, max_chars - len(suffix))
+        return f"{text[:keep].rstrip()}{suffix}"
+
+    @classmethod
+    def dataset_preprocess(cls, example: Any, **kwargs: Any) -> StandardizedExample:
+        return StandardizedExample(
+            prompt=example.get("question", ""),
+            ground_truth=example.get("answer", None),
+            init_rollout_args={},
+        )
+
+    async def list_tools(self) -> list[ToolDefinition]:
+        return [self._tools[k][0] for k in sorted(self._tools)]
+
+    async def run_tool(self, rollout_id: str, tool_name: str, **tool_args: Any) -> Any:
+        _, tool_function = self._tools[tool_name]
+        return await tool_function(**tool_args)
+
     async def _search_tool(
         self,
         query: str,
@@ -155,12 +193,18 @@ class SearchClientEnv(SearchEnv):
         ground_truth: Any,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Compute reward — uses judge if configured, else overlap."""
-        # If no judge configured, fall back to base class overlap reward
+        """Compute reward — uses judge if configured, else string overlap."""
         if not self._judge_base_url or not self._judge_api_key:
-            return await super().compute_reward(
-                rollout_id, completion, ground_truth, **kwargs
-            )
+            # Simple string overlap fallback (no Chunk dependency)
+            from difflib import SequenceMatcher
+
+            comp_text = _extract_completion_text(completion)
+            gt_str = str(ground_truth or "")
+            if not gt_str or not comp_text:
+                return {"overlap": 0.0}
+            matcher = SequenceMatcher(None, gt_str, comp_text)
+            overlap = sum(s for _, _, s in matcher.get_matching_blocks()) / len(gt_str)
+            return {"overlap": overlap if overlap >= 0.25 else 0.0}
 
         # Judge-based reward
         zeros = {"correctness": 0.0}

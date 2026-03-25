@@ -75,7 +75,7 @@ class ChromaSearch:
             else:
                 mode = "vector"
 
-        if client._search_api and mode in ("lexical", "hybrid"):
+        if client.search_api and mode in ("lexical", "hybrid"):
             vec = client.embed(query) if mode == "hybrid" else None
             rows = client.search_api_raw(
                 text_query=query,
