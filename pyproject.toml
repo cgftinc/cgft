@@ -31,6 +31,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+chroma = [
+    "chromadb>=1.0.0",
+]
 pinecone = [
     "pinecone>=5.0.0",
 ]
