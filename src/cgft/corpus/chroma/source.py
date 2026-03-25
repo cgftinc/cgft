@@ -414,28 +414,23 @@ class ChromaChunkSource:
                 chunks.extend(_results_to_chunks(result, self._content_attr))
             return chunks
 
-        # With min_chars: fetch in batches, filter locally
+        # With min_chars: fetch pages at random offsets, filter locally
         collected: list[Chunk] = []
-        all_offsets = list(range(total))
-        random.shuffle(all_offsets)
-        fetch_size = max(n * 2, 50)
-        pos = 0
+        page_size = 200
+        offsets = list(range(0, total, page_size))
+        random.shuffle(offsets)
 
-        while pos < len(all_offsets) and len(collected) < n:
-            batch_offsets = sorted(all_offsets[pos : pos + fetch_size])
-            pos += fetch_size
-
-            for offset in batch_offsets:
-                result = col.get(
-                    include=["documents", "metadatas"],
-                    limit=1,
-                    offset=offset,
-                )
-                for chunk in _results_to_chunks(result, self._content_attr):
-                    if len(chunk.content) >= min_chars:
-                        collected.append(chunk)
-                        if len(collected) == n:
-                            return collected
+        for start in offsets:
+            result = col.get(
+                include=["documents", "metadatas"],
+                limit=page_size,
+                offset=start,
+            )
+            for chunk in _results_to_chunks(result, self._content_attr):
+                if len(chunk.content) >= min_chars:
+                    collected.append(chunk)
+                    if len(collected) >= n:
+                        return collected[:n]
 
         return collected
 
