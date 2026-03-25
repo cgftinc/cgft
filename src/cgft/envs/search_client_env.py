@@ -7,7 +7,6 @@ params) is serialized.  No Pydantic/Chunk in the pickle graph.
 
 from __future__ import annotations
 
-import re
 import traceback
 from collections.abc import Callable
 from typing import Any
@@ -17,8 +16,11 @@ from benchmax.envs.tracking import log_env
 from benchmax.envs.types import StandardizedExample, ToolDefinition
 
 from cgft.corpus.search_client import SearchClient
-
-_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+from cgft.envs.reward_helpers import (
+    extract_answer_block,
+    extract_completion_text,
+    overlap_reward,
+)
 
 SYSTEM_PROMPT = """Please use the search tool provided to find relevant information from the corpus.
 Formulate effective search queries to retrieve the most relevant chunks.
@@ -193,27 +195,21 @@ class SearchClientEnv(BaseEnv):
         ground_truth: Any,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Compute reward — uses judge if configured, else string overlap."""
+        """Compute reward — uses judge if configured, else overlap."""
         if not self._judge_base_url or not self._judge_api_key:
-            # Simple string overlap fallback (no Chunk dependency)
-            from difflib import SequenceMatcher
+            return {
+                "chunk_overlap_reward_function": overlap_reward(
+                    completion, ground_truth, **kwargs
+                )
+            }
 
-            comp_text = _extract_completion_text(completion)
-            gt_str = str(ground_truth or "")
-            if not gt_str or not comp_text:
-                return {"overlap": 0.0}
-            matcher = SequenceMatcher(None, gt_str, comp_text)
-            overlap = sum(s for _, _, s in matcher.get_matching_blocks()) / len(gt_str)
-            return {"overlap": overlap if overlap >= 0.25 else 0.0}
-
-        # Judge-based reward
         zeros = {"correctness": 0.0}
         try:
-            text = _extract_completion_text(completion)
+            text = extract_completion_text(completion)
             if not text.strip():
                 return zeros
 
-            answer = _extract_answer_block(text)
+            answer = extract_answer_block(text)
             prompt = str(
                 kwargs.get("prompt") or kwargs.get("question") or ""
             )
@@ -261,22 +257,3 @@ class SearchClientEnv(BaseEnv):
                 f"[SearchClientEnv] compute_reward failed: {exc}",
             )
             return zeros
-
-
-def _extract_completion_text(completion: str | list[dict[str, Any]]) -> str:
-    if isinstance(completion, str):
-        return completion
-    if not isinstance(completion, list):
-        return ""
-    parts: list[str] = []
-    for msg in completion:
-        if isinstance(msg, dict) and msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if isinstance(content, str) and content.strip():
-                parts.append(content)
-    return "\n".join(parts)
-
-
-def _extract_answer_block(text: str) -> str:
-    match = _ANSWER_TAG_RE.search(text or "")
-    return (match.group(1) if match else text).strip()

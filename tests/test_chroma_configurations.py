@@ -50,40 +50,31 @@ class TestCapabilities:
 
     def test_lexical_hybrid_available_on_server_with_search_api(self):
         """When Search API is available AND host is set, lexical+hybrid appear."""
-        with patch(
-            "cgft.corpus.chroma.source._has_search_api", return_value=True
-        ):
-            from cgft.corpus.chroma.source import ChromaChunkSource
+        from cgft.corpus.chroma.client import ChromaClient
+        from cgft.corpus.chroma.source import ChromaChunkSource
 
-            src = ChromaChunkSource.__new__(ChromaChunkSource)
-            src._collection_name = "t"
-            src._host = "h"
-            src._port = 8000
-            src._path = None
-            src._embed_fn = None
-            src._content_attr = ["content"]
-            src._distance_metric = "cosine"
-            src._enable_bm25 = True
-            src._rrf_k = 60
-            src._rrf_oversample = 20
-            src._rrf_max_candidates = 200
-            src._client = None
-            src._collection = MagicMock()  # pre-set to avoid connection
-            src._total_count = None
-            src._embed_dim = None
-            src._search_api = True
-            src._files = NoFileFakeFiles()
-            src._search_capabilities = {
-                "backend": "chroma",
-                "modes": {"vector", "lexical", "hybrid"},
-                "filter_ops": {
-                    "field": {"eq", "in", "gte", "lte"},
-                    "logical": {"and", "or", "not"},
-                },
-                "ranking": {"cosine", "bm25"},
-                "constraints": {"max_top_k": 10000, "vector_dimensions": None},
-                "graph_expansion": False,
-            }
+        with patch("cgft.corpus.chroma.client.has_search_api", return_value=True):
+            chroma = ChromaClient(
+                collection_name="t",
+                host="h",
+                enable_bm25=True,
+            )
+        chroma._collection = MagicMock()  # pre-set to avoid connection
+
+        src = ChromaChunkSource.__new__(ChromaChunkSource)
+        src._chroma = chroma
+        src._files = NoFileFakeFiles()
+        src._search_capabilities = {
+            "backend": "chroma",
+            "modes": {"vector", "lexical", "hybrid"},
+            "filter_ops": {
+                "field": {"eq", "in", "gte", "lte"},
+                "logical": {"and", "or", "not"},
+            },
+            "ranking": {"cosine", "bm25"},
+            "constraints": {"max_top_k": 10000, "vector_dimensions": None},
+            "graph_expansion": False,
+        }
         caps = src.get_search_capabilities()
         assert "lexical" in caps["modes"]
         assert "hybrid" in caps["modes"]
@@ -220,34 +211,34 @@ class TestSearchTextFlow:
         source = make_source(col)
         # Enable hybrid/lexical
         source._search_capabilities["modes"] = {"vector", "lexical", "hybrid"}
-        source._search_api = True
+        source._chroma.search_api = True
 
         mock_result = MagicMock()
         mock_result.rows.return_value = [[{"document": "hyb", "metadata": {}, "score": 0.9}]]
-        source._collection = MagicMock()
-        source._collection.search = MagicMock(return_value=mock_result)
+        source._chroma._collection = MagicMock()
+        source._chroma._collection.search = MagicMock(return_value=mock_result)
 
         results = source.search_text("query", top_k=3)
         assert len(results) == 1
         assert results[0].content == "hyb"
-        source._collection.search.assert_called_once()
+        source._chroma._collection.search.assert_called_once()
 
     def test_search_text_falls_back_to_lexical_without_hybrid(self):
         """search_text picks lexical when hybrid is unavailable."""
         col = FakeCollection(count=5)
         source = make_source(col)
         source._search_capabilities["modes"] = {"vector", "lexical"}
-        source._search_api = True
+        source._chroma.search_api = True
 
         mock_result = MagicMock()
         mock_result.rows.return_value = [[{"document": "lex", "metadata": {}, "score": 0.8}]]
-        source._collection = MagicMock()
-        source._collection.search = MagicMock(return_value=mock_result)
+        source._chroma._collection = MagicMock()
+        source._chroma._collection.search = MagicMock(return_value=mock_result)
 
         results = source.search_text("query", top_k=3)
         assert len(results) == 1
         assert results[0].content == "lex"
-        source._collection.search.assert_called_once()
+        source._chroma._collection.search.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +289,15 @@ class TestEmbedQuery:
 
 
 class TestPickle:
-    def test_getstate_strips_client(self):
+    def test_getstate_strips_files(self):
         col = FakeCollection(count=5)
         source = make_source(col)
         state = source.__getstate__()
-        assert state["_client"] is None
-        assert state["_collection"] is None
         assert state["_files"] is None
+        # ChromaClient's own pickle strips _raw_client and _collection
+        chroma_state = state["_chroma"].__getstate__()
+        assert chroma_state["_raw_client"] is None
+        assert chroma_state["_collection"] is None
 
     def test_setstate_restores_files(self):
         col = FakeCollection(count=5)
@@ -324,9 +317,9 @@ class TestPickle:
 
         new_src = ChromaChunkSource.__new__(ChromaChunkSource)
         new_src.__setstate__(state)
-        assert new_src._collection_name == "test"
-        assert new_src._host == "localhost"
-        assert new_src._enable_bm25 is False
+        assert new_src._chroma.collection_name == "test"
+        assert new_src._chroma.host == "localhost"
+        assert new_src._chroma.enable_bm25 is False
 
 
 # ---------------------------------------------------------------------------
@@ -358,38 +351,15 @@ class TestAutoEmbedRelaxation:
 class TestBm25Downgrade:
     def test_schema_failure_downgrades_to_vector_only(self):
         """When schema creation fails, capabilities downgrade to vector-only."""
+        from cgft.corpus.chroma.client import ChromaClient
         from cgft.corpus.chroma.source import ChromaChunkSource
 
-        with patch("cgft.corpus.chroma.source._has_search_api", return_value=True):
-            src = ChromaChunkSource.__new__(ChromaChunkSource)
-            src._collection_name = "t"
-            src._host = "h"
-            src._port = 8000
-            src._path = None
-            src._embed_fn = None
-            src._content_attr = ["content"]
-            src._distance_metric = "cosine"
-            src._enable_bm25 = True
-            src._rrf_k = 60
-            src._rrf_oversample = 20
-            src._rrf_max_candidates = 200
-            src._client = None
-            src._collection = None
-            src._total_count = None
-            src._embed_dim = None
-            src._search_api = True
-            src._files = NoFileFakeFiles()
-            src._search_capabilities = {
-                "backend": "chroma",
-                "modes": {"vector", "lexical", "hybrid"},
-                "filter_ops": {
-                    "field": {"eq", "in", "gte", "lte"},
-                    "logical": {"and", "or", "not"},
-                },
-                "ranking": {"cosine", "bm25"},
-                "constraints": {"max_top_k": 10000, "vector_dimensions": None},
-                "graph_expansion": False,
-            }
+        with patch("cgft.corpus.chroma.client.has_search_api", return_value=True):
+            chroma = ChromaClient(
+                collection_name="t",
+                host="h",
+                enable_bm25=True,
+            )
 
         # Mock client that raises on schema-based create, succeeds without
         mock_client = MagicMock()
@@ -401,15 +371,34 @@ class TestBm25Downgrade:
             return mock_collection
 
         mock_client.get_or_create_collection = MagicMock(side_effect=fake_get_or_create)
-        src._client = mock_client
+        chroma._raw_client = mock_client
 
-        # Trigger collection creation
-        col = src._get_collection()
+        src = ChromaChunkSource.__new__(ChromaChunkSource)
+        src._chroma = chroma
+        src._files = NoFileFakeFiles()
+        src._search_capabilities = {
+            "backend": "chroma",
+            "modes": {"vector", "lexical", "hybrid"},
+            "filter_ops": {
+                "field": {"eq", "in", "gte", "lte"},
+                "logical": {"and", "or", "not"},
+            },
+            "ranking": {"cosine", "bm25"},
+            "constraints": {"max_top_k": 10000, "vector_dimensions": None},
+            "graph_expansion": False,
+        }
 
-        # Should have downgraded capabilities
-        assert src._search_capabilities["modes"] == {"vector"}
-        assert src._search_capabilities["ranking"] == {"cosine"}
-        assert col is mock_collection
+        # Trigger collection creation via get_search_capabilities
+        # which forces lazy init when lexical is in modes
+        caps = src.get_search_capabilities()
+
+        # ChromaClient should have downgraded its own modes
+        assert chroma.modes == {"vector"}
+        assert chroma.ranking == {"cosine"}
+
+        # Source capabilities should be synced
+        assert caps["modes"] == {"vector"}
+        assert caps["ranking"] == {"cosine"}
 
         # get_or_create_collection called twice: once with schema (failed),
         # once without (succeeded)
@@ -467,7 +456,7 @@ class TestContentAttr:
             count=5,
         )
         source = make_source(col)
-        source._content_attr = ["description"]
+        source._chroma.content_attr = ["description"]
         results = source.search(SearchSpec(mode="vector", top_k=3, text_query="test"))
         assert len(results) == 1
         assert results[0].content == "the real text"
@@ -487,7 +476,7 @@ class TestContentAttr:
             count=5,
         )
         source = make_source(col)
-        source._content_attr = ["title", "body"]
+        source._chroma.content_attr = ["title", "body"]
         results = source.search(SearchSpec(mode="vector", top_k=3, text_query="test"))
         assert len(results) == 1
         assert "My Title" in results[0].content
@@ -502,7 +491,7 @@ class TestContentAttr:
             count=5,
         )
         source = make_source(col)
-        assert source._content_attr == ["content"]
+        assert source._chroma.content_attr == ["content"]
         results = source.search(SearchSpec(mode="vector", top_k=3, text_query="test"))
         assert results[0].content == "doc text from chroma"
 
@@ -518,6 +507,6 @@ class TestContentAttr:
             count=5,
         )
         source = make_source(col)
-        source._content_attr = ["description"]
+        source._chroma.content_attr = ["description"]
         results = source.search_content(SearchSpec(mode="vector", top_k=3, text_query="test"))
         assert results == ["the text"]

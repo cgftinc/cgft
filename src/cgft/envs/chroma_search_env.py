@@ -1,71 +1,26 @@
-"""ChromaSearchEnv — SearchEnv backed by ChromaDB (vector, BM25, or hybrid)."""
+"""ChromaSearchEnv — backward-compatible wrapper.
+
+Delegates to :class:`SearchClientEnv` with a :class:`ChromaSearch` client.
+New code should use ``SearchClientEnv`` directly.
+"""
 
 from __future__ import annotations
 
-import re
-import traceback
 from collections.abc import Callable
 from typing import Any
 
-from benchmax.envs.tracking import log_env
-from benchmax.envs.types import ToolDefinition
+from cgft.corpus.chroma.search import ChromaSearch
 
-from cgft.corpus.chroma.source import ChromaChunkSource
-from cgft.corpus.search_schema.search_types import SearchSpec
-from cgft.rubrics.rubric import Rubric, evaluate_single_rubric
-
-from .search_env import SearchEnv
-
-_CORRECTNESS_RUBRIC = Rubric(
-    title="Answer correctness",
-    description=(
-        "Response correctly answers the question and is factually consistent "
-        "with the reference answer."
-    ),
-    type="positive",
-    score_map={
-        0: "Provided answer is missing or incorrect.",
-        0.5: (
-            "Response captures some facts from the reference answer, "
-            "but is missing key facts or has an incorrect conclusion."
-        ),
-        1: (
-            "Response correctly answers the question and is factually "
-            "consistent with the reference answer."
-        ),
-    },
-)
-
-DEFAULT_W_CORRECTNESS = 1.0
-DEFAULT_JUDGE_TIMEOUT = 30.0
-
-_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+from .search_client_env import SearchClientEnv
 
 
-class ChromaSearchEnv(SearchEnv):
-    """Search environment backed by a ChromaDB collection.
+class ChromaSearchEnv(SearchClientEnv):
+    """Search environment backed by ChromaDB.
 
-    Supports lexical (BM25), vector (ANN), and hybrid search.  When the
-    Chroma Search API is available, all three modes are exposed to the
-    RL agent via a ``mode`` parameter on the tool.  Otherwise only
-    vector search is available.
-
-    Only client-server mode (``host``/``port``) is supported for training
-    environments because the Chroma HTTP client can be reconstructed
-    after pickle, whereas local/in-memory clients cannot.
-
-    Args:
-        collection_name: Name of the Chroma collection.
-        host: Chroma server hostname (**required** for training envs).
-        port: Chroma server port (default 8000).
-        embed_fn: Optional embedding callable. When ``None``, Chroma's
-            built-in default embedding is used for dense search.
-        enable_bm25: Enable BM25 sparse index for lexical/hybrid modes
-            (default ``True``).  Ignored when the Search API is absent.
-        judge_base_url: Base URL for the LLM judge API.
-        judge_api_key: API key for the LLM judge.
-        judge_model: Model name for the LLM judge.
-        w_correctness: Weight for the correctness reward component.
+    Thin wrapper that constructs a :class:`ChromaSearch` and delegates
+    to :class:`SearchClientEnv`.  Provided for backward compatibility —
+    new code should use ``SearchClientEnv(search=ChromaSearch(...))``
+    directly.
     """
 
     def __init__(
@@ -78,9 +33,9 @@ class ChromaSearchEnv(SearchEnv):
         judge_base_url: str = "",
         judge_api_key: str = "",
         judge_model: str = "",
-        judge_timeout: float | None = DEFAULT_JUDGE_TIMEOUT,
-        w_correctness: float = DEFAULT_W_CORRECTNESS,
-        **kwargs,
+        judge_timeout: float = 30.0,
+        w_correctness: float = 1.0,
+        **kwargs: Any,
     ):
         if not host:
             raise ValueError(
@@ -89,206 +44,19 @@ class ChromaSearchEnv(SearchEnv):
                 "for remote training environments."
             )
 
-        self._source = ChromaChunkSource(
+        search = ChromaSearch(
             collection_name=collection_name,
             host=host,
             port=port,
             embed_fn=embed_fn,
             enable_bm25=enable_bm25,
         )
-        supported_modes = self._source.get_search_capabilities()["modes"]
-
-        if "hybrid" in supported_modes:
-            mode_enum = ["lexical", "vector", "hybrid"]
-            self._default_mode = "hybrid"
-        elif "lexical" in supported_modes:
-            mode_enum = ["lexical", "vector"]
-            self._default_mode = "lexical"
-        else:
-            mode_enum = ["vector"]
-            self._default_mode = "vector"
-
-        tool_properties: dict = {
-            "query": {
-                "type": "string",
-                "description": "Search query string.",
-            },
-            "limit": {
-                "type": "integer",
-                "description": ("Max number of results to return (default 10)."),
-            },
-        }
-        if len(mode_enum) > 1:
-            tool_properties["mode"] = {
-                "type": "string",
-                "enum": mode_enum,
-                "description": (
-                    f'Search mode: {", ".join(mode_enum)}. Default: "{self._default_mode}".'
-                ),
-            }
-
-        search_tool_definition = ToolDefinition(
-            name="search",
-            description=("Search the corpus using full-text, vector, or hybrid search."),
-            input_schema={
-                "type": "object",
-                "properties": tool_properties,
-                "required": ["query"],
-            },
+        super().__init__(
+            search=search,
+            judge_base_url=judge_base_url,
+            judge_api_key=judge_api_key,
+            judge_model=judge_model,
+            judge_timeout=judge_timeout,
+            w_correctness=w_correctness,
+            **kwargs,
         )
-
-        self._tools: dict[str, tuple[ToolDefinition, Callable]] = {
-            search_tool_definition.name: (
-                search_tool_definition,
-                self._search_tool,
-            )
-        }
-        self._judge_base_url = judge_base_url
-        self._judge_api_key = judge_api_key
-        self._judge_model = judge_model
-        self._judge_timeout = judge_timeout
-        self._w_correctness = w_correctness
-        self._experiment_id = kwargs.get("experiment_id")
-        self._rollout_api_key = kwargs.get("api_key")
-
-    async def _search_tool(
-        self,
-        query: str,
-        mode: str | None = None,
-        limit: int = 10,
-        **kwargs,
-    ) -> str:
-        """Search the Chroma collection.
-
-        Args:
-            query: Search query string.
-            mode: Search mode (lexical/vector/hybrid). Defaults to best
-                available.
-            limit: Maximum number of results.
-
-        Returns:
-            Formatted search results or error message.
-        """
-        if not query:
-            return "Error: Missing required parameter: 'query'"
-
-        effective_mode = mode or self._default_mode
-        vector_query = None
-        if effective_mode in ("vector", "hybrid"):
-            vector_query = self._source.embed_query(query)
-            if vector_query is None and effective_mode == "vector":
-                # Chroma will auto-embed via query_texts
-                pass
-
-        spec = SearchSpec(
-            mode=effective_mode,  # type: ignore[arg-type]
-            top_k=limit,
-            text_query=query,
-            vector_query=vector_query,
-        )
-        try:
-            results = self._source.search_content(spec)
-        except Exception:
-            return f"Error:\n{traceback.format_exc()}"
-
-        if not results:
-            return "No results found."
-
-        lines = [f"{i}.\n   Content: {content}" for i, content in enumerate(results, 1)]
-        return self._truncate_tool_output("\n".join(lines))
-
-    # ------------------------------------------------------------------
-    # Reward
-    # ------------------------------------------------------------------
-
-    async def compute_reward(
-        self,
-        rollout_id: str,
-        completion: str | list[dict[str, Any]],
-        ground_truth: Any,
-        **kwargs: Any,
-    ) -> dict[str, float]:
-        """Return correctness reward via LLM judge rubric."""
-        zeros = {"correctness": 0.0}
-
-        try:
-            completion_text = _extract_completion_text(completion)
-            if not completion_text.strip():
-                return zeros
-
-            answer_block = _extract_answer_block(completion_text)
-            prompt = str(kwargs.get("prompt") or kwargs.get("question") or "")
-            gt_str = str(ground_truth or "")
-
-            log_env(
-                rollout_id,
-                f"[ChromaSearchEnv] Question: {prompt[:200]}\n"
-                f"  Ground truth: {gt_str[:200]}\n"
-                f"  Answer: {answer_block[:200]}",
-            )
-
-            if not self._judge_base_url or not self._judge_api_key:
-                log_env(
-                    rollout_id,
-                    "[ChromaSearchEnv] Judge disabled: missing credentials",
-                )
-                return zeros
-
-            correctness_result = await evaluate_single_rubric(
-                rubric=_CORRECTNESS_RUBRIC,
-                question=prompt,
-                ground_truth=gt_str,
-                response=answer_block,
-                model_name=self._judge_model,
-                base_url=self._judge_base_url,
-                api_key=self._judge_api_key,
-                timeout=self._judge_timeout,
-            )
-            correctness_raw = _clip01(correctness_result.get("score", 0.0))
-
-            log_env(
-                rollout_id,
-                f"[ChromaSearchEnv] correctness={correctness_raw:.2f}",
-            )
-
-            return {"correctness": self._w_correctness * correctness_raw}
-        except Exception as exc:
-            log_env(
-                rollout_id,
-                f"[ChromaSearchEnv] compute_reward failed: {exc}",
-            )
-            return zeros
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-
-def _clip01(value: Any) -> float:
-    try:
-        x = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(1.0, x))
-
-
-def _extract_completion_text(
-    completion: str | list[dict[str, Any]],
-) -> str:
-    if isinstance(completion, str):
-        return completion
-    if not isinstance(completion, list):
-        return ""
-    parts: list[str] = []
-    for msg in completion:
-        if isinstance(msg, dict) and msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if isinstance(content, str) and content.strip():
-                parts.append(content)
-    return "\n".join(parts)
-
-
-def _extract_answer_block(text: str) -> str:
-    match = _ANSWER_TAG_RE.search(text or "")
-    return (match.group(1) if match else text).strip()

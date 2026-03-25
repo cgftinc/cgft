@@ -1,16 +1,16 @@
-"""ChromaChunkSource — ChunkSource implementation backed by ChromaDB.
+"""ChromaChunkSource -- ChunkSource implementation backed by ChromaDB.
 
-Supports vector, lexical (BM25), and hybrid (RRF) search modes via
-Chroma's Search API.  When the Search API is unavailable (older chromadb
-or OSS-only builds), falls back to the legacy ``query()`` API with
-vector-only search.
+Delegates all SDK operations to :class:`ChromaClient` (from ``.client``).
+This module handles only Chunk-specific logic: converting raw dicts to
+``Chunk`` objects, ``ChunkCollection`` handling, and the ``ChunkSource``
+protocol surface.
 """
 
 from __future__ import annotations
 
 import random
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from tqdm.auto import tqdm
 
@@ -28,26 +28,9 @@ from cgft.corpus.search_schema.search_types import (
     validate_search_spec_shape,
 )
 
+from .client import ChromaClient
 from .files import FileAwareness
 from .filter_mapper import to_chroma_filters
-
-# Sparse-key name used when setting up BM25 schema
-_BM25_KEY = "bm25_embedding"
-
-# Default RRF parameters — tunable via rrf_k / rrf_oversample constructor args
-_DEFAULT_RRF_K = 60
-_DEFAULT_RRF_OVERSAMPLE = 20
-_DEFAULT_RRF_MAX_CANDIDATES = 200
-
-
-def _has_search_api() -> bool:
-    """Return True when the chromadb package exposes the Search API."""
-    try:
-        from chromadb import Knn, Search  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
 
 
 class ChromaChunkSource:
@@ -55,11 +38,11 @@ class ChromaChunkSource:
 
     Supports three retrieval modes:
 
-    * **vector** — dense embedding similarity (always available).
-    * **lexical** — native BM25 via Chroma's sparse-vector index.
-    * **hybrid** — Reciprocal Rank Fusion of dense + sparse rankings.
+    * **vector** -- dense embedding similarity (always available).
+    * **lexical** -- native BM25 via Chroma's sparse-vector index.
+    * **hybrid** -- Reciprocal Rank Fusion of dense + sparse rankings.
 
-    Lexical and hybrid modes require ``chromadb ≥ 1.0`` with the
+    Lexical and hybrid modes require ``chromadb >= 1.0`` with the
     ``Search`` API and a client-server connection (sparse indexing is
     not available on local/in-memory Chroma).  When unavailable the
     source gracefully degrades to vector-only.
@@ -67,7 +50,7 @@ class ChromaChunkSource:
     The client is lazily initialized on first use so that the source
     survives ``pickle`` round-trips (only connection parameters are
     stored).  For remote training environments, only **client-server**
-    mode (``host``/``port``) is safe — local/in-memory collections
+    mode (``host``/``port``) is safe -- local/in-memory collections
     cannot be transferred to a different process.
 
     Args:
@@ -77,7 +60,7 @@ class ChromaChunkSource:
         path: Directory for persistent-local mode (mutually exclusive
             with ``host``).  When neither ``host`` nor ``path`` is given,
             an ephemeral in-memory client is created.
-        embed_fn: Optional embedding callable ``list[str] → list[list[float]]``.
+        embed_fn: Optional embedding callable ``list[str] -> list[list[float]]``.
             When provided, Chroma's default dense embedding function is
             replaced.
         content_attr: List of metadata field names to treat as searchable
@@ -86,7 +69,7 @@ class ChromaChunkSource:
             field (analogous to ``content_attr`` on ``TpufChunkSource``).
         distance_metric: Distance function for the dense index.  One of
             ``"cosine"``, ``"l2"``, ``"ip"`` (default ``"cosine"``).
-            Applied both with and without BM25 — controls the HNSW index.
+            Applied both with and without BM25 -- controls the HNSW index.
         enable_bm25: Create a sparse BM25 index on the collection for
             lexical / hybrid search (default ``True``).  Only takes
             effect when client-server mode and the Search API are both
@@ -94,7 +77,7 @@ class ChromaChunkSource:
         rrf_k: RRF smoothing constant for hybrid search (default 60).
             Higher values flatten rank differences.
         rrf_oversample: Multiplier for candidate pool in each RRF leg,
-            capped at ``rrf_max_candidates`` (default 20×).
+            capped at ``rrf_max_candidates`` (default 20x).
         rrf_max_candidates: Hard cap on per-leg candidate count
             (default 200).
 
@@ -117,154 +100,66 @@ class ChromaChunkSource:
         content_attr: list[str] | None = None,
         distance_metric: str = "cosine",
         enable_bm25: bool = True,
-        rrf_k: int = _DEFAULT_RRF_K,
-        rrf_oversample: int = _DEFAULT_RRF_OVERSAMPLE,
-        rrf_max_candidates: int = _DEFAULT_RRF_MAX_CANDIDATES,
+        rrf_k: int = 60,
+        rrf_oversample: int = 20,
+        rrf_max_candidates: int = 200,
     ) -> None:
-        self._collection_name = collection_name
-        self._host = host
-        self._port = port
-        self._path = path
-        self._embed_fn = embed_fn
-        self._content_attr: list[str] = content_attr if content_attr is not None else ["content"]
-        self._distance_metric = distance_metric
-        self._enable_bm25 = enable_bm25
-        self._rrf_k = rrf_k
-        self._rrf_oversample = rrf_oversample
-        self._rrf_max_candidates = rrf_max_candidates
+        self._chroma = ChromaClient(
+            collection_name=collection_name,
+            host=host,
+            port=port,
+            path=path,
+            embed_fn=embed_fn,
+            content_attr=content_attr,
+            distance_metric=distance_metric,
+            enable_bm25=enable_bm25,
+            rrf_k=rrf_k,
+            rrf_oversample=rrf_oversample,
+            rrf_max_candidates=rrf_max_candidates,
+        )
 
-        # Lazily initialized
-        self._client: Any = None
-        self._collection: Any = None
-        self._total_count: int | None = None
-        self._embed_dim: int | None = None  # validated on first embed call
+        self._files = FileAwareness(self._chroma.get_collection)
 
-        # Detect Search API availability
-        self._search_api = _has_search_api()
-
-        self._files = FileAwareness(self._get_collection)
-
-        # BM25/hybrid require Search API + client-server (sparse indexing
-        # is not available on local/in-memory Chroma).
-        modes: set[SearchMode] = {"vector"}
-        ranking: set[str] = {"cosine"}
-        if self._search_api and enable_bm25 and (host is not None):
-            modes |= {"lexical", "hybrid"}
-            ranking.add("bm25")
-
+        # Build SearchCapabilities from ChromaClient's modes/ranking
         self._search_capabilities: SearchCapabilities = {
             "backend": "chroma",
-            "modes": modes,
+            "modes": cast(set[SearchMode], self._chroma.modes),
             "filter_ops": {
                 "field": {"eq", "in", "gte", "lte"},
                 "logical": {"and", "or", "not"},
             },
-            "ranking": ranking,
+            "ranking": set(self._chroma.ranking),
             "constraints": {"max_top_k": 10000, "vector_dimensions": None},
             "graph_expansion": False,
         }
 
-    # ------------------------------------------------------------------
-    # Lazy client / collection
-    # ------------------------------------------------------------------
-
-    def _get_client(self) -> Any:
-        """Return (and cache) the ChromaDB client."""
-        if self._client is not None:
-            return self._client
-
-        import chromadb
-
-        if self._host is not None:
-            self._client = chromadb.HttpClient(host=self._host, port=self._port)
-        elif self._path is not None:
-            self._client = chromadb.PersistentClient(path=self._path)
-        else:
-            self._client = chromadb.Client()
-
-        return self._client
-
-    def _get_collection(self) -> Any:
-        """Return (and cache) the Chroma collection, creating if needed."""
-        if self._collection is not None:
-            return self._collection
-
-        client = self._get_client()
-
-        kwargs: dict[str, Any] = {"name": self._collection_name}
-        if self._embed_fn is not None:
-            kwargs["embedding_function"] = _WrapEmbedFn(self._embed_fn)
-
-        # BM25 schema requires client-server mode and a server that
-        # supports sparse indexing.  Chroma does not allow schema +
-        # metadata simultaneously, so distance_metric is only set via
-        # metadata when no schema is used.
-        created_with_schema = False
-        if self._search_api and self._enable_bm25 and self.is_client_server:
-            try:
-                schema_kwargs = {**kwargs, "schema": self._build_schema()}
-                self._collection = client.get_or_create_collection(
-                    **schema_kwargs
-                )
-                created_with_schema = True
-            except Exception:
-                # Server doesn't support sparse indexing (e.g. older
-                # version).  Downgrade to vector-only and retry below.
-                self._search_capabilities["modes"] = {"vector"}
-                self._search_capabilities["ranking"] = {"cosine"}
-
-        if not created_with_schema:
-            metadata: dict[str, str] = {}
-            if self._distance_metric:
-                metadata["hnsw:space"] = self._distance_metric
-            if metadata:
-                kwargs["metadata"] = metadata
-            self._collection = client.get_or_create_collection(**kwargs)
-
-        return self._collection
-
-    def _build_schema(self) -> Any:
-        """Build a Chroma Schema with a BM25 sparse-vector index."""
-        from chromadb import Schema, SparseVectorIndexConfig
-        from chromadb.utils.embedding_functions import (
-            ChromaBm25EmbeddingFunction,
-        )
-
-        schema = Schema()
-        schema = schema.create_index(
-            key=_BM25_KEY,
-            config=SparseVectorIndexConfig(
-                embedding_function=ChromaBm25EmbeddingFunction(),
-                source_key="#document",
-                bm25=True,
-            ),
-        )
-        return schema
-
     @property
     def is_client_server(self) -> bool:
         """True when configured for HTTP client-server mode."""
-        return self._host is not None
+        return self._chroma.is_client_server
+
+    # ------------------------------------------------------------------
+    # Pickle
+    # ------------------------------------------------------------------
 
     def __getstate__(self) -> dict:
-        """Strip live client/collection for pickle safety.
+        """Strip live caches for pickle safety.
 
         Connection params, config, and search capabilities are preserved.
-        The client, collection, and file-awareness caches are rebuilt
-        lazily after unpickling — this is safe because training envs
-        require client-server mode where data persists on the server.
+        The ChromaClient and file-awareness caches are rebuilt lazily
+        after unpickling.
         """
         state = self.__dict__.copy()
-        state["_client"] = None
-        state["_collection"] = None
         state["_files"] = None
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
-        # FileAwareness caches (file_cache, all_file_paths, awareness
-        # flag) are rebuilt lazily on next access from the remote server.
-        self._files = FileAwareness(self._get_collection)
+        self._files = FileAwareness(self._chroma.get_collection)
+        # Sync capabilities in case ChromaClient downgraded modes during
+        # collection creation before pickling.
+        self._search_capabilities["modes"] = cast(set[SearchMode], self._chroma.modes)
+        self._search_capabilities["ranking"] = set(self._chroma.ranking)
 
     # ------------------------------------------------------------------
     # Populate
@@ -333,13 +228,13 @@ class ChromaChunkSource:
             batch_size: Number of chunks per upload batch (default 100).
             show_summary: Print upload progress (default True).
         """
-        col = self._get_collection()
+        col = self._chroma.get_collection()
         all_chunks = list(collection)
+        collection_name = self._chroma.collection_name
 
         if show_summary:
             print(
-                f"\nUploading {len(all_chunks)} chunks to Chroma"
-                f" collection '{self._collection_name}'..."
+                f"\nUploading {len(all_chunks)} chunks to Chroma collection '{collection_name}'..."
             )
 
         for batch_start in tqdm(
@@ -370,38 +265,32 @@ class ChromaChunkSource:
 
             col.upsert(ids=ids, documents=documents, metadatas=metadatas)
 
-        self._total_count = len(all_chunks)
+        self._chroma._total_count = len(all_chunks)
         self._files.invalidate()
 
         if show_summary:
             print(
                 f"\nUpload complete! {len(all_chunks)} chunks written to"
-                f" collection '{self._collection_name}'."
+                f" collection '{collection_name}'."
             )
 
     # ------------------------------------------------------------------
     # Sampling
     # ------------------------------------------------------------------
 
-    def _get_total_count(self) -> int:
-        """Return the total document count, caching after first call."""
-        if self._total_count is None:
-            self._total_count = self._get_collection().count()
-        return self._total_count
-
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
         """Return n randomly sampled chunks, optionally filtered by length."""
-        total = self._get_total_count()
+        total = self._chroma.get_total_count()
         if total == 0:
             return []
 
-        col = self._get_collection()
+        col = self._chroma.get_collection()
 
         if min_chars == 0:
             sample_size = min(n, total)
             if sample_size == total:
                 result = col.get(include=["documents", "metadatas"], limit=total)
-                return _results_to_chunks(result, self._content_attr)
+                return self._get_results_to_chunks(result)
 
             indices = sorted(random.sample(range(total), sample_size))
             chunks: list[Chunk] = []
@@ -411,7 +300,7 @@ class ChromaChunkSource:
                     limit=1,
                     offset=idx,
                 )
-                chunks.extend(_results_to_chunks(result, self._content_attr))
+                chunks.extend(self._get_results_to_chunks(result))
             return chunks
 
         # With min_chars: fetch pages at random offsets, filter locally
@@ -426,13 +315,24 @@ class ChromaChunkSource:
                 limit=page_size,
                 offset=start,
             )
-            for chunk in _results_to_chunks(result, self._content_attr):
+            for chunk in self._get_results_to_chunks(result):
                 if len(chunk.content) >= min_chars:
                     collected.append(chunk)
                     if len(collected) >= n:
                         return collected[:n]
 
         return collected
+
+    def _get_results_to_chunks(self, result: dict[str, Any]) -> list[Chunk]:
+        """Convert a Chroma ``get()`` result dict to Chunks via ChromaClient."""
+        rows = ChromaClient._get_result_to_raw(result)
+        return [
+            Chunk(
+                content=self._chroma.extract_content(r["content"], r["metadata"]),
+                metadata=tuple(r["metadata"].items()),
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Context & structure
@@ -504,188 +404,19 @@ class ChromaChunkSource:
         return chunks
 
     # ------------------------------------------------------------------
-    # Search — new Search API (lexical / vector / hybrid)
-    # ------------------------------------------------------------------
-
-    def _build_search_expr(self, spec: SearchSpec) -> Any:
-        """Build a ``chromadb.Search`` expression from a SearchSpec.
-
-        Uses ``Knn`` for dense and sparse rankings, ``Rrf`` for hybrid
-        fusion.  Only called when the Search API is available.
-        """
-        from chromadb import K, Knn, Search
-
-        mode = spec.get("mode")
-        text_query = spec.get("text_query") or ""
-        vector_query: list[float] | None = spec.get("vector_query")
-        top_k = spec.get("top_k", 10)
-        hybrid_opts: HybridOptions | None = spec.get("hybrid")
-
-        search = Search()
-
-        # Metadata filter — Search.where() accepts dicts directly
-        where_filter = to_chroma_filters(spec.get("filter"), self._search_capabilities)
-        if where_filter is not None:
-            search = search.where(where_filter)
-
-        # Build ranking expression
-        if mode == "lexical":
-            rank = Knn(query=text_query, key=_BM25_KEY)
-        elif mode == "vector":
-            if vector_query is not None:
-                rank = Knn(query=vector_query)
-            else:
-                rank = Knn(query=text_query)
-        else:  # hybrid
-            from chromadb import Rrf
-
-            opts = hybrid_opts or {}
-            vector_weight = opts.get("vector_weight", 1.0)
-            lexical_weight = opts.get("lexical_weight", 1.0)
-            candidates = min(top_k * self._rrf_oversample, self._rrf_max_candidates)
-
-            dense_rank = Knn(
-                query=(vector_query if vector_query is not None else text_query),
-                return_rank=True,
-                limit=candidates,
-            )
-            sparse_rank = Knn(
-                query=text_query,
-                key=_BM25_KEY,
-                return_rank=True,
-                limit=candidates,
-            )
-            rank = Rrf(
-                ranks=[dense_rank, sparse_rank],
-                weights=[vector_weight, lexical_weight],
-                k=self._rrf_k,
-            )
-
-        search = search.rank(rank).limit(top_k).select(K.DOCUMENT, K.METADATA, K.SCORE)
-        return search
-
-    def _search_via_api(self, spec: SearchSpec) -> Any:
-        """Execute a search using the new Search API and return raw result."""
-        col = self._get_collection()
-        search_expr = self._build_search_expr(spec)
-        return col.search(search_expr)
-
-    @staticmethod
-    def _search_rows(result: Any) -> list[dict]:
-        """Extract rows from a Search API result.
-
-        ``result.rows()`` returns ``list[list[SearchResultRow]]`` — one
-        inner list per search payload.  We always pass a single search,
-        so we take element ``[0]``.
-        """
-        if not hasattr(result, "rows"):
-            return []
-        payloads = result.rows()
-        if not payloads:
-            return []
-        return list(payloads[0])
-
-    def _search_results_to_chunks(self, result: Any) -> list[Chunk]:
-        """Convert Search API results to Chunks."""
-        fields = self._content_attr
-        chunks: list[Chunk] = []
-        for row in self._search_rows(result):
-            doc = row.get("document", "")
-            meta = row.get("metadata") or {}
-            if isinstance(meta, dict):
-                content = _extract_content(doc, meta, fields)
-                chunks.append(Chunk(content=content, metadata=_clean_metadata(meta)))
-            else:
-                chunks.append(Chunk(content=doc))
-        return chunks
-
-    def _search_results_to_strings(self, result: Any) -> list[str]:
-        """Convert Search API results to content strings."""
-        fields = self._content_attr
-        results: list[str] = []
-        for row in self._search_rows(result):
-            doc = row.get("document", "")
-            meta = row.get("metadata") or {}
-            if isinstance(meta, dict):
-                results.append(_extract_content(doc, meta, fields))
-            else:
-                results.append(doc)
-        return results
-
-    def _search_results_to_scored_chunks(self, result: Any) -> list[tuple[Chunk, float]]:
-        """Convert Search API results to (Chunk, score) pairs."""
-        fields = self._content_attr
-        pairs: list[tuple[Chunk, float]] = []
-        for row in self._search_rows(result):
-            doc = row.get("document", "")
-            meta = row.get("metadata") or {}
-            score = row.get("score", 0.0) or 0.0
-            if isinstance(meta, dict):
-                content = _extract_content(doc, meta, fields)
-                chunk = Chunk(content=content, metadata=_clean_metadata(meta))
-            else:
-                chunk = Chunk(content=doc)
-            pairs.append((chunk, float(score)))
-        return pairs
-
-    # ------------------------------------------------------------------
-    # Search — legacy query() API (vector-only fallback)
-    # ------------------------------------------------------------------
-
-    def _build_query_kwargs(self, spec: SearchSpec) -> dict[str, Any]:
-        """Build kwargs for the legacy ``collection.query()`` API."""
-        vector_query: list[float] | None = spec.get("vector_query")
-        top_k = spec.get("top_k", 10)
-
-        query_kwargs: dict[str, Any] = {
-            "n_results": top_k,
-            "include": ["documents", "metadatas", "distances"],
-        }
-
-        if vector_query is not None:
-            query_kwargs["query_embeddings"] = [vector_query]
-        else:
-            query_kwargs["query_texts"] = [spec.get("text_query") or ""]
-
-        where = to_chroma_filters(spec.get("filter"), self._search_capabilities)
-        if where is not None:
-            query_kwargs["where"] = where
-
-        return query_kwargs
-
-    # ------------------------------------------------------------------
-    # Embedding helpers
+    # Embedding
     # ------------------------------------------------------------------
 
     def embed_query(self, text: str) -> list[float] | None:
         """Return a dense embedding vector for *text*, or ``None``.
 
         Uses the custom ``embed_fn`` if provided.  Otherwise returns
-        ``None`` — Chroma will auto-embed via ``query_texts``.
-
-        On the first call with ``embed_fn``, validates that the returned
-        dimension is consistent.  Raises ``ValueError`` on mismatch.
+        ``None`` -- Chroma will auto-embed via ``query_texts``.
         """
-        if self._embed_fn is None:
-            return None
-        vec = self._embed_fn([text])[0]
-        self._validate_embed_dim(vec)
-        return vec
-
-    def _validate_embed_dim(self, vec: list[float]) -> None:
-        """Check embedding dimension consistency on first call."""
-        dim = len(vec)
-        if self._embed_dim is None:
-            self._embed_dim = dim
-        elif dim != self._embed_dim:
-            raise ValueError(
-                f"Embedding dimension mismatch: expected {self._embed_dim}, "
-                f"got {dim}. Check that your embed_fn produces vectors of "
-                f"consistent size."
-            )
+        return self._chroma.embed(text)
 
     # ------------------------------------------------------------------
-    # Public search interface
+    # Search validation
     # ------------------------------------------------------------------
 
     def _validate_spec(self, spec: SearchSpec) -> None:
@@ -693,7 +424,7 @@ class ChromaChunkSource:
 
         Chroma can auto-embed text queries in vector mode, so we relax
         the standard shape validation that would require ``vector_query``
-        — a ``text_query`` is sufficient.
+        -- a ``text_query`` is sufficient.
         """
         mode = spec.get("mode")
         supported_modes = self._search_capabilities["modes"]
@@ -707,7 +438,7 @@ class ChromaChunkSource:
         shape_errors = validate_search_spec_shape(spec)
 
         # Chroma auto-embeds text queries via its built-in embedding
-        # function, so vector_query is never strictly required — a
+        # function, so vector_query is never strictly required -- a
         # text_query is sufficient for vector and hybrid modes.
         if mode in ("vector", "hybrid") and shape_errors:
             text_query = spec.get("text_query")
@@ -721,20 +452,67 @@ class ChromaChunkSource:
                 spec=spec,
             )
 
+    # ------------------------------------------------------------------
+    # Raw results -> Chunks (delegates to ChromaClient)
+    # ------------------------------------------------------------------
+
+    def _raw_rows_to_chunks(self, rows: list[dict[str, Any]]) -> list[Chunk]:
+        """Convert raw dicts from ChromaClient to Chunks."""
+        return [
+            Chunk(
+                content=self._chroma.extract_content(r["content"], r["metadata"]),
+                metadata=tuple(r["metadata"].items()),
+            )
+            for r in rows
+        ]
+
+    def _raw_rows_to_scored_chunks(self, rows: list[dict[str, Any]]) -> list[tuple[Chunk, float]]:
+        """Convert raw dicts from ChromaClient to (Chunk, score) pairs."""
+        return [
+            (
+                Chunk(
+                    content=self._chroma.extract_content(r["content"], r["metadata"]),
+                    metadata=tuple(r["metadata"].items()),
+                ),
+                float(r.get("score", 0.0)),
+            )
+            for r in rows
+        ]
+
+    def _raw_rows_to_strings(self, rows: list[dict[str, Any]]) -> list[str]:
+        """Convert raw dicts from ChromaClient to content strings."""
+        return [self._chroma.extract_content(r["content"], r["metadata"]) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Public search interface
+    # ------------------------------------------------------------------
+
     def search(self, spec: SearchSpec) -> list[Chunk]:
         """Search chunks using a structured search spec."""
         self._validate_spec(spec)
         mode = spec.get("mode")
 
-        if self._search_api and mode in ("lexical", "hybrid"):
-            result = self._search_via_api(spec)
-            return self._search_results_to_chunks(result)
+        where = to_chroma_filters(spec.get("filter"), self._search_capabilities)
+
+        if self._chroma.search_api and mode in ("lexical", "hybrid"):
+            rows = self._chroma.search_api_raw(
+                text_query=spec.get("text_query") or "",
+                vector_query=spec.get("vector_query"),
+                mode=mode,
+                top_k=spec.get("top_k", 10),
+                where=where,
+                hybrid_opts=cast(dict[str, Any] | None, spec.get("hybrid")),
+            )
+            return self._raw_rows_to_chunks(rows)
 
         # Vector mode (or fallback when Search API unavailable)
-        col = self._get_collection()
-        query_kwargs = self._build_query_kwargs(spec)
-        result = col.query(**query_kwargs)
-        return _query_results_to_chunks(result, self._content_attr)
+        rows = self._chroma.query_raw(
+            text_query=spec.get("text_query"),
+            vector_query=spec.get("vector_query"),
+            top_k=spec.get("top_k", 10),
+            where=where,
+        )
+        return self._raw_rows_to_chunks(rows)
 
     def search_content(self, spec: SearchSpec) -> list[str]:
         """Search and return content strings without Chunk construction.
@@ -745,19 +523,26 @@ class ChromaChunkSource:
         self._validate_spec(spec)
         mode = spec.get("mode")
 
-        if self._search_api and mode in ("lexical", "hybrid"):
-            result = self._search_via_api(spec)
-            return self._search_results_to_strings(result)
+        where = to_chroma_filters(spec.get("filter"), self._search_capabilities)
 
-        col = self._get_collection()
-        query_kwargs = self._build_query_kwargs(spec)
-        result = col.query(**query_kwargs)
-        docs = result.get("documents", [[]])[0]
-        metas = result.get("metadatas", [[]])[0]
-        return [
-            _extract_content(doc, meta, self._content_attr)
-            for doc, meta in zip(docs, metas)
-        ]
+        if self._chroma.search_api and mode in ("lexical", "hybrid"):
+            rows = self._chroma.search_api_raw(
+                text_query=spec.get("text_query") or "",
+                vector_query=spec.get("vector_query"),
+                mode=mode,
+                top_k=spec.get("top_k", 10),
+                where=where,
+                hybrid_opts=cast(dict[str, Any] | None, spec.get("hybrid")),
+            )
+            return self._raw_rows_to_strings(rows)
+
+        rows = self._chroma.query_raw(
+            text_query=spec.get("text_query"),
+            vector_query=spec.get("vector_query"),
+            top_k=spec.get("top_k", 10),
+            where=where,
+        )
+        return self._raw_rows_to_strings(rows)
 
     def search_text(
         self,
@@ -837,8 +622,8 @@ class ChromaChunkSource:
 
         # Batch-embed all queries when embed_fn available and vectors needed
         vectors: list[list[float]] | None = None
-        if self._embed_fn is not None and (use_hybrid or not use_lexical):
-            vectors = self._embed_fn(queries)
+        if self._chroma.embed_fn is not None and (use_hybrid or not use_lexical):
+            vectors = self._chroma.embed_fn(queries)
 
         related_map: dict[str, dict] = {}
 
@@ -909,21 +694,33 @@ class ChromaChunkSource:
     def _search_with_scores(self, spec: SearchSpec) -> list[tuple[Chunk, float]]:
         """Search and return (Chunk, score) pairs.
 
-        Uses actual backend scores — Search API scores for lexical/hybrid,
+        Uses actual backend scores -- Search API scores for lexical/hybrid,
         Chroma distances (converted: higher = better) for vector/legacy.
         """
         self._validate_spec(spec)
         mode = spec.get("mode")
 
-        if self._search_api and mode in ("lexical", "hybrid"):
-            result = self._search_via_api(spec)
-            return self._search_results_to_scored_chunks(result)
+        where = to_chroma_filters(spec.get("filter"), self._search_capabilities)
 
-        # Legacy query() API — distances (lower = closer)
-        col = self._get_collection()
-        query_kwargs = self._build_query_kwargs(spec)
-        result = col.query(**query_kwargs)
-        return _query_results_to_scored_chunks(result, self._content_attr)
+        if self._chroma.search_api and mode in ("lexical", "hybrid"):
+            rows = self._chroma.search_api_raw(
+                text_query=spec.get("text_query") or "",
+                vector_query=spec.get("vector_query"),
+                mode=mode,
+                top_k=spec.get("top_k", 10),
+                where=where,
+                hybrid_opts=cast(dict[str, Any] | None, spec.get("hybrid")),
+            )
+            return self._raw_rows_to_scored_chunks(rows)
+
+        # Legacy query() API -- distances (lower = closer)
+        rows = self._chroma.query_raw(
+            text_query=spec.get("text_query"),
+            vector_query=spec.get("vector_query"),
+            top_k=spec.get("top_k", 10),
+            where=where,
+        )
+        return self._raw_rows_to_scored_chunks(rows)
 
     def get_search_capabilities(self) -> SearchCapabilities:
         """Return search capabilities for ChromaDB backend.
@@ -934,133 +731,14 @@ class ChromaChunkSource:
         on older servers, causing a downgrade to vector-only).
         """
         if (
-            self._collection is None
-            and self._enable_bm25
+            self._chroma._collection is None
+            and self._chroma.enable_bm25
             and self.is_client_server
             and "lexical" in self._search_capabilities["modes"]
         ):
-            self._get_collection()
+            # Force collection creation to detect sparse index support
+            self._chroma.get_collection()
+            # Sync capabilities after potential downgrade
+            self._search_capabilities["modes"] = cast(set[SearchMode], self._chroma.modes)
+            self._search_capabilities["ranking"] = set(self._chroma.ranking)
         return self._search_capabilities
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-
-class _WrapEmbedFn:
-    """Adapt a plain ``Callable[[list[str]], list[list[float]]]`` to the
-    chromadb ``EmbeddingFunction`` protocol.
-
-    Chromadb 1.5+ requires ``name()``, ``embed_query()``, and other
-    methods for collection configuration and query embedding.
-    """
-
-    def __init__(self, fn: Callable[[list[str]], list[list[float]]]) -> None:
-        self._fn = fn
-
-    def __call__(self, input: list[str]) -> list[list[float]]:  # noqa: N802
-        return self._fn(input)
-
-    def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: N802
-        return self._fn(input)
-
-    @staticmethod
-    def name() -> str:
-        return "default"
-
-    @staticmethod
-    def is_legacy() -> bool:
-        return False
-
-
-def _clean_metadata(meta: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
-    """Filter metadata to only JSON-serializable scalar values.
-
-    Chroma Cloud may include non-serializable objects in metadata
-    (e.g. SparseVector from BM25 indexes).  We keep only str, int,
-    float, bool, and None values.
-    """
-    return tuple(
-        (k, v)
-        for k, v in meta.items()
-        if isinstance(v, (str, int, float, bool, type(None)))
-    )
-
-
-def _extract_content(
-    doc: str | None,
-    meta: dict[str, Any],
-    content_fields: list[str],
-) -> str:
-    """Return the chunk text, reading from metadata when content_fields != ["content"].
-
-    For the default ``["content"]`` case the Chroma ``document`` field is
-    used.  For custom content_attr (pre-existing collections) we pull
-    from the named metadata field(s) and JSON-join when multiple.
-    """
-    if content_fields == ["content"]:
-        return doc or ""
-    if len(content_fields) == 1:
-        return str(meta.get(content_fields[0], doc or ""))
-    import json as _json
-
-    return _json.dumps(
-        {f: meta.get(f, "") for f in content_fields}, default=str
-    )
-
-
-def _results_to_chunks(
-    result: dict[str, Any],
-    content_fields: list[str] | None = None,
-) -> list[Chunk]:
-    """Convert a Chroma ``get()`` result dict to a list of Chunks."""
-    fields = content_fields or ["content"]
-    docs = result.get("documents") or []
-    metas = result.get("metadatas") or []
-    chunks: list[Chunk] = []
-    for doc, meta in zip(docs, metas):
-        content = _extract_content(doc, meta, fields)
-        chunks.append(Chunk(content=content, metadata=_clean_metadata(meta)))
-    return chunks
-
-
-def _query_results_to_chunks(
-    result: dict[str, Any],
-    content_fields: list[str] | None = None,
-) -> list[Chunk]:
-    """Convert a Chroma ``query()`` result dict to a list of Chunks.
-
-    Query results are nested one level deeper than get results
-    (list-of-lists since multiple query texts are supported).
-    """
-    fields = content_fields or ["content"]
-    docs = result.get("documents", [[]])[0]
-    metas = result.get("metadatas", [[]])[0]
-    chunks: list[Chunk] = []
-    for doc, meta in zip(docs, metas):
-        content = _extract_content(doc, meta, fields)
-        chunks.append(Chunk(content=content, metadata=_clean_metadata(meta)))
-    return chunks
-
-
-def _query_results_to_scored_chunks(
-    result: dict[str, Any],
-    content_fields: list[str] | None = None,
-) -> list[tuple[Chunk, float]]:
-    """Convert a Chroma ``query()`` result to (Chunk, score) pairs.
-
-    Chroma distances are lower-is-closer; we convert to higher-is-better
-    via ``1 / (1 + distance)`` for consistent ranking with the Search API.
-    """
-    fields = content_fields or ["content"]
-    docs = result.get("documents", [[]])[0]
-    metas = result.get("metadatas", [[]])[0]
-    distances = result.get("distances", [[]])[0]
-    pairs: list[tuple[Chunk, float]] = []
-    for doc, meta, dist in zip(docs, metas, distances):
-        content = _extract_content(doc, meta, fields)
-        chunk = Chunk(content=content, metadata=_clean_metadata(meta))
-        score = 1.0 / (1.0 + dist) if dist >= 0 else 0.0
-        pairs.append((chunk, score))
-    return pairs

@@ -9,8 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from .index_client import PineconeIndexClient
-
 
 class PineconeSearch:
     """Pickle-safe Pinecone search client for RL environments.
@@ -48,10 +46,12 @@ class PineconeSearch:
         self._embed_fn = embed_fn
         self._embed_model = embed_model
         self._field_mapping = field_mapping
-        self._client: PineconeIndexClient | None = None
+        self._client: Any = None
 
-    def _get_client(self) -> PineconeIndexClient:
+    def _get_client(self) -> Any:
         if self._client is None:
+            from .index_client import PineconeIndexClient
+
             self._client = PineconeIndexClient(
                 api_key=self._api_key,
                 index_name=self._index_name,

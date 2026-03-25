@@ -82,7 +82,7 @@ class ChromaClient:
         # Capabilities — may be downgraded on collection creation
         modes: set[str] = {"vector"}
         ranking: set[str] = {"cosine"}
-        if self._search_api and enable_bm25 and host is not None:
+        if self.search_api and enable_bm25 and host is not None:
             modes |= {"lexical", "hybrid"}
             ranking.add("bm25")
 
