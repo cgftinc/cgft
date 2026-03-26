@@ -3,7 +3,7 @@
     from cgft.trainer.pipeline import train
 
     experiment_id = train(
-        env_class=SearchEnv,
+        env_class=SearchClientEnv,
         env_args={"api_key": "..."},
         train_dataset=[...],
         eval_dataset=[...],
@@ -113,7 +113,7 @@ def upload_env(
     """Bundle and upload environment class for training.
 
     Args:
-        env_class: Environment class (e.g., SearchEnv, SummarizationEnv)
+        env_class: Environment class (e.g., SearchClientEnv, SummarizationEnv)
         constructor_args: Arguments to pass to env class constructor
         prefix: Namespace prefix for the upload path (e.g., "cgft-search", "tpuf-search")
         api_key: API key for storage service
@@ -128,12 +128,12 @@ def upload_env(
 
     Examples:
         >>> env_path, meta_path = upload_env(
-        ...     env_class=SearchEnv,
+        ...     env_class=SearchClientEnv,
         ...     constructor_args={"api_key": "..."},
         ...     prefix="cgft-search",
         ...     api_key="your-api-key"
         ... )
-        Bundling SearchEnv...
+        Bundling SearchClientEnv...
         Env uploaded to: envs/cgft-search/a1b2c3d4/env-cls.pkl
     """
     from benchmax.bundle.bundler import bundle_env, write_bundle_files
@@ -243,7 +243,7 @@ def train(
     the training job.  Useful for testing your environment setup.
 
     Args:
-        env_class: Environment class (e.g., SearchEnv, SummarizationEnv)
+        env_class: Environment class (e.g., SearchClientEnv, SummarizationEnv)
         env_args: Constructor arguments for the environment
         train_dataset: List of dicts for the training split
         eval_dataset: List of dicts for the validation split
@@ -330,7 +330,7 @@ def train(
     # Dry run: stop before launching
     if dry_run:
         if show_summary:
-            print(f"\nDry run complete — no training job launched.")
+            print("\nDry run complete — no training job launched.")
         return {
             "status": "validated",
             "env_path": env_blob_path,

@@ -34,12 +34,8 @@ TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated due to character limit]"
 class SearchClientEnv(BaseEnv):
     """Backend-agnostic search environment using SearchClient.
 
-    Subclasses ``BaseEnv`` directly (not ``SearchEnv``) to avoid pulling
-    Chunk/Pydantic into the pickle graph.
-
-    Replaces per-backend envs (PineconeSearchEnv, ChromaSearchEnv, etc.)
-    with a single composable environment.  Any backend that implements
-    :class:`SearchClient` works.
+    Subclasses ``BaseEnv`` directly — no Chunk/Pydantic in the pickle
+    graph.  Any backend that implements :class:`SearchClient` works.
 
     Args:
         search: A :class:`SearchClient` instance (pickle-safe).

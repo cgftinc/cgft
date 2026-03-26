@@ -26,7 +26,7 @@ def overlap_reward(
     ground_truth: Any,
     **kwargs: Any,
 ) -> float:
-    """Compute overlap reward matching SearchEnv's chunk_overlap_reward_function.
+    """Compute overlap reward based on chunk text overlap.
 
     Uses reference_chunks from kwargs when available, falls back to
     ground_truth string.  Penalizes >= 4 tool calls with 0 reward.

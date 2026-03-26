@@ -1,3 +1,3 @@
-from cgft.envs.corpora_search_env import CorporaSearchEnv
+from cgft.envs.search_client_env import SearchClientEnv
 
-__all__ = ["CorporaSearchEnv"]
+__all__ = ["SearchClientEnv"]

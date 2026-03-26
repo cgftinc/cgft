@@ -321,63 +321,6 @@ class TestBuiltInEmbed:
 
 
 # ---------------------------------------------------------------------------
-# PineconeSearchEnv
-# ---------------------------------------------------------------------------
-
-
-class TestPineconeSearchEnv:
-    def _make_env(self, embed_fn=None):
-        from unittest.mock import patch
-
-        from cgft.envs.pinecone_search_env import PineconeSearchEnv
-
-        with patch("cgft.corpus.pinecone.index_client.PineconeIndexClient._get_index"):
-            return PineconeSearchEnv(
-                pinecone_api_key="key",
-                index_name="idx",
-                embed_fn=embed_fn or (lambda texts: [[0.1, 0.2, 0.3]] * len(texts)),
-            )
-
-    def test_creates_search_tool(self):
-        env = self._make_env()
-        assert "search" in env._tools
-        tool_def, _ = env._tools["search"]
-        assert tool_def.name == "search"
-        assert "query" in tool_def.input_schema["properties"]
-        # No "mode" property — Pinecone is vector-only
-        assert "mode" not in tool_def.input_schema["properties"]
-
-    def test_list_tools(self):
-        import asyncio
-
-        env = self._make_env()
-        tools = asyncio.run(env.list_tools())
-        assert len(tools) == 1
-        assert tools[0].name == "search"
-
-    def test_empty_query_returns_error(self):
-        import asyncio
-
-        env = self._make_env()
-        result = asyncio.run(env._search_tool(query=""))
-        assert result.startswith("Error")
-
-    def test_accepts_embed_model_string(self):
-        """Env accepts embed_model (JSON-serializable) for remote training."""
-        from unittest.mock import patch
-
-        from cgft.envs.pinecone_search_env import PineconeSearchEnv
-
-        with patch("cgft.corpus.pinecone.index_client.PineconeIndexClient._get_index"):
-            env = PineconeSearchEnv(
-                pinecone_api_key="key",
-                index_name="idx",
-                embed_model="multilingual-e5-large",
-            )
-        assert "search" in env._tools
-
-
-# ---------------------------------------------------------------------------
 # Dimension mismatch
 # ---------------------------------------------------------------------------
 
