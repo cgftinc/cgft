@@ -10,6 +10,9 @@ from cgft.trainer.validation import validate_env
 class StubSearch:
     """Minimal SearchClient for testing."""
 
+    def __init__(self, modes=None):
+        self._modes = modes or ["vector"]
+
     def search(self, query, mode="auto", top_k=10):
         return ["result one", "result two"]
 
@@ -18,7 +21,7 @@ class StubSearch:
 
     @property
     def available_modes(self):
-        return ["vector"]
+        return self._modes
 
     def get_params(self):
         return {"backend": "stub"}
@@ -52,6 +55,19 @@ class TestHappyPath:
             train_dataset=SAMPLE_DATA,
         )
         assert result is True
+
+    def test_multi_mode_backend_passes(self, capsys):
+        """Multi-mode backends add a 'mode' enum param to the tool schema.
+        validate_env must pick a valid enum value, not 'test query'."""
+        multi = StubSearch(modes=["vector", "lexical", "hybrid"])
+        result = validate_env(
+            env_class=SearchEnv,
+            env_args={"search": multi},
+            train_dataset=SAMPLE_DATA,
+        )
+        assert result is True
+        out = capsys.readouterr().out
+        assert "\u2717" not in out
 
 
 # ── Failure: bad prompt type ─────────────────────────────────────────

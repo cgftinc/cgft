@@ -16,14 +16,44 @@ from typing import Any
 
 import cloudpickle
 
-# Jupyter notebooks have a running event loop — asyncio.run() fails.
-# nest_asyncio patches it to allow nested loops.
-try:
-    import nest_asyncio as _nest_asyncio
+_TOOL_TIMEOUT = 30.0
 
-    _nest_asyncio.apply()
-except ImportError:
-    pass
+
+def _run_async(coro: Any, timeout: float = _TOOL_TIMEOUT) -> Any:
+    """Run a coroutine with a timeout."""
+    return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
+
+
+def _build_dummy_args(
+    schema: dict[str, Any], query: str,
+) -> dict[str, Any]:
+    """Build dummy tool args from a JSON schema, respecting enums."""
+    args: dict[str, Any] = {}
+    for pname, pschema in schema.get("properties", {}).items():
+        ptype = pschema.get("type", "string")
+        if "enum" in pschema:
+            args[pname] = pschema["enum"][0]
+        elif pname in ("query", "text", "search_query"):
+            args[pname] = query
+        elif ptype == "string":
+            args[pname] = "test"
+        elif ptype == "integer":
+            args[pname] = 10
+        elif ptype == "number":
+            args[pname] = 1.0
+        elif ptype == "boolean":
+            args[pname] = True
+    return args
+
+
+def _ensure_nest_asyncio() -> None:
+    """Patch asyncio for Jupyter notebooks (running event loop)."""
+    try:
+        import nest_asyncio
+
+        nest_asyncio.apply()
+    except ImportError:
+        pass
 
 
 def validate_env(
@@ -50,6 +80,8 @@ def validate_env(
     Returns:
         True if all checks pass, False otherwise.
     """
+    _ensure_nest_asyncio()
+
     if not train_dataset:
         print("  \u2717 train_dataset is empty")
         return False
@@ -139,26 +171,18 @@ def validate_env(
 
     if env is not None:
         try:
-            tools = asyncio.run(env.list_tools())
+            tools = _run_async(env.list_tools())
             print(f"  \u2713 list_tools returns {len(tools)} tool(s)")
             passed += 1
 
             if tools:
                 tool = tools[0]
-                dummy_args = {}
-                for prop_name, prop_schema in tool.input_schema.get("properties", {}).items():
-                    ptype = prop_schema.get("type", "string")
-                    if ptype == "string":
-                        dummy_args[prop_name] = "test query"
-                    elif ptype == "integer":
-                        dummy_args[prop_name] = 10
-                    elif ptype == "number":
-                        dummy_args[prop_name] = 1.0
-                    elif ptype == "boolean":
-                        dummy_args[prop_name] = True
+                dummy_args = _build_dummy_args(
+                    tool.input_schema, "test query"
+                )
 
                 try:
-                    result = asyncio.run(
+                    result = _run_async(
                         env.run_tool(rollout_id="test", tool_name=tool.name, **dummy_args)
                     )
                     if isinstance(result, str):
@@ -199,7 +223,7 @@ def validate_env(
                 **init_args,
             }
 
-            reward = asyncio.run(
+            reward = _run_async(
                 env.compute_reward(
                     rollout_id=flattened["rollout_ids"],
                     completion=flattened["completions"],
@@ -251,41 +275,18 @@ def validate_env(
                 init_args = {}
             ref_chunks = example.get("reference_chunks", [])
 
-            tools = asyncio.run(env.list_tools())
+            tools = _run_async(env.list_tools())
 
             # ── Turn 1: model calls the first tool ──────────────
             tool_result = None
             if tools:
                 tool = tools[0]
-                # Build a realistic query from the prompt
                 query = prompt_text[:200] if prompt_text else "test"
-                tool_args: dict[str, Any] = {}
-                for pname, pschema in tool.input_schema.get(
-                    "properties", {}
-                ).items():
-                    ptype = pschema.get("type", "string")
-                    if pname in ("query", "text", "search_query"):
-                        tool_args[pname] = query
-                    elif ptype == "string":
-                        tool_args[pname] = query
-                    elif ptype == "integer":
-                        tool_args[pname] = 5
-                    elif ptype == "number":
-                        tool_args[pname] = 1.0
-                    elif ptype == "boolean":
-                        tool_args[pname] = True
-                # Only pass required args
-                required = set(
-                    tool.input_schema.get("required", [])
+                tool_args = _build_dummy_args(
+                    tool.input_schema, query
                 )
-                tool_args = {
-                    k: v
-                    for k, v in tool_args.items()
-                    if k in required
-                    or k in tool.input_schema.get("properties", {})
-                }
 
-                tool_result = asyncio.run(
+                tool_result = _run_async(
                     env.run_tool(
                         rollout_id="sim-rollout",
                         tool_name=tool.name,
@@ -296,7 +297,7 @@ def validate_env(
             # ── Turn 2: call tool again (catch stateful bugs) ───
             tool_result_2 = None
             if tools and tool_result is not None:
-                tool_result_2 = asyncio.run(
+                tool_result_2 = _run_async(
                     env.run_tool(
                         rollout_id="sim-rollout",
                         tool_name=tool.name,
@@ -342,7 +343,7 @@ def validate_env(
                 **init_args,
             }
 
-            reward = asyncio.run(
+            reward = _run_async(
                 env.compute_reward(
                     rollout_id=sim_sample["rollout_ids"],
                     completion=sim_sample["completions"],
@@ -390,7 +391,7 @@ def validate_env(
         data = cloudpickle.dumps(env_class)
         restored_cls = pickle.loads(data)
         restored_env = restored_cls(**env_args)
-        tools = asyncio.run(restored_env.list_tools())
+        tools = _run_async(restored_env.list_tools())
         print(f"  \u2713 pickle round-trip OK ({len(data)} bytes, {len(tools)} tools)")
         passed += 1
     except Exception as exc:
