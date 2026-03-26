@@ -273,71 +273,47 @@ def validate_env(
             init_args = preprocessed.get("init_rollout_args", {})
             if not isinstance(init_args, dict):
                 init_args = {}
-            ref_chunks = example.get("reference_chunks", [])
 
             tools = _run_async(env.list_tools())
 
-            # ── Turn 1: model calls the first tool ──────────────
-            tool_result = None
-            if tools:
-                tool = tools[0]
+            # ── Call each tool twice (catch stateful bugs) ──────
+            completion_msgs: list[dict[str, Any]] = []
+            tool_call_count = 0
+            for tool in tools:
                 query = prompt_text[:200] if prompt_text else "test"
                 tool_args = _build_dummy_args(
                     tool.input_schema, query
                 )
-
-                tool_result = _run_async(
-                    env.run_tool(
-                        rollout_id="sim-rollout",
-                        tool_name=tool.name,
-                        **tool_args,
+                for _ in range(2):
+                    result = _run_async(
+                        env.run_tool(
+                            rollout_id="sim-rollout",
+                            tool_name=tool.name,
+                            **tool_args,
+                        )
                     )
-                )
-
-            # ── Turn 2: call tool again (catch stateful bugs) ───
-            tool_result_2 = None
-            if tools and tool_result is not None:
-                tool_result_2 = _run_async(
-                    env.run_tool(
-                        rollout_id="sim-rollout",
-                        tool_name=tool.name,
-                        **tool_args,
+                    completion_msgs.append(
+                        {"role": "assistant", "content": "<tool_call>"}
                     )
-                )
+                    completion_msgs.append(
+                        {"role": "tool", "content": str(result)[:500]}
+                    )
+                    tool_call_count += 1
 
-            # ── Build realistic completion ──────────────────────
-            # Mirrors the message format the trainer produces
-            answer_text = str(gt or "The answer based on search.")
-            search_content = str(tool_result or "")[:500]
-
-            completion_msgs: list[dict[str, Any]] = [
-                {
-                    "role": "assistant",
-                    "content": (
-                        "<think>Let me search for information."
-                        "</think>\n<tool_call>"
-                    ),
-                },
-                {
-                    "role": "tool",
-                    "content": search_content,
-                },
-                {
-                    "role": "assistant",
-                    "content": (
-                        f"<think>Based on the search results."
-                        f"</think>\n<answer>{answer_text}</answer>"
-                    ),
-                },
-            ]
+            # Final assistant message with ground truth as answer
+            answer_text = str(gt or "test answer")
+            completion_msgs.append(
+                {"role": "assistant", "content": answer_text}
+            )
 
             # ── Call compute_reward with full context ───────────
-            # Same flattening as reward_worker.py line 190
-            sim_sample = {
+            # Same flattening as reward_worker.py line 190.
+            # Pass through all fields from the original example.
+            sim_sample: dict[str, Any] = {
+                **example,
                 "prompt": prompt_text,
                 "ground_truth": gt,
                 "init_rollout_args": init_args,
-                "reference_chunks": ref_chunks,
                 "rollout_ids": "sim-rollout",
                 "completions": completion_msgs,
                 **init_args,
@@ -370,11 +346,13 @@ def validate_env(
                     )
                     failed += 1
                 else:
-                    turns = "2 tool calls" if tool_result_2 else (
-                        "1 tool call" if tool_result else "no tools"
+                    tools_desc = (
+                        f"{tool_call_count} tool calls"
+                        if tool_call_count
+                        else "no tools"
                     )
                     print(
-                        f"  \u2713 simulated rollout OK ({turns},"
+                        f"  \u2713 simulated rollout OK ({tools_desc},"
                         f" reward={reward})"
                     )
                     passed += 1
