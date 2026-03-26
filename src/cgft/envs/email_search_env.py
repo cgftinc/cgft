@@ -245,7 +245,7 @@ class EmailSearchEnv(SearchEnv):
                     else 0.0
                 ),
             }
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError, AttributeError):
             return zeros
 
     async def _judge_answer_quality(
@@ -286,7 +286,7 @@ class EmailSearchEnv(SearchEnv):
             )
             return (_clip01(pos_result.get("score", 0.0)),
                     _clip01(concise_result.get("score", 0.0)))
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError, AttributeError):
             return (0.0, 0.0)
 
 
