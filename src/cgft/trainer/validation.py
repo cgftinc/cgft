@@ -17,7 +17,7 @@ from typing import Any
 import cloudpickle
 
 
-def validate_env_full(
+def validate_env(
     env_class: type,
     env_args: dict[str, Any],
     train_dataset: list[dict[str, Any]],
@@ -25,14 +25,21 @@ def validate_env_full(
 ) -> bool:
     """Validate an environment class against the trainer's calling conventions.
 
-    Runs 7 checks that mirror how the trainer actually calls env methods.
-    Prints results as they run. Returns True if all checks pass.
+    Runs a comprehensive set of checks that mirror how the trainer actually
+    calls env methods, including a simulated rollout with real tool calls
+    and reward computation.
+
+    Can be called standalone before ``train()`` or is called automatically
+    by ``train(validate_env=True)`` (the default).
 
     Args:
         env_class: The environment class (e.g., SearchEnv).
         env_args: Constructor kwargs for the env (same as train(env_args=...)).
         train_dataset: Training examples (list of dicts with question/answer).
         eval_dataset: Optional eval examples. Uses train_dataset[:2] if not given.
+
+    Returns:
+        True if all checks pass, False otherwise.
     """
     if not train_dataset:
         print("  \u2717 train_dataset is empty")

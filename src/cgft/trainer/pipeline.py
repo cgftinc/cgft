@@ -264,6 +264,21 @@ def train(
         results (dry_run mode).
     """
 
+    # Run local environment validation before uploading anything
+    if validate_env:
+        from cgft.trainer.validation import validate_env as _validate_env
+
+        if show_summary:
+            print(f"\nValidating {env_class.__name__}...")
+        if not _validate_env(env_class, env_args, train_dataset, eval_dataset):
+            raise RuntimeError(
+                "Local environment validation failed."
+                " Fix the errors above before retrying,"
+                " or pass validate_env=False to skip."
+            )
+        if show_summary:
+            print()
+
     # Compute shared hash from combined dataset
     combined_lines = [json.dumps(item, sort_keys=True) for item in train_dataset + eval_dataset]
     dataset_hash = hashlib.sha256("\n".join(combined_lines).encode("utf-8")).hexdigest()[:8]
@@ -309,7 +324,7 @@ def train(
         base_url=base_url,
         pip_dependencies=pip_dependencies,
         local_modules=local_modules,
-        validate=validate_env,
+        validate=False,  # already validated above
         show_summary=show_summary,
     )
 

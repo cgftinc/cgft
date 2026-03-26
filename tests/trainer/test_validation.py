@@ -1,9 +1,9 @@
-"""Tests for validate_env_full — local environment validation."""
+"""Tests for validate_env — local environment validation."""
 
 from __future__ import annotations
 
 from cgft.envs.search_env import SearchEnv
-from cgft.trainer.validation import validate_env_full
+from cgft.trainer.validation import validate_env
 
 # ── Stubs ────────────────────────────────────────────────────────────
 
@@ -34,7 +34,7 @@ SAMPLE_DATA = [
 
 class TestHappyPath:
     def test_search_env_passes_all_checks(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=SearchEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -46,7 +46,7 @@ class TestHappyPath:
         assert "\u2717" not in out
 
     def test_returns_true_on_success(self):
-        result = validate_env_full(
+        result = validate_env(
             env_class=SearchEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -69,7 +69,7 @@ class BadPromptEnv(SearchEnv):
 
 class TestBadPrompt:
     def test_list_prompt_fails_hashability(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=BadPromptEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -88,7 +88,7 @@ class BrokenToolEnv(SearchEnv):
 
 class TestBrokenTool:
     def test_run_tool_error_caught(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=BrokenToolEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -107,7 +107,7 @@ class BadRewardEnv(SearchEnv):
 
 class TestBadReward:
     def test_non_float_reward_values(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=BadRewardEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -125,7 +125,7 @@ class NoPromptEnv(SearchEnv):
 
 class TestNoSystemPrompt:
     def test_empty_system_prompt_fails(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=NoPromptEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -139,7 +139,7 @@ class TestNoSystemPrompt:
 
 class TestEmptyDataset:
     def test_empty_train_dataset_fails(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=SearchEnv,
             env_args={"search": StubSearch()},
             train_dataset=[],
@@ -157,7 +157,7 @@ class BrokenPreprocessEnv(SearchEnv):
 
 class TestBrokenPreprocess:
     def test_preprocess_exception_caught(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=BrokenPreprocessEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -171,7 +171,7 @@ class TestBrokenPreprocess:
 
 class TestSimulatedRollout:
     def test_rollout_runs_with_reference_chunks(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=SearchEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -182,7 +182,7 @@ class TestSimulatedRollout:
         assert "2 tool calls" in out
 
     def test_rollout_catches_broken_tool(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=BrokenToolEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -202,7 +202,7 @@ class NanRewardEnv(SearchEnv):
 
 class TestNanReward:
     def test_nan_reward_fails(self, capsys):
-        result = validate_env_full(
+        result = validate_env(
             env_class=NanRewardEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
@@ -222,7 +222,7 @@ class TestUnpicklableEnvArgs:
             def __reduce__(self):
                 raise _pickle.PicklingError("nope")
 
-        result = validate_env_full(
+        result = validate_env(
             env_class=SearchEnv,
             env_args={"search": StubSearch(), "bad": Unpicklable()},
             train_dataset=SAMPLE_DATA,
@@ -236,7 +236,7 @@ class TestUnpicklableEnvArgs:
 
 class TestOutputFormat:
     def test_prints_all_check_names(self, capsys):
-        validate_env_full(
+        validate_env(
             env_class=SearchEnv,
             env_args={"search": StubSearch()},
             train_dataset=SAMPLE_DATA,
