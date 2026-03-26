@@ -18,6 +18,7 @@ The train() function handles everything automatically:
 - Returns the experiment ID
 
 For more control, you can use the lower-level functions:
+- train(..., dry_run=True) - Validate everything without launching a training job
 - upload_dataset() - Upload a list of dicts as JSONL
 - upload_env() - Bundle and upload environment class
 - launch_job() - Launch from pre-uploaded paths
@@ -227,15 +228,19 @@ def train(
     validate_env: bool = True,
     validate_env_remotely: bool = True,
     show_summary: bool = True,
-) -> str:
+    dry_run: bool = False,
+) -> str | dict[str, Any]:
     """Train a model - the simplest interface for launching training jobs.
 
     This is the recommended high-level function that handles everything:
     1. Uploads your train and val datasets
     2. Bundles and uploads your environment
     3. Validates the environment remotely (optional)
-    4. Launches the training job
-    5. Returns the experiment ID
+    4. Launches the training job (unless ``dry_run=True``)
+    5. Returns the experiment ID (or validation result dict for dry runs)
+
+    Pass ``dry_run=True`` to run all validation steps without launching
+    the training job.  Useful for testing your environment setup.
 
     Args:
         env_class: Environment class (e.g., SearchEnv, SummarizationEnv)
@@ -252,9 +257,11 @@ def train(
         validate_env: Whether to validate environment locally before upload. (default: True)
         validate_env_remotely: Whether to validate environment in a remote rollout server. (default: True)
         show_summary: Whether to print progress information (default: True)
+        dry_run: Validate everything but don't launch the training job. (default: False)
 
     Returns:
-        Experiment ID string
+        Experiment ID string (normal mode), or a dict with validation
+        results (dry_run mode).
     """
 
     # Compute shared hash from combined dataset
@@ -319,6 +326,18 @@ def train(
                 "Remote environment validation failed. "
                 "Fix the errors above before retrying, or pass validate_env_remotely=False to skip."
             )
+
+    # Dry run: stop before launching
+    if dry_run:
+        if show_summary:
+            print("\nDry run complete — no training job launched.")
+        return {
+            "status": "validated",
+            "env_path": env_blob_path,
+            "env_metadata_path": env_meta_blob_path,
+            "train_dataset_path": train_blob_path,
+            "eval_dataset_path": eval_blob_path,
+        }
 
     # Launch training job
     if show_summary:

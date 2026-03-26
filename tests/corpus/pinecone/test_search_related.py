@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from cgft.chunkers.models import Chunk
 
-from .fakes.pinecone import (
+from fakes.pinecone import (
     FakeIndex,
     FileAwareFakeFiles,
     make_match,

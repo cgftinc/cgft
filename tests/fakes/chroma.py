@@ -159,30 +159,32 @@ def make_source(
     embed_fn=None,
     enable_bm25: bool = False,
 ):
-    """Build a ChromaChunkSource with fakes injected — no real Chroma."""
+    """Build a ChromaChunkSource with fakes injected -- no real Chroma.
+
+    Constructs a ChromaClient with the fake collection pre-injected,
+    then wires it into a ChromaChunkSource without calling __init__.
+    """
     from unittest.mock import patch
 
+    from cgft.corpus.chroma.client import ChromaClient
     from cgft.corpus.chroma.source import ChromaChunkSource
 
-    with patch("cgft.corpus.chroma.source._has_search_api", return_value=False):
-        source = ChromaChunkSource.__new__(ChromaChunkSource)
+    # Build a ChromaClient with fakes -- patch has_search_api so it
+    # doesn't try to import chromadb.
+    with patch("cgft.corpus.chroma.client.has_search_api", return_value=False):
+        chroma = ChromaClient(
+            collection_name="test",
+            host="localhost",
+            port=8000,
+            embed_fn=embed_fn,
+            enable_bm25=enable_bm25,
+        )
+    # Inject the fake collection so no real Chroma connection is made
+    chroma._collection = collection
+    chroma._total_count = collection.count() if collection else None
 
-    source._collection_name = "test"
-    source._host = "localhost"
-    source._port = 8000
-    source._path = None
-    source._embed_fn = embed_fn
-    source._content_attr = ["content"]
-    source._distance_metric = "cosine"
-    source._enable_bm25 = enable_bm25
-    source._rrf_k = 60
-    source._rrf_oversample = 20
-    source._rrf_max_candidates = 200
-    source._client = None
-    source._collection = collection
-    source._total_count = collection.count() if collection else None
-    source._embed_dim = None
-    source._search_api = False
+    source = ChromaChunkSource.__new__(ChromaChunkSource)
+    source._chroma = chroma
     source._files = files or NoFileFakeFiles()
     source._search_capabilities = {
         "backend": "chroma",

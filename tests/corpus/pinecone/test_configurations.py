@@ -26,7 +26,7 @@ from cgft.corpus.search_schema.search_exceptions import (
 )
 from cgft.corpus.search_schema.search_types import SearchSpec
 
-from .fakes.pinecone import (
+from fakes.pinecone import (
     FakeIndex,
     NoFileFakeFiles,
     make_match,
@@ -199,17 +199,17 @@ class TestCustomFieldMapping:
 
 
 class TestMinimalRowAttributes:
-    def test_match_to_chunk_only_id_and_content(self):
+    def test_match_to_raw_only_id_and_content(self):
         """Customer index has only id + content, no file metadata."""
         source = make_source(FakeIndex())
         match = SimpleNamespace(id="42", metadata={"content": "just text"}, score=0.5)
-        chunk = source._client.match_to_chunk(match)
-        assert chunk.content == "just text"
-        assert chunk.get_metadata("_pinecone_id") == "42"
-        assert chunk.get_metadata("file_path") is None
-        assert chunk.get_metadata("chunk_index") is None
+        raw = source._client.match_to_raw(match)
+        assert raw["content"] == "just text"
+        assert raw["metadata"]["_pinecone_id"] == "42"
+        assert raw["metadata"].get("file_path") is None
+        assert raw["metadata"].get("chunk_index") is None
 
-    def test_match_to_chunk_extra_custom_fields(self):
+    def test_match_to_raw_extra_custom_fields(self):
         """Customer index has extra fields not in standard schema."""
         source = make_source(FakeIndex())
         match = SimpleNamespace(
@@ -217,9 +217,9 @@ class TestMinimalRowAttributes:
             metadata={"content": "text", "custom_tag": "important", "priority": 5},
             score=0.5,
         )
-        chunk = source._client.match_to_chunk(match)
-        assert chunk.get_metadata("custom_tag") == "important"
-        assert chunk.get_metadata("priority") == 5
+        raw = source._client.match_to_raw(match)
+        assert raw["metadata"]["custom_tag"] == "important"
+        assert raw["metadata"]["priority"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -318,63 +318,6 @@ class TestBuiltInEmbed:
 # ---------------------------------------------------------------------------
 # Dimension mismatch
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# PineconeSearchEnv
-# ---------------------------------------------------------------------------
-
-
-class TestPineconeSearchEnv:
-    def _make_env(self, embed_fn=None):
-        from unittest.mock import patch
-
-        from cgft.envs.pinecone_search_env import PineconeSearchEnv
-
-        with patch("cgft.corpus.pinecone.index_client.PineconeIndexClient._get_index"):
-            return PineconeSearchEnv(
-                pinecone_api_key="key",
-                index_name="idx",
-                embed_fn=embed_fn or (lambda texts: [[0.1, 0.2, 0.3]] * len(texts)),
-            )
-
-    def test_creates_search_tool(self):
-        env = self._make_env()
-        assert "search" in env._tools
-        tool_def, _ = env._tools["search"]
-        assert tool_def.name == "search"
-        assert "query" in tool_def.input_schema["properties"]
-        # No "mode" property — Pinecone is vector-only
-        assert "mode" not in tool_def.input_schema["properties"]
-
-    def test_list_tools(self):
-        import asyncio
-
-        env = self._make_env()
-        tools = asyncio.run(env.list_tools())
-        assert len(tools) == 1
-        assert tools[0].name == "search"
-
-    def test_empty_query_returns_error(self):
-        import asyncio
-
-        env = self._make_env()
-        result = asyncio.run(env._search_tool(query=""))
-        assert result.startswith("Error")
-
-    def test_accepts_embed_model_string(self):
-        """Env accepts embed_model (JSON-serializable) for remote training."""
-        from unittest.mock import patch
-
-        from cgft.envs.pinecone_search_env import PineconeSearchEnv
-
-        with patch("cgft.corpus.pinecone.index_client.PineconeIndexClient._get_index"):
-            env = PineconeSearchEnv(
-                pinecone_api_key="key",
-                index_name="idx",
-                embed_model="multilingual-e5-large",
-            )
-        assert "search" in env._tools
 
 
 # ---------------------------------------------------------------------------

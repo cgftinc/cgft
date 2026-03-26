@@ -1,15 +1,26 @@
-"""Base search environment with shared logic for corpus-backed RL training."""
+"""SearchEnv — unified search environment for any backend.
+
+Uses :class:`SearchClient` instead of per-backend subclasses.
+Pickle-safe: only the SearchClient (which stores serializable connection
+params) is serialized.  No Pydantic/Chunk in the pickle graph.
+"""
 
 from __future__ import annotations
 
-from difflib import SequenceMatcher
-from typing import TYPE_CHECKING, Any
+import traceback
+from collections.abc import Callable
+from typing import Any
 
 from benchmax.envs.base_env import BaseEnv
+from benchmax.envs.tracking import log_env
 from benchmax.envs.types import StandardizedExample, ToolDefinition
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from cgft.corpus.search_client import SearchClient
+from cgft.envs.reward_helpers import (
+    extract_answer_block,
+    extract_completion_text,
+    overlap_reward,
+)
 
 SYSTEM_PROMPT = """Please use the search tool provided to find relevant information from the corpus.
 Formulate effective search queries to retrieve the most relevant chunks.
@@ -20,79 +31,102 @@ MAX_TOOL_OUTPUT_CHARS = 10000
 TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated due to character limit]"
 
 
-def percent_of_text_a_in_text_b(text_a: str, text_b: str) -> float:
-    """Calculate percentage of text_a that appears in text_b."""
-    if not text_a:
-        return 0.0
+class SearchEnv(BaseEnv):
+    """Backend-agnostic search environment using SearchClient.
 
-    matcher = SequenceMatcher(None, text_a, text_b)
-    matched_chars = sum(size for _, _, size in matcher.get_matching_blocks())
-    return matched_chars / len(text_a)
-
-
-async def chunk_overlap_reward_function(completion: str, ground_truth: str, **kwargs: Any) -> float:
-    """Reward function based on chunk overlap.
-
-    Computes the percentage of overlapping text between the completion
-    and the reference chunks.
+    Subclasses ``BaseEnv`` directly — no Chunk/Pydantic in the pickle
+    graph.  Any backend that implements :class:`SearchClient` works.
 
     Args:
-        completion: The model's generated text
-        ground_truth: The reference text (not used directly)
-        **kwargs: Must include reference_chunks
+        search: A :class:`SearchClient` instance (pickle-safe).
+        judge_base_url: Base URL for the LLM judge API (optional).
+        judge_api_key: API key for the LLM judge (optional).
+        judge_model: Model name for the LLM judge (optional).
+        judge_timeout: Timeout for judge API calls.
+        w_correctness: Weight for correctness reward component.
 
-    Returns:
-        float: A score between 0.0 and 1.0 representing the overlap percentage
-    """
-    reference_chunks = kwargs.get("reference_chunks", [])
-    reference_string = " ".join(
-        [
-            chunk.get("content", "") if isinstance(chunk, dict) else str(chunk)
-            for chunk in reference_chunks
-        ]
-    )
+    Example::
 
-    completion_str = completion if isinstance(completion, str) else ""
-    if isinstance(completion, list):
-        completion_str = " ".join(
-            [
-                c.get("content", "")
-                for c in completion
-                if isinstance(c, dict) and c.get("role", "") != "assistant"
-            ]
+        from cgft.corpus.pinecone.search import PineconeSearch
+        from cgft.envs.search_env import SearchEnv
+
+        search = PineconeSearch(api_key="...", index_name="my-docs")
+        env = SearchEnv(search=search)
+
+        # Or with judge reward:
+        env = SearchEnv(
+            search=search,
+            judge_base_url="https://...",
+            judge_api_key="...",
+            judge_model="gpt-4o",
         )
-        # Penalize excessive tool calls
-        for msg in completion:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role", "") != "assistant":
-                continue
-            msg_content = msg.get("content", "")
-            if msg_content.count("<tool_call>") >= 4:
-                return 0.0
+    """
 
-    if reference_string:
-        overlap_score = percent_of_text_a_in_text_b(reference_string, completion_str)
-        if overlap_score >= 0.25:
-            return overlap_score
-    return 0.0
+    def __init__(
+        self,
+        search: SearchClient,
+        *,
+        judge_base_url: str = "",
+        judge_api_key: str = "",
+        judge_model: str = "",
+        judge_timeout: float = 30.0,
+        w_correctness: float = 1.0,
+        **kwargs: Any,
+    ) -> None:
+        self._search = search
+        self._judge_base_url = judge_base_url
+        self._judge_api_key = judge_api_key
+        self._judge_model = judge_model
+        self._judge_timeout = judge_timeout
+        self._w_correctness = w_correctness
+        self._experiment_id = kwargs.get("experiment_id")
+        self._rollout_api_key = kwargs.get("api_key")
 
+        modes = search.available_modes
 
-class SearchEnv(BaseEnv):
-    """Base search environment with shared logic for corpus-backed RL training.
+        # Pick default mode: hybrid > lexical > vector
+        if "hybrid" in modes:
+            self._default_mode = "hybrid"
+        elif "lexical" in modes:
+            self._default_mode = "lexical"
+        else:
+            self._default_mode = "vector"
 
-    Subclasses must set ``self._tools`` in their ``__init__`` as a dict mapping
-    tool name to a tuple of ``(ToolDefinition, Callable)``, e.g.::
+        # Build tool schema from available modes
+        properties: dict[str, Any] = {
+            "query": {
+                "type": "string",
+                "description": "Search query string.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max number of results to return (default 10).",
+            },
+        }
+        if len(modes) > 1:
+            properties["mode"] = {
+                "type": "string",
+                "enum": modes,
+                "description": (
+                    f"Search mode: {', '.join(modes)}. "
+                    f'Default: "{self._default_mode}".'
+                ),
+            }
 
-        self._tools = {
-            "search": (tool_definition, self._search_tool)
+        search_tool = ToolDefinition(
+            name="search",
+            description="Search the corpus.",
+            input_schema={
+                "type": "object",
+                "properties": properties,
+                "required": ["query"],
+            },
+        )
+        self._tools: dict[str, tuple[ToolDefinition, Callable]] = {
+            search_tool.name: (search_tool, self._search_tool)
         }
 
-    See ``CgftSearchEnv`` and ``TpufSearchEnv`` for concrete implementations.
-    """
-
     system_prompt: str = SYSTEM_PROMPT
-    _tools: dict[str, tuple[ToolDefinition, Callable]] = {}
 
     @staticmethod
     def _truncate_tool_output(
@@ -100,17 +134,13 @@ class SearchEnv(BaseEnv):
         max_chars: int = MAX_TOOL_OUTPUT_CHARS,
         suffix: str = TOOL_OUTPUT_TRUNCATION_SUFFIX,
     ) -> str:
-        """Clamp tool output length to avoid overlong prompts in later turns."""
         if len(text) <= max_chars:
             return text
-
         keep = max(0, max_chars - len(suffix))
-        truncated = text[:keep].rstrip()
-        return f"{truncated}{suffix}"
+        return f"{text[:keep].rstrip()}{suffix}"
 
     @classmethod
-    def dataset_preprocess(cls, example: Any, **kwargs) -> StandardizedExample:
-        """Preprocess dataset example into standardized format."""
+    def dataset_preprocess(cls, example: Any, **kwargs: Any) -> StandardizedExample:
         return StandardizedExample(
             prompt=example.get("question", ""),
             ground_truth=example.get("answer", None),
@@ -118,29 +148,108 @@ class SearchEnv(BaseEnv):
         )
 
     async def list_tools(self) -> list[ToolDefinition]:
-        """List available tools."""
         return [self._tools[k][0] for k in sorted(self._tools)]
 
-    async def run_tool(self, rollout_id: str, tool_name: str, **tool_args) -> Any:
-        """Execute a tool.
-
-        Args:
-            rollout_id: Identifier for current rollout
-            tool_name: Name of the tool
-            **tool_args: Arguments for the tool function
-
-        Returns:
-            Tool execution result or error message
-        """
+    async def run_tool(self, rollout_id: str, tool_name: str, **tool_args: Any) -> Any:
         _, tool_function = self._tools[tool_name]
         return await tool_function(**tool_args)
 
-    async def compute_reward(
-        self, rollout_id: str, completion: str, ground_truth: Any, **kwargs: Any
-    ) -> dict[str, float]:
-        """Compute rewards using the chunk overlap reward function."""
-        return {
-            "chunk_overlap_reward_function": await chunk_overlap_reward_function(
-                completion, ground_truth, **kwargs
+    async def _search_tool(
+        self,
+        query: str,
+        mode: str | None = None,
+        limit: int = 10,
+        **kwargs: Any,
+    ) -> str:
+        """Execute search via the SearchClient."""
+        if not query:
+            return "Error: Missing required parameter: 'query'"
+
+        effective_mode = mode or self._default_mode
+        try:
+            results = self._search.search(
+                query=query,
+                mode=effective_mode,
+                top_k=limit,
             )
-        }
+        except Exception:
+            return f"Error:\n{traceback.format_exc()}"
+
+        if not results:
+            return "No results found."
+
+        lines = [
+            f"{i}.\n   Content: {content}"
+            for i, content in enumerate(results, 1)
+        ]
+        return self._truncate_tool_output("\n".join(lines))
+
+    async def compute_reward(
+        self,
+        rollout_id: str,
+        completion: str | list[dict[str, Any]],
+        ground_truth: Any,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Compute reward — uses judge if configured, else overlap."""
+        if not self._judge_base_url or not self._judge_api_key:
+            return {
+                "chunk_overlap_reward_function": overlap_reward(
+                    completion, ground_truth, **kwargs
+                )
+            }
+
+        zeros = {"correctness": 0.0}
+        try:
+            text = extract_completion_text(completion)
+            if not text.strip():
+                return zeros
+
+            answer = extract_answer_block(text)
+            prompt = str(
+                kwargs.get("prompt") or kwargs.get("question") or ""
+            )
+            gt_str = str(ground_truth or "")
+
+            log_env(
+                rollout_id,
+                f"[SearchEnv] Q: {prompt[:200]}\n"
+                f"  GT: {gt_str[:200]}\n"
+                f"  A: {answer[:200]}",
+            )
+
+            from cgft.rubrics.rubric import Rubric, evaluate_single_rubric
+
+            rubric = Rubric(
+                title="Answer correctness",
+                description=(
+                    "Response correctly answers the question and is "
+                    "factually consistent with the reference answer."
+                ),
+                type="positive",
+                score_map={
+                    0: "Provided answer is missing or incorrect.",
+                    0.5: "Partially correct — captures some facts.",
+                    1: "Fully correct and factually consistent.",
+                },
+            )
+            result = await evaluate_single_rubric(
+                rubric=rubric,
+                question=prompt,
+                ground_truth=gt_str,
+                response=answer,
+                model_name=self._judge_model,
+                base_url=self._judge_base_url,
+                api_key=self._judge_api_key,
+                timeout=self._judge_timeout,
+            )
+            score = max(0.0, min(1.0, float(result.get("score", 0.0))))
+            log_env(rollout_id, f"[SearchEnv] correctness={score:.2f}")
+            return {"correctness": self._w_correctness * score}
+
+        except Exception as exc:
+            log_env(
+                rollout_id,
+                f"[SearchEnv] compute_reward failed: {exc}",
+            )
+            return zeros
