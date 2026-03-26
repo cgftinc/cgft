@@ -43,6 +43,10 @@ def _build_dummy_args(
             args[pname] = 1.0
         elif ptype == "boolean":
             args[pname] = True
+        elif ptype == "array":
+            args[pname] = []
+        elif ptype == "object":
+            args[pname] = {}
     return args
 
 
@@ -71,6 +75,11 @@ def validate_env(
     Can be called standalone before ``train()`` or is called automatically
     by ``train(validate_env=True)`` (the default).
 
+    Warning:
+        This function calls your env's tools with dummy arguments
+        against real backends. If your tools have side effects
+        (writes, deletes, sends), use a test backend.
+
     Args:
         env_class: The environment class (e.g., SearchEnv).
         env_args: Constructor kwargs for the env (same as train(env_args=...)).
@@ -89,6 +98,12 @@ def validate_env(
     examples = train_dataset[:5]
     passed = 0
     failed = 0
+
+    print(
+        "  \u26a0 Tools will be called with dummy args against"
+        " real backends. Use a test backend if tools have"
+        " side effects."
+    )
 
     print("Environment Validation")
 
@@ -293,7 +308,7 @@ def validate_env(
                         )
                     )
                     completion_msgs.append(
-                        {"role": "assistant", "content": "<tool_call>"}
+                        {"role": "assistant", "content": "Calling tool."}
                     )
                     completion_msgs.append(
                         {"role": "tool", "content": str(result)[:500]}
