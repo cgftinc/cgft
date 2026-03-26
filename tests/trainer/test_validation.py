@@ -167,6 +167,32 @@ class TestBrokenPreprocess:
         assert "dataset_preprocess raised ValueError" in out
 
 
+# ── Simulated rollout ────────────────────────────────────────────────
+
+class TestSimulatedRollout:
+    def test_rollout_runs_with_reference_chunks(self, capsys):
+        result = validate_env_full(
+            env_class=SearchEnv,
+            env_args={"search": StubSearch()},
+            train_dataset=SAMPLE_DATA,
+        )
+        assert result is True
+        out = capsys.readouterr().out
+        assert "simulated rollout OK" in out
+        assert "2 tool calls" in out
+
+    def test_rollout_catches_broken_tool(self, capsys):
+        result = validate_env_full(
+            env_class=BrokenToolEnv,
+            env_args={"search": StubSearch()},
+            train_dataset=SAMPLE_DATA,
+        )
+        assert result is False
+        out = capsys.readouterr().out
+        # run_tool fails in check 4, so simulated rollout also fails
+        assert "run_tool raised" in out
+
+
 # ── Failure: NaN reward ───────────────────────────────────────────────
 
 class NanRewardEnv(SearchEnv):
@@ -222,6 +248,7 @@ class TestOutputFormat:
         assert "list_tools" in out
         assert "run_tool" in out
         assert "compute_reward" in out
+        assert "simulated rollout" in out
         assert "pickle" in out
         assert "env_args pickle" in out
         assert "system_prompt" in out

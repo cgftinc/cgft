@@ -224,6 +224,151 @@ def validate_env_full(
             print("    The trainer flattens init_rollout_args into the sample dict.")
             failed += 1
 
+    # ── 5b. Simulated rollout (E2E) ────────────────────────────────
+    if env is not None and isinstance(preprocessed, dict) and "prompt" in preprocessed:
+        try:
+            example = examples[0]
+            prompt_text = preprocessed["prompt"]
+            gt = preprocessed.get("ground_truth", "")
+            init_args = preprocessed.get("init_rollout_args", {})
+            if not isinstance(init_args, dict):
+                init_args = {}
+            ref_chunks = example.get("reference_chunks", [])
+
+            tools = asyncio.run(env.list_tools())
+
+            # ── Turn 1: model calls the first tool ──────────────
+            tool_result = None
+            if tools:
+                tool = tools[0]
+                # Build a realistic query from the prompt
+                query = prompt_text[:200] if prompt_text else "test"
+                tool_args: dict[str, Any] = {}
+                for pname, pschema in tool.input_schema.get(
+                    "properties", {}
+                ).items():
+                    ptype = pschema.get("type", "string")
+                    if pname in ("query", "text", "search_query"):
+                        tool_args[pname] = query
+                    elif ptype == "string":
+                        tool_args[pname] = query
+                    elif ptype == "integer":
+                        tool_args[pname] = 5
+                    elif ptype == "number":
+                        tool_args[pname] = 1.0
+                    elif ptype == "boolean":
+                        tool_args[pname] = True
+                # Only pass required args
+                required = set(
+                    tool.input_schema.get("required", [])
+                )
+                tool_args = {
+                    k: v
+                    for k, v in tool_args.items()
+                    if k in required
+                    or k in tool.input_schema.get("properties", {})
+                }
+
+                tool_result = asyncio.run(
+                    env.run_tool(
+                        rollout_id="sim-rollout",
+                        tool_name=tool.name,
+                        **tool_args,
+                    )
+                )
+
+            # ── Turn 2: call tool again (catch stateful bugs) ───
+            tool_result_2 = None
+            if tools and tool_result is not None:
+                tool_result_2 = asyncio.run(
+                    env.run_tool(
+                        rollout_id="sim-rollout",
+                        tool_name=tool.name,
+                        **tool_args,
+                    )
+                )
+
+            # ── Build realistic completion ──────────────────────
+            # Mirrors the message format the trainer produces
+            answer_text = str(gt or "The answer based on search.")
+            search_content = str(tool_result or "")[:500]
+
+            completion_msgs: list[dict[str, Any]] = [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "<think>Let me search for information."
+                        "</think>\n<tool_call>"
+                    ),
+                },
+                {
+                    "role": "tool",
+                    "content": search_content,
+                },
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"<think>Based on the search results."
+                        f"</think>\n<answer>{answer_text}</answer>"
+                    ),
+                },
+            ]
+
+            # ── Call compute_reward with full context ───────────
+            # Same flattening as reward_worker.py line 190
+            sim_sample = {
+                "prompt": prompt_text,
+                "ground_truth": gt,
+                "init_rollout_args": init_args,
+                "reference_chunks": ref_chunks,
+                "rollout_ids": "sim-rollout",
+                "completions": completion_msgs,
+                **init_args,
+            }
+
+            reward = asyncio.run(
+                env.compute_reward(
+                    rollout_id=sim_sample["rollout_ids"],
+                    completion=sim_sample["completions"],
+                    **sim_sample,
+                )
+            )
+
+            if not isinstance(reward, dict):
+                print(
+                    "  \u2717 simulated rollout: compute_reward returned"
+                    f" {type(reward).__name__}"
+                )
+                failed += 1
+            else:
+                bad = {
+                    k: v for k, v in reward.items()
+                    if not isinstance(v, (int, float))
+                    or not math.isfinite(v)
+                }
+                if bad:
+                    print(
+                        f"  \u2717 simulated rollout: bad reward"
+                        f" values: {bad}"
+                    )
+                    failed += 1
+                else:
+                    turns = "2 tool calls" if tool_result_2 else (
+                        "1 tool call" if tool_result else "no tools"
+                    )
+                    print(
+                        f"  \u2713 simulated rollout OK ({turns},"
+                        f" reward={reward})"
+                    )
+                    passed += 1
+
+        except Exception as exc:
+            print(
+                f"  \u2717 simulated rollout failed:"
+                f" {type(exc).__name__}: {exc}"
+            )
+            failed += 1
+
     # ── 6. Pickle round-trip ─────────────────────────────────────
     try:
         data = cloudpickle.dumps(env_class)
