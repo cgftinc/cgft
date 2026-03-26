@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import pickle
 import tempfile
 from pathlib import Path
@@ -203,8 +204,20 @@ def validate_env_full(
                     print(f"  \u2717 compute_reward has non-float values: {bad_values}")
                     failed += 1
                 else:
-                    print(f"  \u2713 compute_reward returns dict[str, float]: {reward}")
-                    passed += 1
+                    non_finite = {
+                        k: v for k, v in reward.items()
+                        if not math.isfinite(v)
+                    }
+                    if non_finite:
+                        print(f"  \u2717 compute_reward has NaN/Inf values:"
+                              f" {non_finite}")
+                        print("    Fix: reward values must be finite."
+                              " NaN/Inf break training gradients.")
+                        failed += 1
+                    else:
+                        print("  \u2713 compute_reward returns"
+                              f" dict[str, float]: {reward}")
+                        passed += 1
         except Exception as exc:
             print(f"  \u2717 compute_reward raised {type(exc).__name__}: {exc}")
             print("    Fix: compute_reward must accept (rollout_id, completion, **sample).")
@@ -221,6 +234,19 @@ def validate_env_full(
         passed += 1
     except Exception as exc:
         print(f"  \u2717 pickle round-trip failed: {type(exc).__name__}: {exc}")
+        failed += 1
+
+    # ── 6b. env_args pickle ────────────────────────────────────────
+    try:
+        args_data = cloudpickle.dumps(env_args)
+        restored_args = pickle.loads(args_data)
+        assert isinstance(restored_args, dict)
+        print(f"  \u2713 env_args pickle round-trip OK ({len(args_data)} bytes)")
+        passed += 1
+    except Exception as exc:
+        print(f"  \u2717 env_args pickle failed: {type(exc).__name__}: {exc}")
+        print("    Fix: env_args must be serializable. Lambdas, SDK"
+              " clients, and Pydantic models may not pickle.")
         failed += 1
 
     # ── 7. System prompt ─────────────────────────────────────────

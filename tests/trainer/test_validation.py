@@ -167,6 +167,45 @@ class TestBrokenPreprocess:
         assert "dataset_preprocess raised ValueError" in out
 
 
+# ── Failure: NaN reward ───────────────────────────────────────────────
+
+class NanRewardEnv(SearchEnv):
+    async def compute_reward(self, rollout_id, completion, ground_truth=None, **kwargs):
+        return {"score": float("nan")}
+
+
+class TestNanReward:
+    def test_nan_reward_fails(self, capsys):
+        result = validate_env_full(
+            env_class=NanRewardEnv,
+            env_args={"search": StubSearch()},
+            train_dataset=SAMPLE_DATA,
+        )
+        assert result is False
+        out = capsys.readouterr().out
+        assert "NaN/Inf" in out
+
+
+# ── Failure: unpicklable env_args ────────────────────────────────────
+
+class TestUnpicklableEnvArgs:
+    def test_lambda_in_env_args_fails(self, capsys):
+        import pickle as _pickle
+
+        class Unpicklable:
+            def __reduce__(self):
+                raise _pickle.PicklingError("nope")
+
+        result = validate_env_full(
+            env_class=SearchEnv,
+            env_args={"search": StubSearch(), "bad": Unpicklable()},
+            train_dataset=SAMPLE_DATA,
+        )
+        assert result is False
+        out = capsys.readouterr().out
+        assert "env_args pickle failed" in out
+
+
 # ── Verify output format ─────────────────────────────────────────────
 
 class TestOutputFormat:
@@ -184,4 +223,5 @@ class TestOutputFormat:
         assert "run_tool" in out
         assert "compute_reward" in out
         assert "pickle" in out
+        assert "env_args pickle" in out
         assert "system_prompt" in out
