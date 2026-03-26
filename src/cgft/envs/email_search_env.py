@@ -1,6 +1,6 @@
 """EmailSearchEnv — email-specific prompt and judge-based rewards.
 
-Extends :class:`SearchClientEnv` with a 5-component reward:
+Extends :class:`SearchEnv` with a 5-component reward:
 correctness, conciseness, citation recall, citation precision,
 and search efficiency.
 """
@@ -17,7 +17,7 @@ from benchmax.envs.types import ToolDefinition
 from cgft.corpus.corpora.search import CorporaSearch
 from cgft.rubrics.rubric import Rubric, evaluate_single_rubric
 
-from .search_client_env import SearchClientEnv
+from .search_env import SearchEnv
 
 EMAIL_SYSTEM_PROMPT = """Answer the given question by using a search engine over both an email corpus and wikipedia entries.
 
@@ -84,7 +84,7 @@ _CITATION_PATTERN = re.compile(
 )
 
 
-class EmailSearchEnv(SearchClientEnv):
+class EmailSearchEnv(SearchEnv):
     """Email-focused search env with judge + citation rewards."""
 
     system_prompt: str = EMAIL_SYSTEM_PROMPT

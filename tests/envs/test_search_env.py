@@ -1,4 +1,4 @@
-"""Tests for SearchClientEnv — unified search environment."""
+"""Tests for SearchEnv — unified search environment."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import cloudpickle
 import pytest
 
 from cgft.corpus.search_client import SearchClient
-from cgft.envs.search_client_env import SearchClientEnv
+from cgft.envs.search_env import SearchEnv
 
 
 class StubSearch:
@@ -39,18 +39,18 @@ class TestInit:
         assert isinstance(StubSearch(), SearchClient)
 
     def test_tool_schema_has_query(self):
-        env = SearchClientEnv(search=StubSearch())
+        env = SearchEnv(search=StubSearch())
         tool_def = env._tools["search"][0]
         assert "query" in tool_def.input_schema["properties"]
         assert "query" in tool_def.input_schema["required"]
 
     def test_no_mode_property_with_single_mode(self):
-        env = SearchClientEnv(search=StubSearch(modes=["vector"]))
+        env = SearchEnv(search=StubSearch(modes=["vector"]))
         tool_def = env._tools["search"][0]
         assert "mode" not in tool_def.input_schema["properties"]
 
     def test_mode_property_with_multiple_modes(self):
-        env = SearchClientEnv(
+        env = SearchEnv(
             search=StubSearch(modes=["lexical", "vector", "hybrid"])
         )
         tool_def = env._tools["search"][0]
@@ -58,36 +58,36 @@ class TestInit:
         assert "hybrid" in tool_def.input_schema["properties"]["mode"]["enum"]
 
     def test_default_mode_hybrid_preferred(self):
-        env = SearchClientEnv(
+        env = SearchEnv(
             search=StubSearch(modes=["lexical", "vector", "hybrid"])
         )
         assert env._default_mode == "hybrid"
 
     def test_default_mode_lexical_when_no_hybrid(self):
-        env = SearchClientEnv(
+        env = SearchEnv(
             search=StubSearch(modes=["lexical", "vector"])
         )
         assert env._default_mode == "lexical"
 
     def test_default_mode_vector_fallback(self):
-        env = SearchClientEnv(search=StubSearch(modes=["vector"]))
+        env = SearchEnv(search=StubSearch(modes=["vector"]))
         assert env._default_mode == "vector"
 
 
 class TestSearchTool:
     def test_empty_query_returns_error(self):
-        env = SearchClientEnv(search=StubSearch())
+        env = SearchEnv(search=StubSearch())
         result = asyncio.run(env._search_tool(query=""))
         assert result.startswith("Error")
 
     def test_returns_formatted_results(self):
-        env = SearchClientEnv(search=StubSearch(results=["foo", "bar"]))
+        env = SearchEnv(search=StubSearch(results=["foo", "bar"]))
         result = asyncio.run(env._search_tool(query="test"))
         assert "foo" in result
         assert "bar" in result
 
     def test_no_results(self):
-        env = SearchClientEnv(search=StubSearch(results=[]))
+        env = SearchEnv(search=StubSearch(results=[]))
         result = asyncio.run(env._search_tool(query="test"))
         assert result == "No results found."
 
@@ -99,7 +99,7 @@ class TestSearchTool:
                 calls.append({"query": query, "mode": mode, "top_k": top_k})
                 return ["result"]
 
-        env = SearchClientEnv(search=TrackingSearch())
+        env = SearchEnv(search=TrackingSearch())
         asyncio.run(env._search_tool(query="test query", limit=5))
         assert len(calls) == 1
         assert calls[0]["query"] == "test query"
@@ -108,7 +108,7 @@ class TestSearchTool:
 
 class TestComputeReward:
     def test_overlap_fallback_without_judge(self):
-        env = SearchClientEnv(search=StubSearch())
+        env = SearchEnv(search=StubSearch())
         result = asyncio.run(env.compute_reward(
             rollout_id="r1",
             completion="the reference text is here",
@@ -119,7 +119,7 @@ class TestComputeReward:
         assert result["chunk_overlap_reward_function"] > 0.25
 
     def test_overlap_zero_no_match(self):
-        env = SearchClientEnv(search=StubSearch())
+        env = SearchEnv(search=StubSearch())
         result = asyncio.run(env.compute_reward(
             rollout_id="r1",
             completion="completely different",
@@ -131,7 +131,7 @@ class TestComputeReward:
     @patch("cgft.rubrics.rubric.evaluate_single_rubric", new_callable=AsyncMock)
     def test_judge_reward_path(self, mock_eval):
         mock_eval.return_value = {"score": 0.8}
-        env = SearchClientEnv(
+        env = SearchEnv(
             search=StubSearch(),
             judge_base_url="http://judge.test/v1",
             judge_api_key="test-key",
@@ -149,7 +149,7 @@ class TestComputeReward:
         mock_eval.assert_awaited_once()
 
     def test_judge_empty_completion_returns_zero(self):
-        env = SearchClientEnv(
+        env = SearchEnv(
             search=StubSearch(),
             judge_base_url="http://judge.test/v1",
             judge_api_key="test-key",
@@ -165,24 +165,24 @@ class TestComputeReward:
 
 class TestDatasetPreprocess:
     def test_extracts_question_answer(self):
-        result = SearchClientEnv.dataset_preprocess(
+        result = SearchEnv.dataset_preprocess(
             {"question": "What is X?", "answer": "Y"}
         )
         assert result["prompt"] == "What is X?"
         assert result["ground_truth"] == "Y"
 
     def test_missing_question_returns_empty(self):
-        result = SearchClientEnv.dataset_preprocess({"answer": "Y"})
+        result = SearchEnv.dataset_preprocess({"answer": "Y"})
         assert result["prompt"] == ""
 
     def test_missing_answer_returns_none(self):
-        result = SearchClientEnv.dataset_preprocess({"question": "What?"})
+        result = SearchEnv.dataset_preprocess({"question": "What?"})
         assert result["ground_truth"] is None
 
 
 class TestListTools:
     def test_returns_tool_definitions(self):
-        env = SearchClientEnv(search=StubSearch())
+        env = SearchEnv(search=StubSearch())
         tools = asyncio.run(env.list_tools())
         assert len(tools) == 1
         assert tools[0].name == "search"
@@ -190,16 +190,16 @@ class TestListTools:
 
 class TestPickle:
     def test_class_pickle(self):
-        data = cloudpickle.dumps(SearchClientEnv)
+        data = cloudpickle.dumps(SearchEnv)
         restored = pickle.loads(data)
-        assert restored.__name__ == "SearchClientEnv"
+        assert restored.__name__ == "SearchEnv"
 
     def test_instance_pickle_roundtrip(self):
         search = StubSearch(modes=["lexical", "vector"])
-        env = SearchClientEnv(search=search)
+        env = SearchEnv(search=search)
         data = cloudpickle.dumps(env)
         restored = pickle.loads(data)
-        assert isinstance(restored, SearchClientEnv)
+        assert isinstance(restored, SearchEnv)
         assert restored._default_mode == "lexical"
         assert restored._search._modes == ["lexical", "vector"]
         # Verify the restored env still works

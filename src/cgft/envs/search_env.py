@@ -1,4 +1,4 @@
-"""SearchClientEnv — unified search environment for any backend.
+"""SearchEnv — unified search environment for any backend.
 
 Uses :class:`SearchClient` instead of per-backend subclasses.
 Pickle-safe: only the SearchClient (which stores serializable connection
@@ -31,7 +31,7 @@ MAX_TOOL_OUTPUT_CHARS = 10000
 TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated due to character limit]"
 
 
-class SearchClientEnv(BaseEnv):
+class SearchEnv(BaseEnv):
     """Backend-agnostic search environment using SearchClient.
 
     Subclasses ``BaseEnv`` directly — no Chunk/Pydantic in the pickle
@@ -48,13 +48,13 @@ class SearchClientEnv(BaseEnv):
     Example::
 
         from cgft.corpus.pinecone.search import PineconeSearch
-        from cgft.envs.search_client_env import SearchClientEnv
+        from cgft.envs.search_env import SearchEnv
 
         search = PineconeSearch(api_key="...", index_name="my-docs")
-        env = SearchClientEnv(search=search)
+        env = SearchEnv(search=search)
 
         # Or with judge reward:
-        env = SearchClientEnv(
+        env = SearchEnv(
             search=search,
             judge_base_url="https://...",
             judge_api_key="...",
@@ -213,7 +213,7 @@ class SearchClientEnv(BaseEnv):
 
             log_env(
                 rollout_id,
-                f"[SearchClientEnv] Q: {prompt[:200]}\n"
+                f"[SearchEnv] Q: {prompt[:200]}\n"
                 f"  GT: {gt_str[:200]}\n"
                 f"  A: {answer[:200]}",
             )
@@ -244,12 +244,12 @@ class SearchClientEnv(BaseEnv):
                 timeout=self._judge_timeout,
             )
             score = max(0.0, min(1.0, float(result.get("score", 0.0))))
-            log_env(rollout_id, f"[SearchClientEnv] correctness={score:.2f}")
+            log_env(rollout_id, f"[SearchEnv] correctness={score:.2f}")
             return {"correctness": self._w_correctness * score}
 
         except Exception as exc:
             log_env(
                 rollout_id,
-                f"[SearchClientEnv] compute_reward failed: {exc}",
+                f"[SearchEnv] compute_reward failed: {exc}",
             )
             return zeros
