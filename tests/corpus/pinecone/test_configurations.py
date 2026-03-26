@@ -26,7 +26,7 @@ from cgft.corpus.search_schema.search_exceptions import (
 )
 from cgft.corpus.search_schema.search_types import SearchSpec
 
-from .fakes.pinecone import (
+from fakes.pinecone import (
     FakeIndex,
     NoFileFakeFiles,
     make_match,
