@@ -324,7 +324,7 @@ def train(
         base_url=base_url,
         pip_dependencies=pip_dependencies,
         local_modules=local_modules,
-        validate=False,  # already validated above
+        validate=validate_env,
         show_summary=show_summary,
     )
 
