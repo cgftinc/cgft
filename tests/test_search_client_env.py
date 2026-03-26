@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import pickle
+from unittest.mock import AsyncMock, patch
 
 import cloudpickle
+import pytest
 
 from cgft.corpus.search_client import SearchClient
 from cgft.envs.search_client_env import SearchClientEnv
@@ -126,6 +128,40 @@ class TestComputeReward:
         ))
         assert result["chunk_overlap_reward_function"] == 0.0
 
+    @patch("cgft.rubrics.rubric.evaluate_single_rubric", new_callable=AsyncMock)
+    def test_judge_reward_path(self, mock_eval):
+        mock_eval.return_value = {"score": 0.8}
+        env = SearchClientEnv(
+            search=StubSearch(),
+            judge_base_url="http://judge.test/v1",
+            judge_api_key="test-key",
+            judge_model="gpt-4o",
+            w_correctness=0.5,
+        )
+        result = asyncio.run(env.compute_reward(
+            rollout_id="r1",
+            completion="The answer is <answer>42</answer>",
+            ground_truth="42",
+            prompt="What is the answer?",
+        ))
+        assert "correctness" in result
+        assert result["correctness"] == pytest.approx(0.4)  # 0.8 * 0.5
+        mock_eval.assert_awaited_once()
+
+    def test_judge_empty_completion_returns_zero(self):
+        env = SearchClientEnv(
+            search=StubSearch(),
+            judge_base_url="http://judge.test/v1",
+            judge_api_key="test-key",
+            judge_model="gpt-4o",
+        )
+        result = asyncio.run(env.compute_reward(
+            rollout_id="r1",
+            completion="   ",
+            ground_truth="42",
+        ))
+        assert result["correctness"] == 0.0
+
 
 class TestDatasetPreprocess:
     def test_extracts_question_answer(self):
@@ -134,6 +170,14 @@ class TestDatasetPreprocess:
         )
         assert result["prompt"] == "What is X?"
         assert result["ground_truth"] == "Y"
+
+    def test_missing_question_returns_empty(self):
+        result = SearchClientEnv.dataset_preprocess({"answer": "Y"})
+        assert result["prompt"] == ""
+
+    def test_missing_answer_returns_none(self):
+        result = SearchClientEnv.dataset_preprocess({"question": "What?"})
+        assert result["ground_truth"] is None
 
 
 class TestListTools:
@@ -149,3 +193,15 @@ class TestPickle:
         data = cloudpickle.dumps(SearchClientEnv)
         restored = pickle.loads(data)
         assert restored.__name__ == "SearchClientEnv"
+
+    def test_instance_pickle_roundtrip(self):
+        search = StubSearch(modes=["lexical", "vector"])
+        env = SearchClientEnv(search=search)
+        data = cloudpickle.dumps(env)
+        restored = pickle.loads(data)
+        assert isinstance(restored, SearchClientEnv)
+        assert restored._default_mode == "lexical"
+        assert restored._search._modes == ["lexical", "vector"]
+        # Verify the restored env still works
+        result = asyncio.run(restored._search_tool(query="test"))
+        assert "result one" in result

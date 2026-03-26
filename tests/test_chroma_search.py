@@ -5,6 +5,7 @@ from __future__ import annotations
 import pickle
 
 import cloudpickle
+import pytest
 
 from cgft.corpus.chroma.search import ChromaSearch
 
@@ -81,6 +82,11 @@ class TestSearch:
         ]
         results = cs.search("query", mode="auto")
         assert results == ["lexical result"]
+
+    def test_invalid_mode_raises(self):
+        cs = _make_search(modes={"vector"})
+        with pytest.raises(ValueError, match="does not support mode 'hybrid'"):
+            cs.search("query", mode="hybrid")
 
 
 class TestEmbed:

@@ -9,8 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from .client import ChromaClient
-
 
 class ChromaSearch:
     """Pickle-safe Chroma search client for RL environments.
@@ -43,10 +41,12 @@ class ChromaSearch:
         self._embed_fn = embed_fn
         self._enable_bm25 = enable_bm25
         self._content_attr = content_attr
-        self._client: ChromaClient | None = None
+        self._client: Any = None
 
-    def _get_client(self) -> ChromaClient:
+    def _get_client(self) -> Any:
         if self._client is None:
+            from .client import ChromaClient
+
             self._client = ChromaClient(
                 collection_name=self._collection_name,
                 host=self._host,
@@ -74,6 +74,11 @@ class ChromaSearch:
                 mode = "lexical"
             else:
                 mode = "vector"
+        elif mode not in client.modes:
+            raise ValueError(
+                f"ChromaSearch does not support mode '{mode}'. "
+                f"Available modes: {sorted(client.modes)}"
+            )
 
         if client.search_api and mode in ("lexical", "hybrid"):
             vec = client.embed(query) if mode == "hybrid" else None
