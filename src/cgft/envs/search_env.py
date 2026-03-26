@@ -247,7 +247,7 @@ class SearchEnv(BaseEnv):
             log_env(rollout_id, f"[SearchEnv] correctness={score:.2f}")
             return {"correctness": self._w_correctness * score}
 
-        except Exception as exc:
+        except (KeyError, ValueError, TypeError) as exc:
             log_env(
                 rollout_id,
                 f"[SearchEnv] compute_reward failed: {exc}",
