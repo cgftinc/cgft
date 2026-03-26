@@ -16,6 +16,15 @@ from typing import Any
 
 import cloudpickle
 
+# Jupyter notebooks have a running event loop — asyncio.run() fails.
+# nest_asyncio patches it to allow nested loops.
+try:
+    import nest_asyncio as _nest_asyncio
+
+    _nest_asyncio.apply()
+except ImportError:
+    pass
+
 
 def validate_env(
     env_class: type,
