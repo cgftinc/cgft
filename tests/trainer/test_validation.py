@@ -70,6 +70,31 @@ class TestHappyPath:
         assert "\u2717" not in out
 
 
+# ── List prompt (now valid) ──────────────────────────────────────────
+
+class ListPromptEnv(SearchEnv):
+    @classmethod
+    def dataset_preprocess(cls, example, **kwargs):
+        from benchmax.envs.types import StandardizedExample
+        return StandardizedExample(
+            prompt=[{"role": "system", "content": "hi"}, {"role": "user", "content": "hello"}],
+            ground_truth=example.get("answer", ""),
+            init_rollout_args={},
+        )
+
+
+class TestListPrompt:
+    def test_list_prompt_passes(self, capsys):
+        result = validate_env(
+            env_class=ListPromptEnv,
+            env_args={"search": StubSearch()},
+            train_dataset=SAMPLE_DATA,
+        )
+        assert result is True
+        out = capsys.readouterr().out
+        assert "list of messages" in out
+
+
 # ── Failure: bad prompt type ─────────────────────────────────────────
 
 class BadPromptEnv(SearchEnv):
@@ -77,14 +102,14 @@ class BadPromptEnv(SearchEnv):
     def dataset_preprocess(cls, example, **kwargs):
         from benchmax.envs.types import StandardizedExample
         return StandardizedExample(
-            prompt=["message1", "message2"],  # list, not string!
+            prompt=12345,  # wrong type entirely
             ground_truth=example.get("answer", ""),
             init_rollout_args={},
         )
 
 
 class TestBadPrompt:
-    def test_list_prompt_fails_hashability(self, capsys):
+    def test_bad_prompt_type_fails(self, capsys):
         result = validate_env(
             env_class=BadPromptEnv,
             env_args={"search": StubSearch()},
@@ -92,7 +117,7 @@ class TestBadPrompt:
         )
         assert result is False
         out = capsys.readouterr().out
-        assert "NOT hashable" in out or "not a string" in out
+        assert "unexpected type" in out
 
 
 # ── Failure: broken run_tool ─────────────────────────────────────────
