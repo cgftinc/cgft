@@ -39,12 +39,8 @@ class TpufNamespace:
     ) -> None:
         import turbopuffer
 
-        self._ns = turbopuffer.Turbopuffer(
-            api_key=api_key, region=region
-        ).namespace(namespace)
-        self.fields: list[str] = (
-            content_attr if content_attr is not None else ["content"]
-        )
+        self._ns = turbopuffer.Turbopuffer(api_key=api_key, region=region).namespace(namespace)
+        self.fields: list[str] = content_attr if content_attr is not None else ["content"]
         self.vector_field = str(vector_attr or "vector").strip() or "vector"
         self.embed_fn = embed_fn
         self.distance_metric = distance_metric
@@ -112,9 +108,7 @@ class TpufNamespace:
         """Return the text content for a row, drawn from ``self.fields``."""
         if len(self.fields) == 1:
             return str(getattr(row, self.fields[0], ""))
-        return json.dumps(
-            {f: getattr(row, f, "") for f in self.fields}, default=str
-        )
+        return json.dumps({f: getattr(row, f, "") for f in self.fields}, default=str)
 
     def row_to_chunk(self, row: Any) -> Chunk:
         """Convert a Turbopuffer row to a :class:`Chunk`.
@@ -125,7 +119,9 @@ class TpufNamespace:
         content = self.row_content(row)
 
         try:
-            raw = vars(row)
+            # Turbopuffer Row is a Pydantic model; dynamic attributes
+            # (all user metadata) live in model_extra, not __dict__.
+            raw = getattr(row, "model_extra", None) or vars(row)
             attrs: dict = {
                 k: v
                 for k, v in raw.items()
@@ -148,18 +144,21 @@ class TpufNamespace:
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
         batch_size: int = 100,
         show_summary: bool = True,
+        id_offset: int = 0,
     ) -> int:
         """Upload a :class:`ChunkCollection` to the namespace.
+
+        Args:
+            id_offset: Starting offset for row IDs (default 0). The first
+                chunk gets ID ``id_offset + 1``. Use this when uploading
+                a slice of a larger collection to keep IDs consistent.
 
         Returns the total number of chunks written.
         """
         all_chunks = list(collection)
 
         if show_summary:
-            print(
-                f"\nUploading {len(all_chunks)} chunks to Turbopuffer"
-                " namespace..."
-            )
+            print(f"\nUploading {len(all_chunks)} chunks to Turbopuffer namespace...")
 
         for batch_start in tqdm(
             range(0, len(all_chunks), batch_size),
@@ -170,26 +169,40 @@ class TpufNamespace:
 
             _TPUF_ATTR_LIMIT = 4000  # Turbopuffer 4096 byte limit, leave margin
 
-            upsert_rows = [
-                {
-                    "id": batch_start + i + 1,
+            upsert_rows = []
+            for i, chunk in enumerate(batch):
+                row: dict[str, Any] = {
+                    "id": id_offset + batch_start + i + 1,
                     "content": chunk.content,
-                    "file_path": chunk.get_metadata("file", "")[:_TPUF_ATTR_LIMIT],
-                    "h1": chunk.get_metadata("h1", "")[:_TPUF_ATTR_LIMIT],
-                    "h2": chunk.get_metadata("h2", "")[:_TPUF_ATTR_LIMIT],
-                    "h3": chunk.get_metadata("h3", "")[:_TPUF_ATTR_LIMIT],
-                    "chunk_index": chunk.get_metadata("index", 0),
-                    "chunk_hash": chunk.hash,
-                    "char_count": len(chunk),
                 }
-                for i, chunk in enumerate(batch)
-            ]
+
+                # Write all user metadata, truncating strings to the
+                # Turbopuffer attribute size limit.
+                for mk, mv in chunk.metadata:
+                    if mk == "content":
+                        continue
+                    if isinstance(mv, (str, int, float, bool)):
+                        row.setdefault(
+                            mk,
+                            mv[:_TPUF_ATTR_LIMIT] if isinstance(mv, str) else mv,
+                        )
+                    elif mv is not None:
+                        row.setdefault(mk, str(mv)[:_TPUF_ATTR_LIMIT])
+
+                # Derived fields — only fill if not already present.
+                row.setdefault(
+                    "file_path",
+                    chunk.get_metadata("file", "")[:_TPUF_ATTR_LIMIT],
+                )
+                row.setdefault("chunk_index", chunk.get_metadata("index", 0))
+                row["chunk_hash"] = chunk.hash
+                row["char_count"] = len(chunk)
+
+                upsert_rows.append(row)
 
             write_kwargs: dict = {
                 "upsert_rows": upsert_rows,
-                "schema": {
-                    "content": {"type": "string", "full_text_search": True}
-                },
+                "schema": {"content": {"type": "string", "full_text_search": True}},
             }
 
             if embed_fn:
@@ -201,10 +214,7 @@ class TpufNamespace:
             self._ns.write(**write_kwargs)
 
         if show_summary:
-            print(
-                f"\nUpload complete! {len(all_chunks)} chunks written to"
-                " namespace."
-            )
+            print(f"\nUpload complete! {len(all_chunks)} chunks written to namespace.")
 
         return len(all_chunks)
 
@@ -214,10 +224,14 @@ class TpufNamespace:
 
     def get_max_id(self) -> int | None:
         """Return the highest row ID in the namespace, or None if empty."""
-        result = self._ns.query(
-            rank_by=["id", "desc"],
-            top_k=1,
-        )
+        try:
+            result = self._ns.query(
+                rank_by=["id", "desc"],
+                top_k=1,
+            )
+        except Exception:
+            # Namespace doesn't exist yet — will be created on first write.
+            return None
         rows = result.rows
         if not rows:
             return None

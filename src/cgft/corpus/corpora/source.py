@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import warnings
 from typing import TYPE_CHECKING
 
 from cgft.chunkers.inspector import ChunkInspector
@@ -162,17 +163,17 @@ class CorporaChunkSource:
             print(f"Loading chunks from corpus: {self._corpus.name} (ID: {self._corpus.id})")
 
         chunks: list[Chunk] = []
-        offset = 0
+        cursor: str | None = None
         while True:
-            page = self._client.list_corpus_chunks(
+            results, next_cursor = self._client.list_corpus_chunks(
                 corpus_id=corpus_id,
                 limit=page_size,
-                offset=offset,
+                cursor=cursor,
             )
-            if not page.results:
+            if not results:
                 break
 
-            for row in page.results:
+            for row in results:
                 metadata = dict(row.metadata or {})
                 metadata.pop("_local_hash", None)
                 chunks.append(
@@ -183,9 +184,9 @@ class CorporaChunkSource:
                     )
                 )
 
-            offset += len(page.results)
-            if offset >= page.total:
+            if next_cursor is None:
                 break
+            cursor = next_cursor
 
         self.collection = ChunkCollection(chunks)
 
@@ -267,6 +268,16 @@ class CorporaChunkSource:
             List of dicts sorted by relevance (num matching queries DESC, cross-file first,
             max BM25 score DESC), each containing: chunk, queries, same_file, max_score
         """
+        if hybrid is not None:
+            warnings.warn(
+                "CorporaChunkSource does not support hybrid search; 'hybrid' parameter is ignored.",
+                stacklevel=2,
+            )
+        if mode is not None and mode != "lexical":
+            warnings.warn(
+                f"CorporaChunkSource only supports 'lexical' mode; '{mode}' will be ignored.",
+                stacklevel=2,
+            )
         self._assert_ready()
         related_map: dict[str, dict] = {}
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Callable
 from typing import Any
@@ -26,6 +27,8 @@ from .namespace import TpufNamespace
 
 _DEFAULT_RELATED_SEARCH_MODE: SearchMode = "lexical"
 _HYBRID_FUSION_RRF_K = 60.0
+
+logger = logging.getLogger(__name__)
 
 
 class TpufChunkSource:
@@ -197,11 +200,12 @@ class TpufChunkSource:
     # ------------------------------------------------------------------
 
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
-        """Return n randomly sampled chunks, optionally filtered by
-        minimum length.
+        """Return n randomly sampled chunks, optionally filtered by minimum length.
 
-        Uses random ID generation instead of paginating all IDs, making
-        this O(1) queries regardless of namespace size.
+        Uses random ID generation for dense namespaces (efficient in practice).
+        Automatically falls back to full ID pagination when the namespace is sparse
+        (high deletion rate or non-sequential IDs), detected by a low hit rate on
+        the first sampling attempt.
         """
         max_id = self._client.get_max_id()
         if max_id is None:
@@ -219,19 +223,21 @@ class TpufChunkSource:
                 break
 
             remaining = n - len(collected)
-            sample_size = min(int(remaining * oversample), max_id)
+            sample_size = min(int(remaining * oversample), max_id - len(seen_ids))
             candidate_ids = []
             while len(candidate_ids) < sample_size:
                 rid = random.randint(1, max_id)
                 if rid not in seen_ids:
                     seen_ids.add(rid)
                     candidate_ids.append(rid)
-                # Safety: if we've tried most of the ID space, stop
+                # Safety: if we've exhausted the full ID space, stop
                 if len(seen_ids) >= max_id:
                     break
 
             if not candidate_ids:
                 break
+
+            hits_before = len(collected)
 
             # Fetch in batches of 500 to avoid oversized requests
             for batch_start in range(0, len(candidate_ids), 500):
@@ -247,6 +253,40 @@ class TpufChunkSource:
                 if len(collected) >= n:
                     break
 
+            # After the first attempt, measure hit rate. A low rate means the
+            # namespace has sparse IDs (deletions or non-sequential assignment);
+            # fall back to full pagination to avoid many wasted retries.
+            if attempt == 0 and candidate_ids:
+                hit_rate = (len(collected) - hits_before) / len(candidate_ids)
+                if hit_rate < 0.2:
+                    logger.debug(
+                        "sample_chunks: low hit rate (%.2f) on random ID sampling — "
+                        "falling back to full ID pagination for sparse namespace",
+                        hit_rate,
+                    )
+                    return self._sample_chunks_via_pagination(n, min_chars=min_chars)
+
+        return collected[:n]
+
+    def _sample_chunks_via_pagination(self, n: int, min_chars: int = 0) -> list[Chunk]:
+        """Fallback sampler for sparse namespaces: paginate all IDs then sample uniformly."""
+        all_ids = self._client.paginate_all_ids()
+        if not all_ids:
+            return []
+        oversample = 3 if min_chars > 0 else 1
+        candidate_count = min(int(n * oversample), len(all_ids))
+        sampled_ids = random.sample(all_ids, candidate_count)
+        collected: list[Chunk] = []
+        for batch_start in range(0, len(sampled_ids), 500):
+            batch_ids = sampled_ids[batch_start : batch_start + 500]
+            rows = self._client.query_rows_by_ids(batch_ids)
+            for row in rows:
+                chunk = self._client.row_to_chunk(row)
+                if min_chars > 0 and len(chunk.content) < min_chars:
+                    continue
+                collected.append(chunk)
+                if len(collected) >= n:
+                    return collected[:n]
         return collected[:n]
 
     # ------------------------------------------------------------------
@@ -317,8 +357,10 @@ class TpufChunkSource:
             return []
 
         # Skip expensive full-namespace pagination for large namespaces.
-        max_id = self._client.get_max_id()
-        if max_id is not None and max_id > 50_000:
+        # Use actual row count (not max_id) to handle sparse ID spaces where
+        # max_id >> row_count due to deletions or non-sequential assignment.
+        all_ids = self._client.paginate_all_ids()
+        if len(all_ids) > 50_000:
             return []
 
         all_paths = self._files.get_all_file_paths()
