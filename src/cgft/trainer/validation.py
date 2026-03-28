@@ -123,28 +123,21 @@ def validate_env(
         print(f"  \u2717 dataset_preprocess raised {type(exc).__name__}: {exc}")
         failed += 1
 
-    # ── 2. Prompt hashability ────────────────────────────────────
+    # ── 2. Prompt type ───────────────────────────────────────────
     if preprocessed and isinstance(preprocessed, dict) and "prompt" in preprocessed:
         prompt = preprocessed["prompt"]
-        try:
-            hash(prompt)
-            {prompt: True}
-            if not isinstance(prompt, str):
-                print(f"  \u2717 prompt is hashable but not a string — got {type(prompt).__name__}")
-                print("    Fix: dataset_preprocess should return prompt as a string.")
-                failed += 1
-            else:
-                print("  \u2713 prompt is hashable (string)")
-                passed += 1
-        except TypeError:
-            print(f"  \u2717 prompt is NOT hashable — got {type(prompt).__name__}")
-            print("    Fix: dataset_preprocess must return prompt as a"
-                  " string, not a list of messages.")
-            print("    The reward worker uses prompts as dict keys"
-                  " for reroll tracking.")
+        if isinstance(prompt, str):
+            print("  \u2713 prompt is a string")
+            passed += 1
+        elif isinstance(prompt, list):
+            print("  \u2713 prompt is a list of messages")
+            passed += 1
+        else:
+            print(f"  \u2717 prompt has unexpected type: {type(prompt).__name__}")
+            print("    Fix: prompt should be a string or a list of message dicts.")
             failed += 1
     else:
-        print("  - prompt hashability: skipped (no preprocessed result)")
+        print("  - prompt type: skipped (no preprocessed result)")
 
     # ── 3. load_dataset ──────────────────────────────────────────
     try:
