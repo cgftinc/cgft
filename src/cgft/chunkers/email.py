@@ -693,6 +693,8 @@ class EmailChunker:
                 chunk_id = str(descriptor["chunk_id"])
                 child_chunk_ids = list(child_chunk_ids_by_parent_id.get(chunk_id, []))
                 metadata: tuple[tuple[str, object], ...] = (
+                    ("file", thread_id),
+                    ("index", len(chunks)),
                     ("thread_id", thread_id),
                     ("chunk_id", chunk_id),
                     ("parent_chunk_id", descriptor.get("parent_chunk_id") or ""),
