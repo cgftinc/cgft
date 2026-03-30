@@ -369,22 +369,27 @@ class CorpusClient:
         self,
         corpus_id: str,
         limit: int = 500,
-        offset: int = 0,
-    ) -> SearchResult:
-        """List chunks from a corpus using paginated retrieval.
+        cursor: str | None = None,
+    ) -> tuple[list[CorpusChunk], str | None]:
+        """List chunks from a corpus using cursor-based pagination.
 
         Args:
             corpus_id: Corpus to read chunks from
-            limit: Maximum results to return
-            offset: Pagination offset
+            limit: Maximum results to return per page
+            cursor: Last chunk ID from previous page (None for first page)
 
         Returns:
-            SearchResult with chunk rows and total count
+            Tuple of (chunks, next_cursor). next_cursor is None when
+            there are no more pages.
         """
+        params: dict[str, str | int] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+
         response = self._request(
             "GET",
             f"/api/corpora/{corpus_id}/chunks",
-            params={"limit": limit, "offset": offset},
+            params=params,
         )
         self._handle_response_errors(response)
 
@@ -400,11 +405,8 @@ class CorpusClient:
             for r in rows
         ]
 
-        return SearchResult(
-            results=results,
-            total=data.get("total", len(results)),
-            query="",
-        )
+        next_cursor = data.get("nextCursor")
+        return results, next_cursor
 
     def search(
         self,
