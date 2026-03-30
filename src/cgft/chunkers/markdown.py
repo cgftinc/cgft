@@ -1,5 +1,6 @@
 """Markdown document chunker with header-aware splitting."""
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,10 +12,91 @@ from langchain_text_splitters import (
 
 from cgft.chunkers.models import Chunk, ChunkCollection
 
+# Matches lines that are JS/TS import statements, e.g.:
+#   import Foo from "../path/to/file.mdx"
+#   import { Foo, Bar } from '../module'
+_MDX_IMPORT_RE = re.compile(r"^\s*import\s+.*\bfrom\s+['\"].*['\"]\s*$", re.MULTILINE)
+
+# Matches ES module export statements at the start of a line, including multi-line blocks, e.g.:
+#   export const metadata = { ... }   (single-line)
+#   export const metadata = {         (multi-line — matched up to next blank line / heading / EOF)
+#     title: "foo",
+#   }
+#   export default function ...
+_MDX_EXPORT_BLOCK_RE = re.compile(
+    r"^\s*export\s+(?:const|let|var|default)\s+.*?(?=\n\n|\n#|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+# Matches JSX self-closing component tags whose name starts with an uppercase letter
+# (which distinguishes React components from HTML void elements like <br />, <hr />, <img />).
+# Examples matched:   <MyComponent />   <DetailSetUpReverseProxy />
+# Examples NOT matched: <br />  <hr />  <img src="x" />
+_JSX_SELF_CLOSING_RE = re.compile(r"<[A-Z][A-Za-z0-9]*(?:\s+[^>]*)?\s*/\s*>")
+
+# Matches JSX block component tags that wrap only whitespace, e.g.:
+#   <MyWrapper>   </MyWrapper>
+#   <MyWrapper>\n\n</MyWrapper>
+# The component name must start with uppercase (React convention).
+_JSX_EMPTY_BLOCK_RE = re.compile(r"<([A-Z][A-Za-z0-9]*)[^>]*>\s*</\1>", re.DOTALL)
+
+# Matches HTML comments: <!-- ... -->
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+# Code fence delimiter used to find protected regions.
+_CODE_FENCE_RE = re.compile(r"^```", re.MULTILINE)
+
+
+def _preprocess_mdx(text: str) -> str:
+    """Strip MDX-specific boilerplate from a document before chunking.
+
+    This removes content that adds no informational value to chunks:
+    - JS/TS import statements (``import X from "..."``).
+    - ES module export statements (``export const ...``).
+    - JSX self-closing component tags whose name is PascalCase (React components).
+    - JSX block component tags that contain only whitespace children.
+    - HTML comments (``<!-- ... -->``).
+
+    Content inside markdown code fences (``` blocks) is intentionally left
+    untouched so that legitimate code examples are preserved.
+
+    Args:
+        text: Raw MDX (or plain Markdown) source text.
+
+    Returns:
+        Cleaned text with MDX boilerplate removed and excess blank lines
+        collapsed to at most two consecutive newlines.
+    """
+    # Split on code-fence boundaries so we can process prose regions only.
+    # Parts at even indices (0, 2, 4, …) are outside fences; odd indices are inside.
+    parts = _CODE_FENCE_RE.split(text)
+
+    cleaned_parts: list[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            # Inside a code fence — reconstruct the fence delimiters and leave content alone.
+            cleaned_parts.append("```" + part)
+        else:
+            # Outside a code fence — apply MDX stripping.
+            part = _HTML_COMMENT_RE.sub("", part)
+            part = _MDX_IMPORT_RE.sub("", part)
+            part = _MDX_EXPORT_BLOCK_RE.sub("", part)
+            part = _JSX_EMPTY_BLOCK_RE.sub("", part)
+            part = _JSX_SELF_CLOSING_RE.sub("", part)
+            cleaned_parts.append(part)
+
+    result = "".join(cleaned_parts)
+
+    # Collapse runs of more than two consecutive blank lines.
+    result = re.sub(r"\n{3,}", "\n\n", result)
+
+    return result
+
 
 @dataclass
 class _MutableSection:
     """Mutable intermediate representation used during chunking."""
+
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -79,6 +161,7 @@ class MarkdownChunker:
         content: str,
         file: str | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        preprocess_mdx: bool = False,
     ) -> list[Chunk]:
         """Chunk a markdown document.
 
@@ -86,11 +169,18 @@ class MarkdownChunker:
             content: Raw markdown text.
             file: Optional file path to include in metadata.
             extra_metadata: Optional additional metadata to include in all chunks.
+            preprocess_mdx: If True, run :func:`_preprocess_mdx` on the content
+                before header splitting to remove JSX/import boilerplate.
+                Set automatically by :meth:`chunk_file` and :meth:`chunk_folder`
+                for ``.mdx`` files.
 
         Returns:
             List of Chunk objects with content and metadata.
             Metadata includes header hierarchy (h1, h2, h3), index, and file if provided.
         """
+        if preprocess_mdx:
+            content = _preprocess_mdx(content)
+
         sections = self._split_by_headers(content)
 
         if not sections:
@@ -141,6 +231,9 @@ class MarkdownChunker:
     def chunk_file(self, file_path: str | Path) -> list[Chunk]:
         """Chunk a markdown file.
 
+        ``.mdx`` files are automatically preprocessed to strip JSX/import
+        boilerplate before chunking (see :func:`_preprocess_mdx`).
+
         Args:
             file_path: Path to the markdown file.
 
@@ -149,7 +242,8 @@ class MarkdownChunker:
         """
         file_path = Path(file_path)
         content = file_path.read_text(encoding="utf-8")
-        return self.chunk(content, file=str(file_path.name))
+        is_mdx = file_path.suffix.lower() == ".mdx"
+        return self.chunk(content, file=str(file_path.name), preprocess_mdx=is_mdx)
 
     def chunk_folder(
         self,
@@ -182,7 +276,8 @@ class MarkdownChunker:
             try:
                 content = file_path.read_text(encoding="utf-8")
                 relative_path = str(file_path.relative_to(folder_path))
-                chunks = self.chunk(content, file=relative_path)
+                is_mdx = file_path.suffix.lower() == ".mdx"
+                chunks = self.chunk(content, file=relative_path, preprocess_mdx=is_mdx)
                 all_chunks.extend(chunks)
 
             except Exception as e:
@@ -194,8 +289,7 @@ class MarkdownChunker:
         """Split content by markdown headers."""
         splits = self._header_splitter.split_text(content)
         return [
-            _MutableSection(content=doc.page_content, metadata=dict(doc.metadata))
-            for doc in splits
+            _MutableSection(content=doc.page_content, metadata=dict(doc.metadata)) for doc in splits
         ]
 
     def _fuse_short_sections(self, sections: list[_MutableSection]) -> list[_MutableSection]:
@@ -248,8 +342,6 @@ class MarkdownChunker:
         for section in sections:
             sub_chunks = self._text_splitter.split_text(section.content)
             for sub_chunk in sub_chunks:
-                result.append(
-                    _MutableSection(content=sub_chunk, metadata=section.metadata.copy())
-                )
+                result.append(_MutableSection(content=sub_chunk, metadata=section.metadata.copy()))
 
         return result
