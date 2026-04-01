@@ -83,3 +83,31 @@ def extract_answer_block(text: str) -> str:
     """Extract content from <answer> tags, or return full text."""
     match = _ANSWER_TAG_RE.search(text or "")
     return (match.group(1) if match else text).strip()
+
+
+def clip01(value: Any) -> float:
+    """Clip a value to [0, 1]."""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def count_search_calls(completion: str | list[dict[str, Any]]) -> int:
+    """Count search tool calls in a completion."""
+    if isinstance(completion, str):
+        return completion.count("<tool_call>")
+    if not isinstance(completion, list):
+        return 0
+    count = 0
+    for msg in completion:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                count += content.count("<tool_call>")
+    return count
+
+
+def search_within_budget(calls: int, max_calls: int) -> bool:
+    """Check if the number of search calls is within budget."""
+    return calls <= max_calls

@@ -185,6 +185,9 @@ def upload_env(
         write_bundle_files(bundle, pickle_path, metadata_path)
         env_cls_bytes = pickle_path.read_bytes()
         env_meta_bytes = metadata_path.read_bytes()
+        # Pickled constructor_args (if non-JSON-serializable).
+        args_pickle_path = pickle_path.with_suffix(".args.pkl")
+        env_args_bytes = args_pickle_path.read_bytes() if args_pickle_path.exists() else None
 
     # Generate content hash for versioning
     content_hash = hashlib.sha256(env_cls_bytes + env_meta_bytes).hexdigest()[:8]
@@ -205,6 +208,16 @@ def upload_env(
         content=env_meta_bytes,
         mime_type="application/json",
     )
+
+    if env_args_bytes is not None:
+        if show_summary:
+            print(f"Pickled constructor_args size: {len(env_args_bytes) / 1024:.2f} KB")
+        env_args_path = f"envs/{prefix}/{content_hash}/env-cls.args.pkl"
+        storage_client.upload_file(
+            path=env_args_path,
+            content=env_args_bytes,
+            mime_type="application/octet-stream",
+        )
 
     if show_summary:
         print(f"Env uploaded to: {env_result['blobPath']}")

@@ -7,6 +7,12 @@ from cgft.trainer.validation import validate_env
 
 # ── Stubs ────────────────────────────────────────────────────────────
 
+JUDGE_ARGS = {
+    "judge_base_url": "http://judge.test/v1",
+    "judge_api_key": "test-key",
+    "judge_model": "gpt-4o-mini",
+}
+
 class StubSearch:
     """Minimal SearchClient for testing."""
 
@@ -33,13 +39,19 @@ SAMPLE_DATA = [
 ]
 
 
+def _env_args(**overrides):
+    args = {"search": StubSearch(), **JUDGE_ARGS}
+    args.update(overrides)
+    return args
+
+
 # ── Happy path ───────────────────────────────────────────────────────
 
 class TestHappyPath:
     def test_search_env_passes_all_checks(self, capsys):
         result = validate_env(
             env_class=SearchEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is True
@@ -51,7 +63,7 @@ class TestHappyPath:
     def test_returns_true_on_success(self):
         result = validate_env(
             env_class=SearchEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is True
@@ -62,7 +74,7 @@ class TestHappyPath:
         multi = StubSearch(modes=["vector", "lexical", "hybrid"])
         result = validate_env(
             env_class=SearchEnv,
-            env_args={"search": multi},
+            env_args=_env_args(search=multi),
             train_dataset=SAMPLE_DATA,
         )
         assert result is True
@@ -87,7 +99,7 @@ class TestBadPrompt:
     def test_list_prompt_fails_hashability(self, capsys):
         result = validate_env(
             env_class=BadPromptEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -106,7 +118,7 @@ class TestBrokenTool:
     def test_run_tool_error_caught(self, capsys):
         result = validate_env(
             env_class=BrokenToolEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -125,7 +137,7 @@ class TestBadReward:
     def test_non_float_reward_values(self, capsys):
         result = validate_env(
             env_class=BadRewardEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -136,14 +148,16 @@ class TestBadReward:
 # ── Failure: missing system_prompt ───────────────────────────────────
 
 class NoPromptEnv(SearchEnv):
-    system_prompt = ""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.system_prompt = ""
 
 
 class TestNoSystemPrompt:
     def test_empty_system_prompt_fails(self, capsys):
         result = validate_env(
             env_class=NoPromptEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -157,7 +171,7 @@ class TestEmptyDataset:
     def test_empty_train_dataset_fails(self, capsys):
         result = validate_env(
             env_class=SearchEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=[],
         )
         assert result is False
@@ -175,7 +189,7 @@ class TestBrokenPreprocess:
     def test_preprocess_exception_caught(self, capsys):
         result = validate_env(
             env_class=BrokenPreprocessEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -189,7 +203,7 @@ class TestSimulatedRollout:
     def test_rollout_runs_with_reference_chunks(self, capsys):
         result = validate_env(
             env_class=SearchEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is True
@@ -200,7 +214,7 @@ class TestSimulatedRollout:
     def test_rollout_catches_broken_tool(self, capsys):
         result = validate_env(
             env_class=BrokenToolEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -220,7 +234,7 @@ class TestNanReward:
     def test_nan_reward_fails(self, capsys):
         result = validate_env(
             env_class=NanRewardEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -240,7 +254,7 @@ class TestUnpicklableEnvArgs:
 
         result = validate_env(
             env_class=SearchEnv,
-            env_args={"search": StubSearch(), "bad": Unpicklable()},
+            env_args=_env_args(bad=Unpicklable()),
             train_dataset=SAMPLE_DATA,
         )
         assert result is False
@@ -254,7 +268,7 @@ class TestOutputFormat:
     def test_prints_all_check_names(self, capsys):
         validate_env(
             env_class=SearchEnv,
-            env_args={"search": StubSearch()},
+            env_args=_env_args(),
             train_dataset=SAMPLE_DATA,
         )
         out = capsys.readouterr().out
