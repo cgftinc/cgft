@@ -53,6 +53,9 @@ class SearchClient(Protocol):
         """
         ...
 
+    # search_with_metadata is optional — not part of the Protocol.
+    # Implementations that support it define it; SearchEnv checks via hasattr.
+
     def get_params(self) -> dict[str, Any]:
         """Return serializable connection parameters.
 

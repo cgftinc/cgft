@@ -1,12 +1,13 @@
 """CorporaSearch — pickle-safe search client for RL environments.
 
 Delegates to the Corpora API HTTP client. Lexical (BM25) only.
-No Chunk or Pydantic dependency at import time.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+from .client import CorpusClient
 
 
 class CorporaSearch:
@@ -33,13 +34,11 @@ class CorporaSearch:
         self._corpus_name = corpus_name
         self._base_url = base_url
         self._corpus_id = corpus_id
-        self._client: Any = None
+        self._client: CorpusClient | None = None
 
-    def _get_client(self) -> Any:
+    def _get_client(self) -> CorpusClient:
         if self._client is None:
-            from .client import CorporaAPIClient
-
-            self._client = CorporaAPIClient(
+            self._client = CorpusClient(
                 api_key=self._api_key,
                 base_url=self._base_url,
             )
@@ -68,6 +67,28 @@ class CorporaSearch:
         corpus_id = self._get_corpus_id()
         result = client.search(corpus_id=corpus_id, query=query, limit=top_k)
         return [chunk.content for chunk in result.results]
+
+    def search_with_metadata(
+        self,
+        query: str,
+        mode: str = "auto",
+        top_k: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Search and return structured results with metadata."""
+        if mode not in ("auto", "lexical"):
+            raise ValueError(f"CorporaSearch only supports 'lexical' mode, got '{mode}'.")
+        client = self._get_client()
+        corpus_id = self._get_corpus_id()
+        result = client.search(corpus_id=corpus_id, query=query, limit=top_k)
+        return [
+            {
+                "content": chunk.content,
+                "source": (chunk.metadata or {}).get("file", ""),
+                "metadata": dict(chunk.metadata or {}),
+                "score": chunk.score or 0.0,
+            }
+            for chunk in result.results
+        ]
 
     def embed(self, text: str) -> list[float] | None:
         """Corpora API does not support embeddings."""

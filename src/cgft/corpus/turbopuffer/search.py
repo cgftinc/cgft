@@ -47,19 +47,25 @@ class TpufSearch:
         self._client: Any = None
 
     def _get_client(self) -> Any:
-        if self._client is None:
-            from .namespace import TpufNamespace
+        """Lazily initialize the Turbopuffer namespace client.
 
-            self._client = TpufNamespace(
-                api_key=self._api_key,
-                namespace=self._namespace,
-                region=self._region,
-                content_attr=self._content_attr,
-                embed_fn=self._embed_fn,
-                vector_attr=self._vector_attr,
-                distance_metric=self._distance_metric,
-            )
+        Uses the ``turbopuffer`` SDK directly (no cgft dependency)
+        so this class remains pickle-safe for remote training.
+        """
+        if self._client is None:
+            import turbopuffer
+
+            tpuf = turbopuffer.Turbopuffer(api_key=self._api_key, region=self._region)
+            self._client = tpuf.namespace(self._namespace)
         return self._client
+
+    @staticmethod
+    def _row_content(row: Any) -> str:
+        """Extract content string from a Turbopuffer row."""
+        # Try model_extra first (newer SDK), then getattr
+        extras = getattr(row, "model_extra", None) or {}
+        content = extras.get("content") or getattr(row, "content", None)
+        return str(content) if content else ""
 
     def search(
         self,
@@ -68,8 +74,9 @@ class TpufSearch:
         top_k: int = 10,
     ) -> list[str]:
         """Search and return content strings."""
-        client = self._get_client()
+        ns = self._get_client()
         modes = self.available_modes
+        content_fields = self._content_attr or ["content"]
 
         if mode == "auto":
             if "hybrid" in modes:
@@ -87,24 +94,34 @@ class TpufSearch:
             )
 
         if mode == "lexical":
-            rank_by = client.build_bm25_rank_by(query)
-            result = client.ns.query(rank_by=rank_by, top_k=top_k)
-            return [client.row_content(row) for row in (result.rows or [])]
+            rank_by = [content_fields[0], "BM25", query]
+            result = ns.query(rank_by=rank_by, top_k=top_k, include_attributes=True)
+            return [self._row_content(row) for row in (result.rows or [])]
 
         if mode == "vector":
             vec = self._embed_fn([query])[0]
-            rank_by = client.build_vector_rank_by(vec)
-            result = client.ns.query(rank_by=rank_by, top_k=top_k)
-            return [client.row_content(row) for row in (result.rows or [])]
+            rank_by = [self._vector_attr, "ANN", vec]
+            result = ns.query(
+                rank_by=rank_by,
+                top_k=top_k,
+                include_attributes=True,
+                distance_metric=self._distance_metric,
+            )
+            return [self._row_content(row) for row in (result.rows or [])]
 
         # hybrid: client-side RRF
         vec = self._embed_fn([query])[0]
-        lex_rank = client.build_bm25_rank_by(query)
-        vec_rank = client.build_vector_rank_by(vec)
+        lex_rank = [content_fields[0], "BM25", query]
+        vec_rank = [self._vector_attr, "ANN", vec]
         oversample_k = min(top_k * 2, 10000)
 
-        lex_result = client.ns.query(rank_by=lex_rank, top_k=oversample_k)
-        vec_result = client.ns.query(rank_by=vec_rank, top_k=oversample_k)
+        lex_result = ns.query(rank_by=lex_rank, top_k=oversample_k, include_attributes=True)
+        vec_result = ns.query(
+            rank_by=vec_rank,
+            top_k=oversample_k,
+            include_attributes=True,
+            distance_metric=self._distance_metric,
+        )
 
         # RRF fusion
         k = 60.0
@@ -117,7 +134,88 @@ class TpufSearch:
             fused[row.id]["score"] += 1.0 / (k + rank)
 
         ranked = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
-        return [client.row_content(e["row"]) for e in ranked[:top_k]]
+        return [self._row_content(e["row"]) for e in ranked[:top_k]]
+
+    def search_with_metadata(
+        self,
+        query: str,
+        mode: str = "auto",
+        top_k: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Search and return structured results with metadata."""
+        ns = self._get_client()
+        modes = self.available_modes
+        content_fields = self._content_attr or ["content"]
+
+        if mode == "auto":
+            if "hybrid" in modes:
+                mode = "hybrid"
+            elif "vector" in modes:
+                mode = "vector"
+            else:
+                mode = "lexical"
+
+        if mode not in modes:
+            raise ValueError(f"TpufSearch: mode '{mode}' not available. Available: {modes}.")
+
+        if mode == "lexical":
+            rank_by = [content_fields[0], "BM25", query]
+            result = ns.query(rank_by=rank_by, top_k=top_k, include_attributes=True)
+            return [self._row_to_result(row) for row in (result.rows or [])]
+
+        if mode == "vector":
+            vec = self._embed_fn([query])[0]
+            rank_by = [self._vector_attr, "ANN", vec]
+            result = ns.query(
+                rank_by=rank_by,
+                top_k=top_k,
+                include_attributes=True,
+                distance_metric=self._distance_metric,
+            )
+            return [self._row_to_result(row) for row in (result.rows or [])]
+
+        # hybrid: client-side RRF
+        vec = self._embed_fn([query])[0]
+        lex_rank = [content_fields[0], "BM25", query]
+        vec_rank = [self._vector_attr, "ANN", vec]
+        oversample_k = min(top_k * 2, 10000)
+
+        lex_result = ns.query(rank_by=lex_rank, top_k=oversample_k, include_attributes=True)
+        vec_result = ns.query(
+            rank_by=vec_rank,
+            top_k=oversample_k,
+            include_attributes=True,
+            distance_metric=self._distance_metric,
+        )
+
+        k = 60.0
+        fused: dict[Any, dict[str, Any]] = {}
+        for rank, row in enumerate(lex_result.rows or []):
+            fused.setdefault(row.id, {"row": row, "score": 0.0})
+            fused[row.id]["score"] += 1.0 / (k + rank)
+        for rank, row in enumerate(vec_result.rows or []):
+            fused.setdefault(row.id, {"row": row, "score": 0.0})
+            fused[row.id]["score"] += 1.0 / (k + rank)
+
+        ranked = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
+        return [self._row_to_result(e["row"], score=e["score"]) for e in ranked[:top_k]]
+
+    def _row_to_result(self, row: Any, score: float | None = None) -> dict[str, Any]:
+        """Convert a Turbopuffer row to a structured result dict."""
+        extras = getattr(row, "model_extra", None) or {}
+        content = extras.get("content") or getattr(row, "content", None) or ""
+        source = extras.get("file") or extras.get("file_path") or ""
+        metadata = {
+            k: v
+            for k, v in extras.items()
+            if k not in ("content", "$dist") and not k.startswith("$")
+        }
+        return {
+            "content": str(content),
+            "source": str(source),
+            "metadata": metadata,
+            "score": float(score if score is not None else getattr(row, "$dist", 0.0) or 0.0),
+        }
 
     def embed(self, text: str) -> list[float] | None:
         if self._embed_fn is None:
