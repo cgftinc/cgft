@@ -769,6 +769,7 @@ class RolloutClient:
                     env_cls_bytes=env_cls_bytes,
                     env_metadata_bytes=env_metadata_bytes,
                     example_index=i,
+                    llm_model="gpt-5.4-nano"
                 )
                 if not final.get("success"):
                     all_ok = False

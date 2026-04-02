@@ -73,6 +73,7 @@ class LLMSanityValidator:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
+                timeout=60.0,
             )
         except Exception as exc:
             logger.exception("LLMSanityValidator call failed.")

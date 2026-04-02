@@ -42,12 +42,12 @@ class _RetrievalItemData:
     too_easy_overlap_triggered: bool
     matched_reference_ids: list[str] = field(default_factory=list)
 
+
 _FILTER_MODE = "retrieval_too_easy_llm"
 _JUDGE_SYSTEM_PROMPT = DEFAULT_RETRIEVAL_JUDGE_SYSTEM_PROMPT
 _JUDGE_USER_TEMPLATE = DEFAULT_RETRIEVAL_JUDGE_USER_TEMPLATE
 _JUDGE_TAG_TOO_EASY = "too_easy_lexical"
-_JUDGE_TAG_UNSUPPORTED = "unsupported"
-_JUDGE_TAG_PASS = "challenging_answerable_pass"
+_JUDGE_TAG_PASS = "challenging_retrieval_pass"
 _JUDGE_TAG_UNKNOWN = "unknown"
 _FAILURE_TYPE_TOO_EASY = "too_easy"
 _FAILURE_TYPE_NONE = "none"
@@ -76,9 +76,21 @@ class RetrievalLLMFilter:
             base_url=cfg.judge_base_url,
         )
 
+    def _resolve_search_mode(self, context: CgftContext) -> str | None:
+        """Use the best search mode available on the corpus backend."""
+        profile = getattr(context, "profile", None)
+        if profile is None:
+            return None
+        mode = getattr(profile, "best_search_mode", None)
+        if mode and mode != "lexical":
+            return mode
+        return None
+
     def evaluate(self, items: list[GeneratedQA], context: CgftContext) -> list[GeneratedQA]:
         if not self.cfg.enabled:
             return items
+
+        self._corpus_language = str(context.get("corpus_language", "") or "").strip()
 
         max_refinements = context.config.refinement.max_refinements_per_item
         stats_key = str(self.cfg.stats_key or "").strip() or "retrieval_too_easy_filter_stats"
@@ -94,7 +106,6 @@ class RetrievalLLMFilter:
                 "judge_answerable_false": 0,
                 "judge_reason_tags": {
                     _JUDGE_TAG_TOO_EASY: 0,
-                    _JUDGE_TAG_UNSUPPORTED: 0,
                     _JUDGE_TAG_PASS: 0,
                     _JUDGE_TAG_UNKNOWN: 0,
                 },
@@ -108,6 +119,8 @@ class RetrievalLLMFilter:
         self._ensure_stats_shape(stats)
         rewrite_cfg = context.config.filtering.query_rewrite
 
+        search_mode = self._resolve_search_mode(context)
+
         if not self.cfg.batch_enabled:
             for item in items:
                 if item.filter_verdict is not None and not item.is_passed:
@@ -117,6 +130,7 @@ class RetrievalLLMFilter:
                         item,
                         max_refinements=max_refinements,
                         rewrite_cfg=rewrite_cfg,
+                        search_mode=search_mode,
                     )
                 except Exception:
                     logger.exception("RetrievalLLMFilter failed for one item")
@@ -133,7 +147,11 @@ class RetrievalLLMFilter:
             return items
 
         return self._evaluate_batch(
-            items, stats=stats, max_refinements=max_refinements, rewrite_cfg=rewrite_cfg
+            items,
+            stats=stats,
+            max_refinements=max_refinements,
+            rewrite_cfg=rewrite_cfg,
+            search_mode=search_mode,
         )
 
     def _evaluate_batch(
@@ -143,6 +161,7 @@ class RetrievalLLMFilter:
         stats: dict[str, Any],
         max_refinements: int,
         rewrite_cfg: QueryRewriteConfig,
+        search_mode: str | None = None,
     ) -> list[GeneratedQA]:
         """Batch evaluation: search sequentially, judge in parallel."""
         # Phase 1: search + prep for all eligible items
@@ -178,6 +197,7 @@ class RetrievalLLMFilter:
                     source=_DUMMY_CHUNK,
                     queries=[query],
                     top_k=self.cfg.top_k,
+                    mode=search_mode,
                 )
             except Exception:
                 logger.warning(
@@ -193,9 +213,13 @@ class RetrievalLLMFilter:
                 stats["errors"] = int(stats.get("errors", 0)) + 1
                 self._update_stats(stats, item.filter_verdict)
                 continue
-            retrieved_chunks: list[Chunk] = [row["chunk"] for row in search_results if "chunk" in row]
+            retrieved_chunks: list[Chunk] = [
+                row["chunk"] for row in search_results if "chunk" in row
+            ]
             ref_chunks = list(item.qa.get("reference_chunks", []) or [])
-            overlap_ratio, matched_reference_ids = self._compute_overlap(ref_chunks, retrieved_chunks)
+            overlap_ratio, matched_reference_ids = self._compute_overlap(
+                ref_chunks, retrieved_chunks
+            )
             overlap_triggered = overlap_ratio >= self.cfg.overlap_threshold
             too_easy_overlap_triggered = overlap_ratio >= self.cfg.too_easy_overlap_threshold
             prepared.append(
@@ -229,6 +253,12 @@ class RetrievalLLMFilter:
         judge_results: dict[int, dict[str, Any]] = {}
         if judge_prompts:
             system_prompt = self.cfg.judge_system_prompt or _JUDGE_SYSTEM_PROMPT
+            corpus_language = getattr(self, "_corpus_language", "")
+            if corpus_language:
+                system_prompt = (
+                    f"NOTE: The question, answer, and chunks are in {corpus_language}. "
+                    f"Evaluate them in {corpus_language}.\n\n{system_prompt}"
+                )
             batch_result = batch_process_sync(
                 client=self.judge_client,
                 model=self.cfg.judge_model,
@@ -239,6 +269,7 @@ class RetrievalLLMFilter:
                 max_concurrent=self.cfg.max_concurrent,
                 show_progress=self.cfg.show_batch_progress,
                 temperature=0.0,
+                desc="Retrieval filter",
             )
             for j, i in enumerate(needs_judge_indices):
                 response = batch_result.responses[j]
@@ -264,6 +295,7 @@ class RetrievalLLMFilter:
                 refinements = int(data.item.generation_metadata.get("refinement_count", 0))
                 shared_metadata = {
                     "filter_mode": _FILTER_MODE,
+                    "search_mode": search_mode or "default",
                     "retrieval_query": data.query,
                     "ref_overlap_ratio": data.overlap_ratio,
                     "overlap_threshold": self.cfg.overlap_threshold,
@@ -291,7 +323,7 @@ class RetrievalLLMFilter:
                         "judge_called": False,
                         "judge_answerable": None,
                         "judge_reasoning": "",
-                        "judge_reason_tag": _JUDGE_TAG_UNKNOWN,
+                        "judge_reason_tag": _JUDGE_TAG_TOO_EASY,
                         "too_easy_source": "overlap_pre_gate",
                     }
                     verdict = self._too_easy_verdict(
@@ -330,6 +362,7 @@ class RetrievalLLMFilter:
         *,
         max_refinements: int,
         rewrite_cfg: QueryRewriteConfig,
+        search_mode: str | None = None,
     ) -> FilterVerdict:
         query = resolve_retrieval_query(item.qa, rewrite_cfg=rewrite_cfg)
         if not query:
@@ -355,6 +388,7 @@ class RetrievalLLMFilter:
             source=_DUMMY_CHUNK,
             queries=[query],
             top_k=self.cfg.top_k,
+            mode=search_mode,
         )
         retrieved_chunks: list[Chunk] = [row["chunk"] for row in search_results if "chunk" in row]
         ref_chunks = list(item.qa.get("reference_chunks", []) or [])
@@ -365,6 +399,7 @@ class RetrievalLLMFilter:
 
         shared_metadata = {
             "filter_mode": _FILTER_MODE,
+            "search_mode": search_mode or "default",
             "retrieval_query": query,
             "ref_overlap_ratio": overlap_ratio,
             "overlap_threshold": self.cfg.overlap_threshold,
@@ -390,7 +425,7 @@ class RetrievalLLMFilter:
                 "judge_called": False,
                 "judge_answerable": None,
                 "judge_reasoning": "",
-                "judge_reason_tag": _JUDGE_TAG_UNKNOWN,
+                "judge_reason_tag": _JUDGE_TAG_TOO_EASY,
                 "too_easy_source": "overlap_pre_gate",
             }
             return self._too_easy_verdict(
@@ -480,22 +515,45 @@ class RetrievalLLMFilter:
         try:
             payload = json.loads(raw)
             if not isinstance(payload, dict):
-                return {"answerable": False, "confidence": 0.0, "reasoning": "parse_error", "reason_tag": _JUDGE_TAG_UNKNOWN}
+                return {
+                    "answerable": False,
+                    "confidence": 0.0,
+                    "reasoning": "parse_error",
+                    "reason_tag": _JUDGE_TAG_UNKNOWN,
+                }
+            raw_tag = str(payload.get("reason_tag", "")).strip()
+            payload["reason_tag_raw"] = raw_tag
             payload["reason_tag"] = self._extract_judge_reason_tag(
-                reason_tag=payload.get("reason_tag", ""),
+                reason_tag=raw_tag,
                 reasoning=payload.get("reasoning", ""),
             )
             return payload
         except json.JSONDecodeError:
             logger.warning("Judge response parse failure: %s", raw[:240])
-            return {"answerable": False, "confidence": 0.0, "reasoning": "parse_error", "reason_tag": _JUDGE_TAG_UNKNOWN}
+            return {
+                "answerable": False,
+                "confidence": 0.0,
+                "reasoning": "parse_error",
+                "reason_tag": _JUDGE_TAG_UNKNOWN,
+            }
 
     def _run_judge(self, item: GeneratedQA, retrieved_chunks: list[Chunk]) -> dict[str, Any]:
         prompt = self._build_judge_prompt(item, retrieved_chunks)
         if prompt is None:
-            return {"answerable": False, "confidence": 1.0, "reasoning": "No chunks retrieved.", "reason_tag": _JUDGE_TAG_UNKNOWN}
+            return {
+                "answerable": False,
+                "confidence": 1.0,
+                "reasoning": "No chunks retrieved.",
+                "reason_tag": _JUDGE_TAG_UNKNOWN,
+            }
 
         system_prompt = self.cfg.judge_system_prompt or _JUDGE_SYSTEM_PROMPT
+        corpus_language = getattr(self, "_corpus_language", "")
+        if corpus_language:
+            system_prompt = (
+                f"NOTE: The question, answer, and chunks are in {corpus_language}. "
+                f"Evaluate them in {corpus_language}.\n\n{system_prompt}"
+            )
         response = self.judge_client.chat.completions.create(
             model=self.cfg.judge_model,
             messages=[
@@ -520,13 +578,19 @@ class RetrievalLLMFilter:
         answerable = bool(judge_result.get("answerable", False))
         confidence = _safe_float(judge_result.get("confidence", 0.0), default=0.0)
         judge_reasoning = str(judge_result.get("reasoning", "")).strip()
+        reason_tag_raw = str(judge_result.get("reason_tag_raw", "")).strip()
         judge_reason_tag = self._extract_judge_reason_tag(
             reason_tag=judge_result.get("reason_tag", ""),
             reasoning=judge_reasoning,
         )
+        lexical_anchor_evidence = (
+            str(judge_result.get("lexical_anchor_evidence", "") or "").strip() or None
+        )
         too_easy_high_confidence = confidence >= self.cfg.too_easy_confidence_threshold
         too_easy_due_to_judge = judge_reason_tag == _JUDGE_TAG_TOO_EASY and too_easy_high_confidence
-        too_easy_calibrated_out = judge_reason_tag == _JUDGE_TAG_TOO_EASY and not too_easy_due_to_judge
+        too_easy_calibrated_out = (
+            judge_reason_tag == _JUDGE_TAG_TOO_EASY and not too_easy_due_to_judge
+        )
 
         if too_easy_due_to_judge:
             metadata = {
@@ -540,6 +604,8 @@ class RetrievalLLMFilter:
                 "judge_answerable": answerable,
                 "judge_reasoning": judge_reasoning,
                 "judge_reason_tag": judge_reason_tag,
+                "judge_reason_tag_raw": reason_tag_raw,
+                "judge_lexical_anchor_evidence": lexical_anchor_evidence,
                 "too_easy_high_confidence": too_easy_high_confidence,
                 "too_easy_calibrated_out": False,
                 "too_easy_source": "judge",
@@ -571,6 +637,8 @@ class RetrievalLLMFilter:
                 "judge_answerable": answerable,
                 "judge_reasoning": judge_reasoning,
                 "judge_reason_tag": judge_reason_tag,
+                "judge_reason_tag_raw": reason_tag_raw,
+                "judge_lexical_anchor_evidence": lexical_anchor_evidence,
                 "too_easy_high_confidence": too_easy_high_confidence,
                 "too_easy_calibrated_out": too_easy_calibrated_out,
                 "too_easy_source": "none",
@@ -626,32 +694,20 @@ class RetrievalLLMFilter:
     @staticmethod
     def _extract_judge_reason_tag(*, reason_tag: Any = "", reasoning: Any = "") -> str:
         explicit = str(reason_tag or "").strip().lower()
-        if explicit in {_JUDGE_TAG_TOO_EASY, _JUDGE_TAG_UNSUPPORTED, _JUDGE_TAG_PASS}:
-            return explicit
-        if explicit == "too_easy":
+        if explicit in {_JUDGE_TAG_TOO_EASY, "too_easy"}:
             return _JUDGE_TAG_TOO_EASY
-        if explicit == "pass":
+        # Anything that isn't too_easy is a pass — including "unsupported"
+        # (means BM25 couldn't retrieve the right chunks = retrieval is hard)
+        # and old tag names like "challenging_answerable_pass".
+        if explicit and explicit != _JUDGE_TAG_UNKNOWN:
             return _JUDGE_TAG_PASS
 
-        # When no reason_tag was provided (neutral prompt), return unknown immediately
-        # without scanning reasoning text — avoids false substring matches like
-        # "unsupported" appearing in natural reasoning prose.
-        if not explicit:
-            return _JUDGE_TAG_UNKNOWN
-
-        # An explicit but unrecognized tag was given; try bracket-prefixed reasoning.
+        # Fallback: scan reasoning text for known tag values.
         text = str(reasoning or "").strip().lower()
-        if text.startswith("[") and "]" in text:
-            candidate = text[1 : text.find("]")].strip()
-            if candidate in {_JUDGE_TAG_TOO_EASY, _JUDGE_TAG_UNSUPPORTED, _JUDGE_TAG_PASS}:
-                return candidate
-
-        if "too_easy_lexical" in text:
+        if "too_easy" in text:
             return _JUDGE_TAG_TOO_EASY
-        if "challenging_answerable_pass" in text:
+        if text:
             return _JUDGE_TAG_PASS
-        if "unsupported" in text or "unanswerable" in text:
-            return _JUDGE_TAG_UNSUPPORTED
         return _JUDGE_TAG_UNKNOWN
 
     @staticmethod
@@ -674,7 +730,6 @@ class RetrievalLLMFilter:
             stats["judge_reason_tags"] = {}
             tags = stats["judge_reason_tags"]
         tags.setdefault(_JUDGE_TAG_TOO_EASY, 0)
-        tags.setdefault(_JUDGE_TAG_UNSUPPORTED, 0)
         tags.setdefault(_JUDGE_TAG_PASS, 0)
         tags.setdefault(_JUDGE_TAG_UNKNOWN, 0)
 
@@ -684,12 +739,14 @@ class RetrievalLLMFilter:
 
         overlap_triggered = bool(metadata.get("overlap_triggered", False))
         if overlap_triggered:
-            stats["overlap_threshold_triggered"] = int(stats.get("overlap_threshold_triggered", 0)) + 1
+            stats["overlap_threshold_triggered"] = (
+                int(stats.get("overlap_threshold_triggered", 0)) + 1
+            )
         too_easy_overlap_triggered = bool(metadata.get("too_easy_overlap_triggered", False))
         if too_easy_overlap_triggered:
-            stats["too_easy_overlap_threshold_triggered"] = int(
-                stats.get("too_easy_overlap_threshold_triggered", 0)
-            ) + 1
+            stats["too_easy_overlap_threshold_triggered"] = (
+                int(stats.get("too_easy_overlap_threshold_triggered", 0)) + 1
+            )
 
         judge_called = bool(metadata.get("judge_called", False))
         if judge_called:
@@ -699,7 +756,9 @@ class RetrievalLLMFilter:
                 if judge_answerable:
                     stats["judge_answerable_true"] = int(stats.get("judge_answerable_true", 0)) + 1
                 else:
-                    stats["judge_answerable_false"] = int(stats.get("judge_answerable_false", 0)) + 1
+                    stats["judge_answerable_false"] = (
+                        int(stats.get("judge_answerable_false", 0)) + 1
+                    )
 
             judge_reason_tag = (
                 str(metadata.get("judge_reason_tag", "")).strip().lower() or _JUDGE_TAG_UNKNOWN
@@ -715,10 +774,8 @@ class RetrievalLLMFilter:
             stats["too_easy_total"] = int(stats.get("too_easy_total", 0)) + 1
             source = str(metadata.get("too_easy_source", "")).strip()
             if source == "overlap_pre_gate":
-                stats["too_easy_due_to_overlap_pre_gate"] = int(
-                    stats.get("too_easy_due_to_overlap_pre_gate", 0)
-                ) + 1
+                stats["too_easy_due_to_overlap_pre_gate"] = (
+                    int(stats.get("too_easy_due_to_overlap_pre_gate", 0)) + 1
+                )
             elif source == "judge":
-                stats["too_easy_due_to_judge"] = int(
-                    stats.get("too_easy_due_to_judge", 0)
-                ) + 1
+                stats["too_easy_due_to_judge"] = int(stats.get("too_easy_due_to_judge", 0)) + 1
