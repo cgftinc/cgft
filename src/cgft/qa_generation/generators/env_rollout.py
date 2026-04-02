@@ -25,9 +25,7 @@ _ESCAPED_CLOSE_BRACE = "__CGFT_ESCAPED_CLOSE_BRACE__"
 
 
 def _render_template_safe(template: str, variables: dict[str, Any]) -> str:
-    protected = (
-        template.replace("{{", _ESCAPED_OPEN_BRACE).replace("}}", _ESCAPED_CLOSE_BRACE)
-    )
+    protected = template.replace("{{", _ESCAPED_OPEN_BRACE).replace("}}", _ESCAPED_CLOSE_BRACE)
     required_fields = set(_TEMPLATE_FIELD_RE.findall(protected))
     missing_fields = sorted(field for field in required_fields if field not in variables)
     if not missing_fields:
@@ -91,15 +89,10 @@ def _chunk_to_reference_chunk(chunk: Any) -> ReferenceChunk:
 
 def _format_secondary_chunks(anchor: AnchorBundle) -> str:
     chunks = list(anchor.secondary_chunks)
-    chunks.extend(anchor.structural_hints.get("bm25_related", []))
     if not chunks:
         return "(none)"
     return "\n\n".join(
-        (
-            chunk.chunk_str(max_chars=600)
-            if hasattr(chunk, "chunk_str")
-            else str(chunk)[:600]
-        )
+        (chunk.chunk_str(max_chars=600) if hasattr(chunk, "chunk_str") else str(chunk)[:600])
         for chunk in chunks
     )
 
@@ -139,9 +132,7 @@ class EnvRolloutGenerator:
             )
 
         if cls_bytes is None or meta_bytes is None:
-            raise ValueError(
-                "LLM env generation requires env bundle paths or env bundle files."
-            )
+            raise ValueError("LLM env generation requires env bundle paths or env bundle files.")
         return self.rollout_client.stream_rollout(
             raw_example=raw_example,
             env_cls_bytes=cls_bytes,
@@ -175,9 +166,9 @@ class EnvRolloutGenerator:
 
             anchor = self.linker.link(
                 seed_chunk,
-                target_qa_type=task.qa_type,
                 target_hop_count=task.target_hop_count,
                 corpus_pool=corpus_pool,
+                reasoning_mode=task.reasoning_mode,
             )
 
             variables = {
@@ -219,7 +210,9 @@ class EnvRolloutGenerator:
                 continue
 
             reference_chunks = [_chunk_to_reference_chunk(anchor.primary_chunk)]
-            reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in anchor.secondary_chunks)
+            reference_chunks.extend(
+                _chunk_to_reference_chunk(chunk) for chunk in anchor.secondary_chunks
+            )
 
             qa_point: QADataPoint = {
                 "question": question,
@@ -239,6 +232,7 @@ class EnvRolloutGenerator:
                     generation_metadata={
                         "qa_type_target": task.qa_type,
                         "target_hop_count": task.target_hop_count,
+                        "reasoning_mode": task.reasoning_mode,
                         "anchor_bundle": anchor,
                         "generation_mode": "llm_env",
                         "refinement_count": 0,

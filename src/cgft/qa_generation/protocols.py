@@ -18,9 +18,9 @@ class ChunkLinker(Protocol):
         self,
         primary_chunk: Any,
         *,
-        target_qa_type: str | None = None,
         target_hop_count: int | None = None,
         corpus_pool: list[Any] | None = None,
+        reasoning_mode: str = "",
     ) -> AnchorBundle: ...
 
 
@@ -39,13 +39,6 @@ class LLMSupportedGenerator(QuestionGenerator, Protocol):
 
 
 @runtime_checkable
-class LLMEnvSupportedGenerator(QuestionGenerator, Protocol):
-    """Environment-backed rollout generator specialization."""
-
-    def generate(self, tasks: list[GenerationTask], context: CgftContext) -> list[GeneratedQA]: ...
-
-
-@runtime_checkable
 class EvaluatorFilter(Protocol):
     """Evaluates QA candidates and annotates each with a FilterVerdict."""
 
@@ -57,20 +50,6 @@ class LLMBasedFilter(EvaluatorFilter, Protocol):
     """Direct-LLM evaluation filter specialization."""
 
     def evaluate(self, items: list[GeneratedQA], context: CgftContext) -> list[GeneratedQA]: ...
-
-
-@runtime_checkable
-class LLMEnvBasedFilter(EvaluatorFilter, Protocol):
-    """Environment-backed rollout evaluation filter specialization."""
-
-    def evaluate(self, items: list[GeneratedQA], context: CgftContext) -> list[GeneratedQA]: ...
-
-
-@runtime_checkable
-class Refiner(Protocol):
-    """Refines items marked `needs_refinement` and returns updated items."""
-
-    def refine(self, items: list[GeneratedQA], context: CgftContext) -> list[GeneratedQA]: ...
 
 
 @runtime_checkable

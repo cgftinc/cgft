@@ -15,6 +15,7 @@ class CorpusCapabilities:
     has_document_ids: bool
     has_section_headers: bool
     has_sequential_links: bool
+    has_dates: bool
 
     @property
     def can_detect_document_boundaries(self) -> bool:
@@ -27,26 +28,14 @@ class CorpusCapabilities:
         return self.has_sequential_links
 
     @property
-    def can_target_section_synthesis(self) -> bool:
-        """Enables synthesis questions that span named sections."""
-        return self.has_section_headers
-
-    @property
-    def available_qa_types(self) -> list[str]:
-        """
-        Returns question types this corpus can reliably support.
-        Types are removed when required metadata is unavailable.
-        """
-        types = ["lookup", "synthesis"]
-        if self.has_document_ids:
-            types.append("co_located_multi_hop")
-            types.append("cross_document_multi_hop")
-        else:
-            types.append("multi_hop")
-
+    def available_reasoning_modes(self) -> list[str]:
+        """Return reasoning modes this corpus supports."""
+        modes = ["factual", "inference"]
+        if self.has_dates:
+            modes.append("temporal")
         if self.has_sequential_links:
-            types.append("sequential_reasoning")
-        return types
+            modes.append("sequential")
+        return modes
 
     @classmethod
     def detect(cls, sample_chunks: list[Any]) -> "CorpusCapabilities":
@@ -56,6 +45,7 @@ class CorpusCapabilities:
                 has_document_ids=False,
                 has_section_headers=False,
                 has_sequential_links=False,
+                has_dates=False,
             )
 
         metadata: dict[str, Any] = {}
@@ -76,25 +66,29 @@ class CorpusCapabilities:
             key in metadata for key in ("document_id", "file_name", "file", "source", "doc_id")
         )
         has_section_headers = any(
-            key in metadata for key in ("section_header", "header", "h1", "h2", "h3", "title", "heading")
+            key in metadata
+            for key in ("section_header", "header", "h1", "h2", "h3", "title", "heading")
         )
         has_sequential_links = any(
             key in metadata for key in ("prev_chunk_id", "next_chunk_id", "prev_id", "next_id")
-        )
+        ) or ("file" in metadata and "index" in metadata)
+        has_dates = any(key in metadata for key in ("date_start", "date_end", "date", "timestamp"))
 
         return cls(
             has_document_ids=has_document_ids,
             has_section_headers=has_section_headers,
             has_sequential_links=has_sequential_links,
+            has_dates=has_dates,
         )
 
     def describe(self) -> str:
         """Human-readable summary for logging."""
-        available = self.available_qa_types
+        modes = self.available_reasoning_modes
         return (
             f"CorpusCapabilities("
             f"doc_ids={self.has_document_ids}, "
             f"headers={self.has_section_headers}, "
-            f"sequential={self.has_sequential_links}) "
-            f"→ available types: {available}"
+            f"sequential={self.has_sequential_links}, "
+            f"dates={self.has_dates}) "
+            f"→ reasoning modes: {modes}"
         )
