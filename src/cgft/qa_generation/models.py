@@ -34,10 +34,3 @@ class QADataPoint(TypedDict):
 
     # Populated by grounding filter: subset of reference_chunks verified as supporting the answer
     verified_reference_chunks: NotRequired[list[ReferenceChunk]]
-
-    # Populated by unanswerable question pipeline
-    answerability: NotRequired[str]  # "fully_answerable" | "partially_answerable" | "unanswerable"
-    nearest_chunks: NotRequired[list[ReferenceChunk]]  # what search returned (for unanswerable)
-    # "entity_swap" | "constraint_addition" | "implementation_detail"
-    # | "premise_violation" | "gap_targeted"
-    perturbation_type: NotRequired[str]
