@@ -31,6 +31,14 @@ from cgft.qa_generation.cgft_models import (
     build_generation_tasks,
     load_cgft_config,
 )
+from cgft.qa_generation.corpus_profile import (
+    CorpusProfile,
+    build_entity_patterns_from_extraction,
+    compute_entity_document_frequency,
+    compute_token_document_frequency,
+    detect_search_capabilities,
+    diverse_profile_sample,
+)
 from cgft.qa_generation.filters import (
     DeterministicGuardsFilter,
     GroundingLLMFilter,
@@ -40,12 +48,6 @@ from cgft.qa_generation.formatters import TrainEvalFormatter
 from cgft.qa_generation.generated_qa import FilterVerdict, GeneratedQA
 from cgft.qa_generation.generators import DirectLLMGenerator, EnvRolloutGenerator
 from cgft.qa_generation.helpers import render_template
-from cgft.qa_generation.linkers import (
-    RELATED_CHUNK_SYSTEM_PROMPT,
-    RELATED_CHUNK_USER_TEMPLATE,
-    LLMGuidedChunkLinker,
-    StructuralChunkLinker,
-)
 from cgft.qa_generation.protocols import (
     ChunkLinker,
     EvaluatorFilter,
@@ -90,9 +92,11 @@ Return JSON only:
 
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
 _GROUNDING_FILTER_STAGE = "grounding_llm"
+_HOP_COUNT_VALIDITY_FILTER_STAGE = "hop_count_validity"
 _SUPPORTED_FILTER_STAGES = (
     _GROUNDING_FILTER_STAGE,
     _RETRIEVAL_TOO_EASY_FILTER_STAGE,
+    _HOP_COUNT_VALIDITY_FILTER_STAGE,
 )
 
 
@@ -176,32 +180,39 @@ def _build_rollout_client(cfg: CgftPipelineConfig) -> RolloutClient:
     return RolloutClient(api_key=cfg.platform.api_key)
 
 
-def _build_linker(cfg: CgftPipelineConfig, source: Any) -> ChunkLinker:
-    if cfg.linker.type == "llm_guided":
-        linker_cfg = cfg.linker.llm_guided
-        linker_client = _build_openai_client(api_key=linker_cfg.api_key, base_url=linker_cfg.base_url)
-        return LLMGuidedChunkLinker(
-            source=source,
-            client=linker_client,
-            model=linker_cfg.model,
-            system_prompt=linker_cfg.system_prompt or RELATED_CHUNK_SYSTEM_PROMPT,
-            user_template=linker_cfg.user_template or RELATED_CHUNK_USER_TEMPLATE,
-            top_k_bm25=linker_cfg.top_k_bm25,
-            top_related_chunks=linker_cfg.top_related_chunks,
-            context_preview_chars=linker_cfg.context_preview_chars,
-            search_mode=linker_cfg.search_mode,
+def _build_linker(
+    cfg: CgftPipelineConfig,
+    source: Any,
+    profile: CorpusProfile | None = None,
+) -> ChunkLinker:
+    if cfg.linker.type == "search_agent":
+        raise NotImplementedError(
+            "Linker type 'search_agent' is defined in config but not yet implemented. "
+            "Use 'metadata' instead."
         )
 
-    structural_cfg = cfg.linker.structural
-    return StructuralChunkLinker(
+    if profile is None:
+        raise ValueError(
+            "Linker type 'metadata' requires a CorpusProfile but none is available "
+            "(corpus_context must be enabled in stages 2/3)."
+        )
+
+    from cgft.qa_generation.metadata_linker import MetadataChunkLinker, MetadataLinkerConfig
+
+    mcfg = cfg.linker.metadata
+    return MetadataChunkLinker(
         source=source,
-        type_distribution=structural_cfg.type_distribution,
-        target_hop_counts=structural_cfg.target_hop_counts,
-        bm25_enrichment_queries=structural_cfg.bm25_enrichment_queries,
-        bm25_enrichment_top_k=structural_cfg.bm25_enrichment_top_k,
-        max_related_refs=structural_cfg.max_related_refs,
-        entity_extraction=cfg.corpus_context.entity_extraction,
-        search_mode=structural_cfg.search_mode,
+        profile=profile,
+        config=MetadataLinkerConfig(
+            max_candidates=mcfg.max_candidates,
+            max_secondaries=mcfg.max_secondaries,
+            min_chunk_chars=mcfg.min_chunk_chars,
+            filter_same_file=mcfg.filter_same_file,
+            min_coherence=mcfg.min_coherence,
+            max_secondary_similarity=mcfg.max_secondary_similarity,
+            retry_confidence=mcfg.retry_confidence,
+            header_keys=mcfg.header_keys,
+        ),
     )
 
 
@@ -253,6 +264,29 @@ def _build_filter_from_stage_name(
         return RetrievalLLMFilter(
             chunk_source=source,
             cfg=cfg.filtering.retrieval_llm,
+        )
+    if stage == _HOP_COUNT_VALIDITY_FILTER_STAGE:
+        from cgft.qa_generation.filters.hop_count_validity import (
+            HopCountValidityConfig,
+            HopCountValidityFilter,
+        )
+
+        hcfg = cfg.filtering.hop_count_validity
+        return HopCountValidityFilter(
+            cfg=HopCountValidityConfig(
+                enabled=hcfg.enabled,
+                mode=hcfg.mode,
+                max_judge_calls=hcfg.max_judge_calls,
+                judge_model=hcfg.judge_model,
+                judge_api_key=hcfg.judge_api_key,
+                judge_base_url=hcfg.judge_base_url,
+                max_concurrent=hcfg.max_concurrent,
+                batch_enabled=hcfg.batch_enabled,
+                show_batch_progress=hcfg.show_batch_progress,
+                stats_key=hcfg.stats_key,
+                lopsided_high_threshold=hcfg.lopsided_high_threshold,
+                lopsided_low_threshold=hcfg.lopsided_low_threshold,
+            ),
         )
     raise ValueError(
         f"Unknown filter stage '{stage_name}'. "
@@ -877,14 +911,21 @@ class CgftPipeline:
             f"[1/8] Loaded {len(seed_chunks)} seed chunks from corpus", verbose=cfg.verbose
         )
 
-        pool_size = max(cfg.linker.structural.corpus_pool_size, len(seed_chunks))
-        corpus_pool = source.sample_chunks(pool_size, min_chars=cfg.corpus.min_chunk_chars)
-        if not corpus_pool:
-            corpus_pool = list(seed_chunks)
+        profile_sample = diverse_profile_sample(
+            source,
+            sample_size=max(200, len(seed_chunks)),
+            min_chars=cfg.corpus.min_chunk_chars,
+            rng=rng,
+        )
+        if not profile_sample:
+            profile_sample = list(seed_chunks)
 
         context["seed_chunk_lookup"] = {chunk.hash: chunk for chunk in seed_chunks}
-        context["corpus_pool"] = corpus_pool
+        context["corpus_pool"] = profile_sample
         context["seed_chunks"] = seed_chunks
+        context["corpus_language"] = str(cfg.corpus_context.language or "").strip()
+
+        search_modes, best_search_mode = detect_search_capabilities(source)
         _print_progress("[2/8] Building corpus profile...", verbose=cfg.verbose)
         _build_corpus_profile(cfg, source, context)
         _print_progress("[2/8] Built corpus profile", verbose=cfg.verbose)
@@ -912,6 +953,31 @@ class CgftPipeline:
         else:
             _print_progress("[3/8] Skipped entity pattern generation", verbose=cfg.verbose)
 
+        from cgft.qa_generation.corpus_capabilities import CorpusCapabilities
+
+        entity_patterns = []
+        if cfg.corpus_context.entity_extraction is not None:
+            ext = cfg.corpus_context.entity_extraction
+            entity_patterns = build_entity_patterns_from_extraction(
+                entity_names=ext.entity_names,
+                code_patterns=ext.code_patterns,
+                domain_terms=ext.domain_terms,
+            )
+            compute_entity_document_frequency(entity_patterns, profile_sample)
+
+        token_df, token_df_n = compute_token_document_frequency(profile_sample)
+        context.profile = CorpusProfile(
+            corpus_summary=context.get("corpus_summary", ""),
+            corpus_queries=context.get("corpus_example_queries", []),
+            corpus_description=context.get("corpus_description", ""),
+            entity_patterns=entity_patterns,
+            capabilities=CorpusCapabilities.detect(profile_sample),
+            search_modes=search_modes,
+            best_search_mode=best_search_mode,
+            token_document_frequency=token_df,
+            token_df_sample_size=token_df_n,
+        )
+
         tasks = build_generation_tasks(
             cfg,
             seed_chunk_ids=[chunk.hash for chunk in seed_chunks],
@@ -919,7 +985,7 @@ class CgftPipeline:
         context["tasks"] = tasks
         _print_progress(f"[4/8] Created {len(tasks)} generation tasks", verbose=cfg.verbose)
 
-        linker = _build_linker(cfg, source)
+        linker = _build_linker(cfg, source, profile=context.profile)
         generator = _build_generator(
             cfg,
             linker=linker,
@@ -1126,6 +1192,10 @@ class CgftPipeline:
         transformation_stats = context.get("transformation_stats")
         if isinstance(transformation_stats, dict) and transformation_stats:
             result["stats"]["transformation"] = dict(transformation_stats)
+
+        hop_count_stats = context.get("hop_count_validity_stats")
+        if isinstance(hop_count_stats, dict) and hop_count_stats:
+            result["stats"]["hop_count_validity"] = dict(hop_count_stats)
 
         return result
 

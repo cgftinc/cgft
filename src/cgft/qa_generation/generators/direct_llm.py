@@ -25,16 +25,41 @@ from cgft.qa_generation.models import QADataPoint, ReferenceChunk
 logger = logging.getLogger(__name__)
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n\s*```", re.DOTALL)
 _QUESTION_RE = re.compile(r"<question>(.*?)</question>", re.IGNORECASE | re.DOTALL)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 _TEMPLATE_FIELD_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_THINK_UNCLOSED_RE = re.compile(r"<think>.*", re.IGNORECASE | re.DOTALL)
 _ESCAPED_OPEN_BRACE = "__CGFT_ESCAPED_OPEN_BRACE__"
 _ESCAPED_CLOSE_BRACE = "__CGFT_ESCAPED_CLOSE_BRACE__"
 
+_REASONING_MODE_INSTRUCTIONS: dict[str, str] = {
+    "temporal": (
+        "The question should require understanding the chronological order or "
+        "time-dependent relationships across sources. Focus on when events happened "
+        "relative to each other, how interactions evolved over time, or what changed "
+        "between different dates."
+    ),
+    "inference": (
+        "The question should require logical deduction — the answer is not stated "
+        "directly in any single source but must be inferred by connecting evidence "
+        "across sources. The user needs to reason about implications, draw conclusions, "
+        "or identify patterns that aren't explicitly stated."
+    ),
+    "sequential": (
+        "The question should require following a step-by-step sequence of events or "
+        "actions that spans multiple sources. Focus on what happened first, what "
+        "followed, and how one action led to the next."
+    ),
+}
+
 _DEFAULT_TEMPLATE = (
+    "[[if corpus_language]]LANGUAGE REQUIREMENT: You MUST generate the question and answer in {corpus_language}. "
+    "Do not use any other language.\n\n[[endif]]"
     "Your task is to generate a {qa_type} question that will require "
     "{target_hop_count} search steps to answer by gathering information from multiple sources.\n\n"
+    "[[if reasoning_mode_instruction]]Reasoning focus: {reasoning_mode_instruction}\n\n[[endif]]"
     "You must first reason inside <think> and </think> about how to connect the information "
     "across the provided documents to create a challenging, multi-hop question.\n\n"
     "[[if regeneration_attempt]]attempt={regeneration_attempt}\n[[endif]]"
@@ -65,10 +90,53 @@ _DEFAULT_TEMPLATE = (
     "- In chunks_used, list the indices of chunks you referenced (0=primary, 1+=secondary).\n"
     "- CRITICAL: If the provided chunks genuinely cannot support a valid {qa_type} question "
     "(e.g., they are completely unrelated or lack sufficient connectable information), "
-    "return `{{\"status\": \"cannot_generate\", \"reason\": \"<brief explanation>\"}}` instead. "
+    'return `{{"status": "cannot_generate", "reason": "<brief explanation>"}}` instead. '
     "Do NOT output a meta-question about the generation process itself.\n\n"
-    'First output your reasoning in <think>...</think>, then provide:\n'
-    '```json\n{{\"question\": \"...\", \"answer\": \"...\", \"answering_steps\": \"...\", \"chunks_used\": [0, 1, ...]}}\n```'
+    "First output your reasoning in <think>...</think>, then provide:\n"
+    '```json\n{{"question": "...", "answer": "...", "answering_steps": "...", "chunks_used": [0, 1, ...]}}\n```'
+)
+
+_LOOKUP_TEMPLATE = (
+    "[[if corpus_language]]LANGUAGE REQUIREMENT: You MUST generate the question and answer in {corpus_language}. "
+    "Do not use any other language.\n\n[[endif]]"
+    "Your task is to generate a single-hop lookup question answerable from one chunk.\n\n"
+    "You must first reason inside <think> and </think> about what a real user would "
+    "search for when they need the information in this chunk — but frame the question "
+    "using the user's language (goals, problems, symptoms), NOT the documentation's "
+    "terminology (feature names, config keys, API methods).\n\n"
+    "[[if regeneration_attempt]]attempt={regeneration_attempt}\n[[endif]]"
+    "[[if source_task_id]]source_task_id={source_task_id}\n[[endif]]"
+    "[[if previous_failure_type]]previous_failure_type={previous_failure_type}\n[[endif]]"
+    "[[if previous_judge_reason_tag]]previous_judge_reason_tag={previous_judge_reason_tag}\n[[endif]]"
+    "[[if overlap_triggered]]overlap_triggered={overlap_triggered}\n[[endif]]"
+    "[[if expected_action]]expected_action={expected_action}\n[[endif]]"
+    "Corpus summary:\n{corpus_summary}\n\n"
+    "Example queries:\n{corpus_queries}\n\n"
+    "Primary chunk:\n{primary_chunk}\n\n"
+    "[[if failed_question]]Failed question:\n{failed_question}\n\n[[endif]]"
+    "[[if failed_answer]]Failed answer:\n{failed_answer}\n\n[[endif]]"
+    "[[if regeneration_prompt]]Feedback:\n{regeneration_prompt}\n\n[[endif]]"
+    "Requirements:\n"
+    "- The question must be answerable from the primary chunk alone.\n"
+    "- Frame the question as a real user would ask it — describe the goal or problem, "
+    "not the solution. Users don't search for 'posthog.init() session_recording config'; "
+    "they search for 'how to record user sessions in my app'.\n"
+    "- Paraphrase and use synonyms — do NOT copy key terms verbatim from the chunk. "
+    "The question should be hard to retrieve via naive keyword matching.\n"
+    "- The answer should be specific and grounded in chunk evidence.\n"
+    "- Use only chunk evidence; do not use outside knowledge.\n"
+    "- Prefer task-oriented use-cases over internal implementation trivia.\n"
+    "[[if previous_failure_type]]- If previous_failure_type=too_easy, rephrase to reduce "
+    "lexical overlap with the chunk while preserving the same answer.\n[[endif]]"
+    "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer "
+    "using current chunk evidence only.\n[[endif]]"
+    "- Output exactly one question and one answer.\n"
+    "- In chunks_used, list the indices of chunks you referenced (0=primary).\n"
+    "- CRITICAL: If the chunk is too generic, boilerplate, or navigation-only to support "
+    "a meaningful question, return "
+    '`{{"status": "cannot_generate", "reason": "<brief explanation>"}}` instead.\n\n'
+    "First output your reasoning in <think>...</think>, then provide:\n"
+    '```json\n{{"question": "...", "answer": "...", "chunks_used": [0]}}\n```'
 )
 
 
@@ -76,9 +144,7 @@ def _render_template_safe(template: str, variables: dict[str, Any]) -> str:
     try:
         return render_template(template, variables)
     except KeyError:
-        protected = (
-            template.replace("{{", _ESCAPED_OPEN_BRACE).replace("}}", _ESCAPED_CLOSE_BRACE)
-        )
+        protected = template.replace("{{", _ESCAPED_OPEN_BRACE).replace("}}", _ESCAPED_CLOSE_BRACE)
         required_fields = set(_TEMPLATE_FIELD_RE.findall(protected))
         missing_fields = sorted(field for field in required_fields if field not in variables)
         if not missing_fields:
@@ -116,11 +182,27 @@ def _parse_qa_response(raw_text: str) -> tuple[str, str, list[int] | None]:
 
     # Strip <think> blocks before parsing
     text = _THINK_BLOCK_RE.sub("", text).strip()
+    # Strip unclosed <think> blocks (e.g. model hit output_tokens limit mid-reasoning)
+    text = _THINK_UNCLOSED_RE.sub("", text).strip()
 
-    for candidate in (text, *_JSON_BLOCK_RE.findall(text)):
+    # Build a list of JSON candidates, best-first:
+    # 1. Content from markdown code fences (matches the prompt's requested format)
+    # 2. The greedy {.*} regex fallback
+    candidates = list(_CODE_FENCE_RE.findall(text))
+    candidates.extend(_JSON_BLOCK_RE.findall(text))
+    # Also try the full text (in case it's raw JSON with no wrapper)
+    candidates.append(text)
+
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
         try:
             payload = json.loads(candidate)
         except Exception:
+            continue
+
+        if not isinstance(payload, dict):
             continue
 
         # Check for explicit generation failure signal
@@ -149,6 +231,11 @@ def _parse_qa_response(raw_text: str) -> tuple[str, str, list[int] | None]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
         return lines[0], "\n".join(lines[1:]), None
+
+    logger.warning(
+        "Failed to parse QA from LLM response (first 500 chars): %s",
+        raw_text[:500] if raw_text else "(empty)",
+    )
     return "", "", None
 
 
@@ -174,7 +261,6 @@ def _chunk_to_reference_chunk(chunk: Any) -> ReferenceChunk:
 
 def _format_secondary_chunks(anchor: AnchorBundle) -> str:
     chunks = list(anchor.secondary_chunks)
-    chunks.extend(anchor.structural_hints.get("bm25_related", []))
     if not chunks:
         return "(none)"
     parts: list[str] = []
@@ -196,7 +282,6 @@ class _PreparedTask:
     system_prompt: str
     resolved_qa_type: str
     resolved_hop_count: int
-    requested_qa_type: str
     requested_hop_count: int
 
 
@@ -262,6 +347,7 @@ class DirectLLMGenerator:
             max_concurrent=self.cfg.max_concurrent,
             show_progress=self.cfg.show_batch_progress,
             temperature=1.0,
+            desc="Generating QA candidates",
         )
         return self._process_batch_results(prepared, result)
 
@@ -274,6 +360,7 @@ class DirectLLMGenerator:
         corpus_summary = str(context.get("corpus_summary", "") or "").strip()
         corpus_queries = str(context.get("corpus_queries", "") or "").strip()
         corpus_description = str(context.get("corpus_description", "") or "").strip()
+        corpus_language = str(context.get("corpus_language", "") or "").strip()
 
         prepared: list[_PreparedTask] = []
         show_prep_progress = self.cfg.show_batch_progress and len(tasks) > 1
@@ -287,30 +374,68 @@ class DirectLLMGenerator:
 
             anchor = self.linker.link(
                 seed_chunk,
-                target_qa_type=task.qa_type,
                 target_hop_count=task.target_hop_count,
                 corpus_pool=corpus_pool,
+                reasoning_mode=task.reasoning_mode,
             )
 
-            requested_qa_type = str(task.qa_type).strip() or "lookup"
+            # Re-anchor: if a multi-hop task got no secondaries, try other
+            # seed chunks before giving up.
+            needs_secondaries = (task.target_hop_count or 1) > 1
+            if needs_secondaries and not anchor.secondary_chunks and corpus_pool:
+                tried = {getattr(seed_chunk, "hash", id(seed_chunk))}
+                candidates = [c for c in corpus_pool if getattr(c, "hash", id(c)) not in tried]
+                context.rng.shuffle(candidates)
+                for alt_seed in candidates[:3]:
+                    anchor = self.linker.link(
+                        alt_seed,
+                        target_hop_count=task.target_hop_count,
+                        corpus_pool=corpus_pool,
+                        reasoning_mode=task.reasoning_mode,
+                    )
+                    if anchor.secondary_chunks:
+                        break
+                    tried.add(getattr(alt_seed, "hash", id(alt_seed)))
+
+            # If still no secondaries for a multi-hop task, demote to
+            # lookup instead of wasting an LLM call on a doomed generation.
+            demoted = False
+            if needs_secondaries and not anchor.secondary_chunks:
+                task = GenerationTask(
+                    task_id=task.task_id,
+                    qa_type="lookup",
+                    target_hop_count=1,
+                    seed_chunk_id=task.seed_chunk_id,
+                )
+                demoted = True
+
+            resolved_qa_type = str(task.qa_type).strip() or "lookup"
             requested_hop_count = max(1, int(task.target_hop_count or 1))
-            resolved_qa_type = str(getattr(anchor, "target_qa_type", "")).strip() or requested_qa_type
-            try:
-                resolved_hop_count = int(getattr(anchor, "target_hop_count", requested_hop_count))
-            except (TypeError, ValueError):
+            if demoted:
                 resolved_hop_count = requested_hop_count
-            resolved_hop_count = max(1, resolved_hop_count)
+            else:
+                try:
+                    resolved_hop_count = int(
+                        getattr(anchor, "target_hop_count", requested_hop_count)
+                    )
+                except (TypeError, ValueError):
+                    resolved_hop_count = requested_hop_count
+                resolved_hop_count = max(1, resolved_hop_count)
 
-            template = self.cfg.prompt_templates_by_qa_type.get(
-                resolved_qa_type,
-                self.cfg.prompt_templates_by_qa_type.get(requested_qa_type, _DEFAULT_TEMPLATE),
+            builtin_default = (
+                _LOOKUP_TEMPLATE if resolved_qa_type == "lookup" else _DEFAULT_TEMPLATE
             )
+            template = self.cfg.prompt_templates_by_qa_type.get(resolved_qa_type, builtin_default)
+            reasoning_mode_instruction = _REASONING_MODE_INSTRUCTIONS.get(task.reasoning_mode, "")
             variables = {
                 "qa_type": resolved_qa_type,
                 "target_hop_count": resolved_hop_count,
+                "reasoning_mode": task.reasoning_mode,
+                "reasoning_mode_instruction": reasoning_mode_instruction,
                 "corpus_summary": corpus_summary,
                 "corpus_queries": corpus_queries,
                 "corpus_description": corpus_description,
+                "corpus_language": corpus_language,
                 "regeneration_attempt": task.regeneration_attempt,
                 "regeneration_prompt": task.regeneration_prompt,
                 "source_task_id": task.source_task_id,
@@ -346,7 +471,6 @@ class DirectLLMGenerator:
                     system_prompt=system_prompt,
                     resolved_qa_type=resolved_qa_type,
                     resolved_hop_count=resolved_hop_count,
-                    requested_qa_type=requested_qa_type,
                     requested_hop_count=requested_hop_count,
                 )
             )
@@ -357,15 +481,50 @@ class DirectLLMGenerator:
     ) -> list[GeneratedQA]:
         """Parse batch LLM responses and build GeneratedQA objects."""
         generated: list[GeneratedQA] = []
+        n_api_fail = 0
+        n_parse_fail = 0
+        n_empty = 0
+
         for pt, response in zip(prepared, result.responses):
             if response is None:
+                n_api_fail += 1
                 logger.warning("Skipping task %s: batch LLM call failed.", pt.task.task_id)
                 continue
-            question, answer, chunks_used = _parse_qa_response(response.answer or "")
+
+            raw = response.answer or ""
+            if not raw.strip():
+                n_empty += 1
+                logger.warning("Skipping task %s: LLM returned empty response.", pt.task.task_id)
+                continue
+
+            question, answer, chunks_used = _parse_qa_response(raw)
             if not question or not answer:
-                logger.warning("Skipping task %s: failed to parse QA response.", pt.task.task_id)
+                n_parse_fail += 1
+                logger.warning(
+                    "Skipping task %s: failed to parse QA response "
+                    "(output_tokens=%d, first 300 chars): %s",
+                    pt.task.task_id,
+                    response.output_tokens,
+                    raw[:300],
+                )
                 continue
             generated.append(self._build_generated_qa(pt, question, answer, chunks_used))
+
+        total = len(prepared)
+        n_ok = len(generated)
+        n_fail = total - n_ok
+        if n_fail > 0:
+            summary = (
+                f"Generation: {n_ok}/{total} parsed OK"
+                f" | {n_api_fail} API failures"
+                f" | {n_empty} empty responses"
+                f" | {n_parse_fail} parse failures"
+            )
+            logger.warning(summary)
+            # Also print so it's visible in notebooks where logging may be off
+            from tqdm.auto import tqdm as _tqdm
+
+            _tqdm.write(f"  ⚠ {summary}")
         return generated
 
     @staticmethod
@@ -378,9 +537,9 @@ class DirectLLMGenerator:
         """Build a GeneratedQA from a prepared task and parsed question/answer."""
         anchor = pt.anchor
         reference_chunks = [_chunk_to_reference_chunk(anchor.primary_chunk)]
-        reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in anchor.secondary_chunks)
-        bm25_chunks = anchor.structural_hints.get("bm25_related", [])
-        reference_chunks.extend(_chunk_to_reference_chunk(chunk) for chunk in bm25_chunks)
+        reference_chunks.extend(
+            _chunk_to_reference_chunk(chunk) for chunk in anchor.secondary_chunks
+        )
 
         qa_point: QADataPoint = {
             "question": question,
@@ -399,8 +558,8 @@ class DirectLLMGenerator:
             generation_metadata={
                 "qa_type_target": pt.resolved_qa_type,
                 "target_hop_count": pt.resolved_hop_count,
-                "qa_type_requested": pt.requested_qa_type,
                 "target_hop_count_requested": pt.requested_hop_count,
+                "reasoning_mode": pt.task.reasoning_mode,
                 "anchor_bundle": anchor,
                 "generation_mode": "llm_direct",
                 "refinement_count": 0,

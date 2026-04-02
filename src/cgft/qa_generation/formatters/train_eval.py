@@ -10,7 +10,6 @@ from typing import Any
 
 from cgft.qa_generation.cgft_models import CgftContext, OutputConfig, SplitConfig
 from cgft.qa_generation.generated_qa import GeneratedQA
-from cgft.qa_generation.style_controls import classify_query_style
 
 
 class TrainEvalFormatter:
@@ -54,22 +53,52 @@ class TrainEvalFormatter:
         }
 
     def _to_row(self, item: GeneratedQA) -> dict[str, Any]:
-        return {
+        qa_type = item.qa.get(
+            "qa_type",
+            item.generation_metadata.get("qa_type_target", "unknown"),
+        )
+        row: dict[str, Any] = {
             "question": item.qa.get("question", ""),
             "answer": item.qa.get("answer", ""),
-            "qa_type": item.qa.get("qa_type", item.generation_metadata.get("qa_type_target", "unknown")),
-            "reference_chunks": item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []),
+            "qa_type": qa_type,
+            "reference_chunks": (
+                item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", [])
+            ),
         }
+        # Include reasoning_mode if present.
+        reasoning_mode = item.generation_metadata.get("reasoning_mode", "")
+        if reasoning_mode:
+            row["reasoning_mode"] = reasoning_mode
+        # Include difficulty_score if available from hop-count validity filter.
+        if item.filter_verdict and item.filter_verdict.metadata:
+            difficulty = item.filter_verdict.metadata.get("difficulty_score")
+            if difficulty is not None:
+                row["difficulty_score"] = difficulty
+        # Include unanswerable-pipeline fields when present.
+        answerability = item.qa.get("answerability")
+        if answerability is not None:
+            row["answerability"] = answerability
+        nearest_chunks = item.qa.get("nearest_chunks")
+        if nearest_chunks is not None:
+            row["nearest_chunks"] = nearest_chunks
+        perturbation_type = item.qa.get("perturbation_type")
+        if perturbation_type is not None:
+            row["perturbation_type"] = perturbation_type
+        return row
 
-    def _stratified_split(self, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _stratified_split(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         rng = random.Random(self.split_cfg.seed)
-        buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
             qa_type = str(row.get("qa_type", "unknown"))
-            style = str(row.get("style_observed", "")).strip() or str(
-                row.get("style_target", "unknown")
-            ).strip()
-            buckets[(qa_type, style)].append(row)
+            style = (
+                str(row.get("style_observed", "")).strip()
+                or str(row.get("style_target", "unknown")).strip()
+            )
+            answerability = str(row.get("answerability", "fully_answerable"))
+            buckets[(qa_type, style, answerability)].append(row)
 
         train_rows: list[dict[str, Any]] = []
         eval_rows: list[dict[str, Any]] = []

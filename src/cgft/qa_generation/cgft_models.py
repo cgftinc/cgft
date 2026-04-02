@@ -4,22 +4,20 @@ from __future__ import annotations
 
 import math
 import random
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
 
-from cgft.qa_generation.anchor_selector import (
-    DEFAULT_TARGET_HOP_COUNTS,
-)
+from cgft.qa_generation.retrieval_query import QueryRewriteConfig
 from cgft.qa_generation.style_controls import (
     QUERY_STYLE_EXPERT,
     QUERY_STYLE_KEYWORD,
     QUERY_STYLE_NATURAL,
     normalize_style_distribution,
 )
-from cgft.qa_generation.retrieval_query import QueryRewriteConfig
 
 CORPUS_SYSTEM_PROMPT = (
     "You are a technical analyst specializing in document corpus analysis.\n"
@@ -49,9 +47,9 @@ CORPUS_SYSTEM_PROMPT = (
     "- Use the inferred user persona and purpose to guide the query style.\n"
     "- Queries can have incomplete information, as often users do not remember full context.\n"
     "\n"
-    'Return JSON with:\n'
-    '- thoughts: Your analysis and reasoning here\n'
-    '- summary: our summary here (3 lines as described above)\n'
+    "Return JSON with:\n"
+    "- thoughts: Your analysis and reasoning here\n"
+    "- summary: our summary here (3 lines as described above)\n"
     '- example_queries: List of example queries in the form of ["query1", "query2", ...]'
 )
 
@@ -73,25 +71,47 @@ CORPUS_USER_TEMPLATE = (
     "Return your analysis as JSON with keys: thoughts, summary, example_queries"
 )
 
-DEFAULT_QA_TYPE_DISTRIBUTION = {
-    "lookup": 0.333,
-    "co_located_multi_hop": 0.200,
-    "cross_document_multi_hop": 0.333,
-    "sequential_reasoning": 0.133,
-    "synthesis": 0.0,
+DEFAULT_PRIMARY_TYPE_DISTRIBUTION: dict[str, float] = {
+    "lookup": 0.30,
+    "multi_hop": 0.70,
+}
+
+DEFAULT_REASONING_MODE_DISTRIBUTION: dict[str, float] = {
+    "factual": 0.45,
+    "temporal": 0.15,
+    "inference": 0.30,
+    "sequential": 0.10,
+}
+
+DEFAULT_HOP_DISTRIBUTION: dict[int, float] = {
+    2: 0.50,
+    3: 0.35,
+    4: 0.15,
 }
 
 DEFAULT_RETRIEVAL_JUDGE_SYSTEM_PROMPT = """\
-You are an expert judge evaluating whether retrieved text chunks contain ALL information \
-needed to fully answer a question.
+You are an expert judge evaluating retrieval difficulty. Given a question, its gold \
+answer, and chunks retrieved via BM25 keyword search, determine whether the retrieval \
+was trivially easy or required semantic understanding.
 
 Rules:
-- The answer must be FULLY supported by the retrieved chunks. Partial information is NOT enough.
-- For multi-hop questions, ALL intermediate facts must be present in the chunks.
+- Focus ONLY on retrieval difficulty, not on whether the answer is correct or grounded.
 - Do not use your own knowledge — only consider what is explicitly in the chunks.
+- Classify the result using reason_tag:
+  - "too_easy_lexical": the question shares obvious keywords/phrases with the retrieved \
+chunks, so naive BM25 keyword search would trivially retrieve them.
+  - "challenging_retrieval_pass": retrieving the right chunks required semantic \
+understanding beyond simple keyword matching.
+- If the retrieved chunks do not appear relevant to the question, that means retrieval \
+was challenging — classify as "challenging_retrieval_pass".
 
 Respond with JSON only:
-{"answerable": <bool>, "confidence": <float 0-1>, "reasoning": "<brief explanation>"}"""
+{"confidence": <float 0-1>, \
+"reason_tag": "<too_easy_lexical|challenging_retrieval_pass>", \
+"reasoning": "<brief explanation>", \
+"lexical_anchor_evidence": "<when reason_tag is too_easy_lexical, list the specific \
+keywords/phrases shared between question and chunks that make retrieval trivial; \
+otherwise omit or set to null>"}"""
 
 DEFAULT_RETRIEVAL_JUDGE_USER_TEMPLATE = """\
 Question: {question}
@@ -101,7 +121,8 @@ Gold answer: {answer}
 Retrieved chunks:
 {chunks_text}
 
-Can the question be fully answered using ONLY the retrieved chunks above?"""
+Is the retrieval trivially easy via keyword matching (too_easy_lexical) \
+or does it require semantic understanding (challenging_retrieval_pass)?"""
 
 DEFAULT_GROUNDING_JUDGE_SYSTEM_PROMPT = """\
 You are an expert grounding judge evaluating whether a gold answer is fully supported by provided evidence chunks.
@@ -129,37 +150,6 @@ Evidence chunks:
 {chunks_text}
 
 Can the gold answer be fully grounded using ONLY the evidence chunks above?"""
-
-# Strict prompts preserved for opt-in use.
-STRICT_RETRIEVAL_JUDGE_SYSTEM_PROMPT = """\
-You are a retrieval-difficulty and grounding judge for BM25-style search.
-
-Rules:
-- Use only retrieved chunks as evidence.
-- Return answerable=true only for FAIL cases in this filter.
-- Use reason_tag values:
-  - too_easy_lexical: answer is supported and naive lexical retrieval is clearly sufficient.
-  - unsupported: chunks do not fully support the gold answer.
-  - challenging_answerable_pass: supported, but retrieval is not naively easy.
-- If shortcut evidence is weak or uncertain, choose challenging_answerable_pass.
-
-Return JSON only with keys:
-{"answerable": <bool>, "confidence": <float 0-1>, "reason_tag": "<tag>", "reasoning": "<short explanation>", "lexical_anchor_evidence": "<optional>", "support_gap": "<optional>"}"""
-
-STRICT_RETRIEVAL_JUDGE_USER_TEMPLATE = """\
-Question: {question}
-
-Gold answer: {answer}
-
-Retrieved chunks:
-{chunks_text}
-
-Evaluate in order:
-1) Support check: can the full answer be grounded in the chunks?
-2) If unsupported, set answerable=true and reason_tag=unsupported.
-3) If supported, check lexical shortcut risk for naive BM25 retrieval.
-4) If shortcut is clearly sufficient, set answerable=true and reason_tag=too_easy_lexical.
-5) Otherwise set answerable=false and reason_tag=challenging_answerable_pass."""
 
 
 @dataclass
@@ -264,65 +254,61 @@ class CorpusContextConfig:
     user_template: str = CORPUS_USER_TEMPLATE
     generate_entity_patterns: bool = True
     entity_extraction: EntityExtractionConfig | None = None
-    entity_extraction_llm: EntityExtractionLLMConfig = field(default_factory=EntityExtractionLLMConfig)
+    entity_extraction_llm: EntityExtractionLLMConfig = field(
+        default_factory=EntityExtractionLLMConfig
+    )
+    language: str = ""  # e.g. "Korean", "Japanese". Empty = no constraint.
 
 
 @dataclass
 class TargetsConfig:
-    """Target matrix settings for qa_type generation."""
+    """Target matrix settings for QA generation."""
 
     total_samples: int = 200
-    qa_type_distribution: dict[str, float] = field(
-        default_factory=lambda: dict(DEFAULT_QA_TYPE_DISTRIBUTION)
+    primary_type_distribution: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_PRIMARY_TYPE_DISTRIBUTION)
+    )
+    reasoning_mode_distribution: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_REASONING_MODE_DISTRIBUTION)
+    )
+    hop_distribution: dict[int, float] = field(
+        default_factory=lambda: dict(DEFAULT_HOP_DISTRIBUTION)
     )
 
-    def normalized_qa_type_distribution(self) -> dict[str, float]:
-        total = sum(v for v in self.qa_type_distribution.values() if v >= 0)
-        if total <= 0:
-            dist = dict(DEFAULT_QA_TYPE_DISTRIBUTION)
-            total = sum(dist.values())
-            return {k: v / total for k, v in dist.items()}
-        return {
-            qa_type: max(0.0, float(weight)) / total
-            for qa_type, weight in self.qa_type_distribution.items()
-        }
+
+@dataclass
+class MetadataLinkerCfg:
+    """Config for ``MetadataChunkLinker``."""
+
+    max_candidates: int = 10
+    max_secondaries: int = 3
+    min_chunk_chars: int = 400
+    filter_same_file: bool = True
+    min_coherence: float = 0.15
+    max_secondary_similarity: float = 0.8
+    retry_confidence: float = 0.5
+    header_keys: tuple[str, ...] = ("h2", "h3", "section_header", "title", "h1")
 
 
 @dataclass
-class StructuralLinkerConfig:
-    """Config for `StructuralChunkLinker`."""
+class SearchAgentLinkerCfg:
+    """Config for ``SearchAgentLinker`` (rollout-based)."""
 
-    type_distribution: dict[str, float] | None = None
-    target_hop_counts: dict[str, int] | None = None
-    bm25_enrichment_queries: int = 3
-    bm25_enrichment_top_k: int = 5
-    max_related_refs: int = 3
-    corpus_pool_size: int = 200
-    search_mode: str = "auto"  # "auto" | "lexical" | "hybrid" | "vector"
-
-
-@dataclass
-class LLMGuidedLinkerConfig:
-    """Config for `LLMGuidedChunkLinker`."""
-
-    model: str = "gpt-5.4"
-    api_key: str = ""
-    base_url: str = ""
-    system_prompt: str = ""
-    user_template: str = ""
-    top_k_bm25: int = 5
-    top_related_chunks: int = 3
-    context_preview_chars: int = 200
-    search_mode: str = "auto"  # "auto" | "lexical" | "hybrid" | "vector"
+    max_turns: int = 2
+    max_tool_calls: int = 3
+    max_completion_tokens: int = 2048
+    fallback_to_metadata: bool = True
+    env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
 
 
 @dataclass
 class LinkerConfig:
     """Chunk-linking mode selection."""
 
-    type: str = "structural"
-    structural: StructuralLinkerConfig = field(default_factory=StructuralLinkerConfig)
-    llm_guided: LLMGuidedLinkerConfig = field(default_factory=LLMGuidedLinkerConfig)
+    type: str = "metadata"
+    metadata: MetadataLinkerCfg = field(default_factory=MetadataLinkerCfg)
+    search_agent: SearchAgentLinkerCfg = field(default_factory=SearchAgentLinkerCfg)
+    search_agent_pct: float = 0.0
 
 
 @dataclass
@@ -406,6 +392,10 @@ class DeterministicGuardsConfig:
     min_question_chars: int = 12
     min_answer_chars: int = 24
     min_reference_chunks: int = 1
+    # Jaccard similarity threshold for chunk-to-chunk overlap.
+    # If any pair of reference chunks exceeds this, the multi-hop label is
+    # suspect because both chunks contain largely the same information.
+    chunk_overlap_threshold: float = 0.60
 
 
 @dataclass
@@ -461,16 +451,41 @@ class LLMEnvFilterConfig:
 
 
 @dataclass
+class HopCountValidityCfg:
+    """Config for the hop-count validity filter."""
+
+    enabled: bool = True
+    mode: str = "leave_one_out"
+    max_judge_calls: int = 3
+    judge_model: str = "gpt-5.4"
+    judge_api_key: str = ""
+    judge_base_url: str = ""
+    max_concurrent: int = 8
+    batch_enabled: bool = True
+    show_batch_progress: bool = True
+    stats_key: str = "hop_count_validity_stats"
+    lopsided_high_threshold: float = 0.60
+    lopsided_low_threshold: float = 0.15
+
+
+@dataclass
 class FilteringConfig:
     """Filter chain mode selection."""
 
-    deterministic_guards: DeterministicGuardsConfig = field(default_factory=DeterministicGuardsConfig)
+    deterministic_guards: DeterministicGuardsConfig = field(
+        default_factory=DeterministicGuardsConfig
+    )
     filters: list[str] = field(
-        default_factory=lambda: ["grounding_llm", "retrieval_too_easy_llm"]
+        default_factory=lambda: [
+            "grounding_llm",
+            "retrieval_too_easy_llm",
+            "hop_count_validity",
+        ]
     )
     query_rewrite: QueryRewriteConfig = field(default_factory=QueryRewriteConfig)
     retrieval_llm: RetrievalLLMFilterConfig = field(default_factory=RetrievalLLMFilterConfig)
     grounding_llm: GroundingLLMFilterConfig = field(default_factory=GroundingLLMFilterConfig)
+    hop_count_validity: HopCountValidityCfg = field(default_factory=HopCountValidityCfg)
 
 
 @dataclass
@@ -481,16 +496,37 @@ class RefinementConfig:
     model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = ""
-    max_refinements_per_item: int = 2
-    max_same_seed_attempts_before_reanchor: int = 3
+    max_refinements_per_item: int = 3
+    max_same_seed_attempts_before_reanchor: int = 2
     max_rounds: int = 4
-    max_total_regenerations: int = 400
     prompt_template: str = (
         "Refine this QA pair while preserving answer correctness and anchor intent.\n"
         "qa_type={qa_type}\nfeedback={feedback}\n\n"
         "Current question: {question}\nCurrent answer: {answer}\n\n"
         "Return JSON with keys question and answer."
     )
+
+
+@dataclass
+class DedupConfig:
+    """Question deduplication settings."""
+
+    enabled: bool = True
+    similarity_threshold: float = 0.70
+    ngram_size: int = 2
+    stats_key: str = "dedup_stats"
+
+
+@dataclass
+class MicroBatchConfig:
+    """Micro-batch processing and checkpointing controls."""
+
+    batch_size: int = 100
+    checkpoint_dir: str = ""  # "" = auto: {output.dir}/.checkpoints/
+    resume: bool = True
+    max_requeue_rounds: int = 3
+    max_parallel_batches: int = 1
+    keep_checkpoints: bool = False
 
 
 @dataclass
@@ -522,19 +558,19 @@ class CgftPipelineConfig:
     linker: LinkerConfig = field(default_factory=LinkerConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     transformation: TransformationConfig = field(default_factory=TransformationConfig)
+    dedup: DedupConfig = field(default_factory=DedupConfig)
     filtering: FilteringConfig = field(default_factory=FilteringConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    micro_batch: MicroBatchConfig = field(default_factory=MicroBatchConfig)
     random_seed: int = 42
     verbose: bool = True
 
     def resolve_api_keys(self) -> None:
         """Fill unset component API keys/base URLs with shared platform LLM settings."""
         shared_llm_key = self.platform.llm_api_key or self.platform.api_key
-        shared_llm_base_url = (
-            self.platform.llm_base_url.strip() or "https://app.cgft.io/api/llm"
-        )
+        shared_llm_base_url = self.platform.llm_base_url.strip() or "https://app.cgft.io/api/llm"
 
         if not self.generation.llm_direct.api_key:
             self.generation.llm_direct.api_key = shared_llm_key
@@ -569,11 +605,6 @@ class CgftPipelineConfig:
         if not self.corpus_context.entity_extraction_llm.model:
             self.corpus_context.entity_extraction_llm.model = self.corpus_context.model
 
-        if not self.linker.llm_guided.api_key:
-            self.linker.llm_guided.api_key = shared_llm_key
-        if not self.linker.llm_guided.base_url:
-            self.linker.llm_guided.base_url = shared_llm_base_url
-
         if not self.filtering.retrieval_llm.judge_api_key:
             self.filtering.retrieval_llm.judge_api_key = shared_llm_key
         if not self.filtering.retrieval_llm.judge_base_url:
@@ -584,13 +615,15 @@ class CgftPipelineConfig:
         if not self.filtering.grounding_llm.judge_base_url:
             self.filtering.grounding_llm.judge_base_url = shared_llm_base_url
 
+        if not self.filtering.hop_count_validity.judge_api_key:
+            self.filtering.hop_count_validity.judge_api_key = shared_llm_key
+        if not self.filtering.hop_count_validity.judge_base_url:
+            self.filtering.hop_count_validity.judge_base_url = shared_llm_base_url
+
         if not self.refinement.api_key:
             self.refinement.api_key = shared_llm_key
         if not self.refinement.base_url:
             self.refinement.base_url = shared_llm_base_url
-
-        if self.refinement.max_total_regenerations <= 0:
-            self.refinement.max_total_regenerations = max(1, self.targets.total_samples * 2)
 
 
 @dataclass
@@ -601,6 +634,7 @@ class GenerationTask:
     qa_type: str
     target_hop_count: int
     seed_chunk_id: str
+    reasoning_mode: str = ""  # "factual" | "temporal" | "inference" | "sequential"
     regeneration_prompt: str = ""
     regeneration_attempt: int = 0
     source_task_id: str = ""
@@ -614,12 +648,26 @@ class GenerationTask:
 
 @dataclass
 class CgftContext:
-    """Shared runtime context for Cgft components."""
+    """Shared runtime context for Cgft components.
+
+    Two storage patterns are intentionally co-located here:
+
+    - **Typed attributes** (``profile``, ``config``, ``source``): first-class,
+      structured data with known shapes.  Use these when the schema is fixed.
+    - **``state`` dict** (``context["key"]`` / ``context.get("key")``): dynamic,
+      ad-hoc data accumulated as the pipeline runs (e.g. corpus_summary,
+      seed_chunks, filter stats).  Use this for keys that only exist after
+      certain stages complete.
+
+    Do not add new typed attributes for every pipeline key — reserve them for
+    data that is genuinely structured and always present.
+    """
 
     config: CgftPipelineConfig
     source: Any
     rng: random.Random = field(default_factory=random.Random)
     state: dict[str, Any] = field(default_factory=dict)
+    profile: Any = None  # CorpusProfile | None (Any to avoid circular import)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.state.get(key, default)
@@ -714,14 +762,6 @@ def allocate_largest_remainder_generic(
     return base
 
 
-def matrix_target_counts(targets: TargetsConfig) -> dict[str, int]:
-    """Allocate deterministic target counts over qa_type."""
-    return allocate_largest_remainder_generic(
-        targets.total_samples,
-        targets.normalized_qa_type_distribution(),
-    )
-
-
 def build_generation_tasks(
     cfg: CgftPipelineConfig,
     *,
@@ -730,28 +770,83 @@ def build_generation_tasks(
     """Build tasks from matrix targets with deterministic seed assignment."""
     if not seed_chunk_ids:
         return []
+    return _build_consolidated_tasks(cfg, seed_chunk_ids=seed_chunk_ids)
+
+
+def _build_consolidated_tasks(
+    cfg: CgftPipelineConfig,
+    *,
+    seed_chunk_ids: list[str],
+) -> list[GenerationTask]:
+    """Build tasks using the 2-type + reasoning mode system."""
     rng = random.Random(cfg.random_seed)
-    qa_counts = matrix_target_counts(cfg.targets)
-    hop_map = {
-        **DEFAULT_TARGET_HOP_COUNTS,
-        **(cfg.linker.structural.target_hop_counts or {}),
-    }
+    targets = cfg.targets
+
+    # Allocate primary types (lookup vs multi_hop).
+    type_counts = allocate_largest_remainder_generic(
+        targets.total_samples,
+        targets.primary_type_distribution,
+    )
+
+    # Allocate reasoning modes within multi_hop.
+    n_multi_hop = type_counts.get("multi_hop", 0)
+    mode_counts = allocate_largest_remainder_generic(
+        n_multi_hop,
+        targets.reasoning_mode_distribution,
+    )
+
+    # Allocate hop counts within multi_hop.
+    hop_counts = allocate_largest_remainder_generic(
+        n_multi_hop,
+        {str(k): v for k, v in targets.hop_distribution.items()},
+    )
+
+    # Build a pool of (reasoning_mode, hop_count) assignments for multi_hop.
+    mode_pool: list[str] = []
+    for mode, count in sorted(mode_counts.items()):
+        mode_pool.extend([mode] * count)
+    rng.shuffle(mode_pool)
+
+    hop_pool: list[int] = []
+    for hop_str, count in sorted(hop_counts.items()):
+        hop_pool.extend([int(hop_str)] * count)
+    rng.shuffle(hop_pool)
 
     tasks: list[GenerationTask] = []
     idx = 0
-    for qa_type in sorted(qa_counts):
-        count = qa_counts[qa_type]
-        for _ in range(max(0, count)):
-            seed_chunk_id = seed_chunk_ids[idx % len(seed_chunk_ids)]
-            idx += 1
-            tasks.append(
-                GenerationTask(
-                    task_id=f"task_{len(tasks):05d}",
-                    qa_type=qa_type,
-                    target_hop_count=int(hop_map.get(qa_type, hop_map.get("multi_hop", 2))),
-                    seed_chunk_id=seed_chunk_id,
-                )
+    multi_hop_idx = 0
+
+    # Lookup tasks first.
+    for _ in range(type_counts.get("lookup", 0)):
+        seed_chunk_id = seed_chunk_ids[idx % len(seed_chunk_ids)]
+        idx += 1
+        tasks.append(
+            GenerationTask(
+                task_id=f"task_{len(tasks):05d}",
+                qa_type="lookup",
+                target_hop_count=1,
+                seed_chunk_id=seed_chunk_id,
+                reasoning_mode="",
             )
+        )
+
+    # Multi-hop tasks with reasoning modes and hop counts.
+    for _ in range(n_multi_hop):
+        seed_chunk_id = seed_chunk_ids[idx % len(seed_chunk_ids)]
+        idx += 1
+        mode = mode_pool[multi_hop_idx] if multi_hop_idx < len(mode_pool) else "factual"
+        hop = hop_pool[multi_hop_idx] if multi_hop_idx < len(hop_pool) else 2
+        multi_hop_idx += 1
+        tasks.append(
+            GenerationTask(
+                task_id=f"task_{len(tasks):05d}",
+                qa_type="multi_hop",
+                target_hop_count=hop,
+                seed_chunk_id=seed_chunk_id,
+                reasoning_mode=mode,
+            )
+        )
+
     rng.shuffle(tasks)
     return tasks
 
@@ -825,9 +920,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         api_key=api_key,
         base_url=str(platform_raw.get("base_url", "https://app.cgft.io")).strip(),
         llm_api_key=str(platform_raw.get("llm_api_key", "")).strip(),
-        llm_base_url=str(
-            platform_raw.get("llm_base_url", "https://app.cgft.io/api/llm")
-        ).strip(),
+        llm_base_url=str(platform_raw.get("llm_base_url", "https://app.cgft.io/api/llm")).strip(),
     )
 
     corpus_raw = raw.get("corpus", {}) or {}
@@ -850,13 +943,9 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         num_top_level_samples=max(0, int(corpus_context_raw.get("num_top_level_samples", 4))),
         num_random_samples=max(0, int(corpus_context_raw.get("num_random_samples", 4))),
         min_chunk_chars=max(0, int(corpus_context_raw.get("min_chunk_chars", 400))),
-        system_prompt=str(
-            corpus_context_raw.get("system_prompt", CORPUS_SYSTEM_PROMPT)
-        ).strip()
+        system_prompt=str(corpus_context_raw.get("system_prompt", CORPUS_SYSTEM_PROMPT)).strip()
         or CORPUS_SYSTEM_PROMPT,
-        user_template=str(
-            corpus_context_raw.get("user_template", CORPUS_USER_TEMPLATE)
-        ).strip()
+        user_template=str(corpus_context_raw.get("user_template", CORPUS_USER_TEMPLATE)).strip()
         or CORPUS_USER_TEMPLATE,
         generate_entity_patterns=bool(corpus_context_raw.get("generate_entity_patterns", True)),
         entity_extraction_llm=EntityExtractionLLMConfig(
@@ -873,37 +962,27 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
     )
 
     targets_raw = raw.get("targets", {}) or {}
+    hop_dist_raw = targets_raw.get("hop_distribution")
+    if isinstance(hop_dist_raw, dict):
+        hop_dist = {int(k): float(v) for k, v in hop_dist_raw.items()}
+    else:
+        hop_dist = dict(DEFAULT_HOP_DISTRIBUTION)
     targets = TargetsConfig(
         total_samples=max(1, int(targets_raw.get("total_samples", 200))),
-        qa_type_distribution=_load_distribution(
-            targets_raw.get("qa_type_distribution"),
-            fallback=dict(DEFAULT_QA_TYPE_DISTRIBUTION),
+        primary_type_distribution=_load_distribution(
+            targets_raw.get("primary_type_distribution"),
+            fallback=dict(DEFAULT_PRIMARY_TYPE_DISTRIBUTION),
         ),
+        reasoning_mode_distribution=_load_distribution(
+            targets_raw.get("reasoning_mode_distribution"),
+            fallback=dict(DEFAULT_REASONING_MODE_DISTRIBUTION),
+        ),
+        hop_distribution=hop_dist,
     )
 
     linker_raw = raw.get("linker", {}) or {}
-    structural_raw = linker_raw.get("structural", {}) or {}
-    llm_linker_raw = linker_raw.get("llm_guided", {}) or {}
     linker = LinkerConfig(
-        type=str(linker_raw.get("type", "structural")).strip().lower() or "structural",
-        structural=StructuralLinkerConfig(
-            type_distribution=structural_raw.get("type_distribution"),
-            target_hop_counts=structural_raw.get("target_hop_counts"),
-            bm25_enrichment_queries=max(1, int(structural_raw.get("bm25_enrichment_queries", 3))),
-            bm25_enrichment_top_k=max(1, int(structural_raw.get("bm25_enrichment_top_k", 5))),
-            max_related_refs=max(1, int(structural_raw.get("max_related_refs", 3))),
-            corpus_pool_size=max(10, int(structural_raw.get("corpus_pool_size", 200))),
-        ),
-        llm_guided=LLMGuidedLinkerConfig(
-            model=str(llm_linker_raw.get("model", "gpt-5.4")),
-            api_key=str(llm_linker_raw.get("api_key", "")),
-            base_url=str(llm_linker_raw.get("base_url", "")).strip(),
-            system_prompt=str(llm_linker_raw.get("system_prompt", "")),
-            user_template=str(llm_linker_raw.get("user_template", "")),
-            top_k_bm25=max(1, int(llm_linker_raw.get("top_k_bm25", 5))),
-            top_related_chunks=max(1, int(llm_linker_raw.get("top_related_chunks", 3))),
-            context_preview_chars=max(50, int(llm_linker_raw.get("context_preview_chars", 200))),
-        ),
+        type=str(linker_raw.get("type", "metadata")).strip().lower() or "metadata",
     )
 
     generation_raw = raw.get("generation", {}) or {}
@@ -930,7 +1009,9 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             system_prompt=str(
                 direct_raw.get("system_prompt", LLMDirectGenerationConfig().system_prompt)
             ),
-            prompt_templates_by_qa_type=dict(direct_raw.get("prompt_templates_by_qa_type", {}) or {}),
+            prompt_templates_by_qa_type=dict(
+                direct_raw.get("prompt_templates_by_qa_type", {}) or {}
+            ),
             max_concurrent=max(1, int(direct_raw.get("max_concurrent", 8))),
             batch_enabled=bool(direct_raw.get("batch_enabled", True)),
             show_batch_progress=bool(direct_raw.get("show_batch_progress", True)),
@@ -953,7 +1034,9 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
                 ),
                 timeout=max(10.0, float(env_gen_limits_raw.get("timeout", 120.0))),
             ),
-            prompt_template=str(env_gen_raw.get("prompt_template", LLMEnvGenerationConfig().prompt_template)),
+            prompt_template=str(
+                env_gen_raw.get("prompt_template", LLMEnvGenerationConfig().prompt_template)
+            ),
         ),
     )
 
@@ -988,15 +1071,11 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
     grounding_raw = filtering_raw.get("grounding_llm", {}) or {}
     if isinstance(filters_raw, str):
         chain_filters = [
-            token.strip().lower()
-            for token in filters_raw.split(",")
-            if token and token.strip()
+            token.strip().lower() for token in filters_raw.split(",") if token and token.strip()
         ]
     else:
         chain_filters = [
-            str(token).strip().lower()
-            for token in list(filters_raw)
-            if str(token).strip()
+            str(token).strip().lower() for token in list(filters_raw) if str(token).strip()
         ]
     filtering = FilteringConfig(
         deterministic_guards=DeterministicGuardsConfig(
@@ -1004,6 +1083,10 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             min_question_chars=max(1, int(guards_raw.get("min_question_chars", 12))),
             min_answer_chars=max(1, int(guards_raw.get("min_answer_chars", 24))),
             min_reference_chunks=max(0, int(guards_raw.get("min_reference_chunks", 1))),
+            chunk_overlap_threshold=max(
+                0.0,
+                min(1.0, float(guards_raw.get("chunk_overlap_threshold", 0.60))),
+            ),
         ),
         filters=chain_filters,
         query_rewrite=QueryRewriteConfig(
@@ -1036,7 +1119,9 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
                 or DEFAULT_RETRIEVAL_JUDGE_USER_TEMPLATE
             ),
             top_k=max(1, int(retrieval_raw.get("top_k", 5))),
-            overlap_threshold=max(0.0, min(1.0, float(retrieval_raw.get("overlap_threshold", 0.5)))),
+            overlap_threshold=max(
+                0.0, min(1.0, float(retrieval_raw.get("overlap_threshold", 0.5)))
+            ),
             too_easy_confidence_threshold=max(
                 0.0,
                 min(1.0, float(retrieval_raw.get("too_easy_confidence_threshold", 0.75))),
@@ -1093,9 +1178,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         model=str(refinement_raw.get("model", "gpt-5.4")),
         api_key=str(refinement_raw.get("api_key", "")),
         base_url=str(refinement_raw.get("base_url", "")).strip(),
-        max_refinements_per_item=max(
-            0, int(refinement_raw.get("max_refinements_per_item", 2))
-        ),
+        max_refinements_per_item=max(0, int(refinement_raw.get("max_refinements_per_item", 3))),
         max_same_seed_attempts_before_reanchor=max(
             0,
             int(
@@ -1106,16 +1189,17 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             ),
         ),
         max_rounds=max(0, int(refinement_raw.get("max_rounds", 4))),
-        max_total_regenerations=max(
-            0, int(refinement_raw.get("max_total_regenerations", targets.total_samples * 2))
+        prompt_template=str(
+            refinement_raw.get("prompt_template", RefinementConfig().prompt_template)
         ),
-        prompt_template=str(refinement_raw.get("prompt_template", RefinementConfig().prompt_template)),
     )
 
     split_raw = raw.get("split", {}) or {}
     split = SplitConfig(
         train_ratio=max(0.1, min(0.95, float(split_raw.get("train_ratio", 0.8)))),
-        stratify_by=list(split_raw.get("stratify_by", ["qa_type", "style"]) or ["qa_type", "style"]),
+        stratify_by=list(
+            split_raw.get("stratify_by", ["qa_type", "style"]) or ["qa_type", "style"]
+        ),
         seed=int(split_raw.get("seed", 42)),
     )
 
@@ -1124,6 +1208,15 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         dir=str(output_raw.get("dir", "outputs/cgft")).strip(),
         train_jsonl=str(output_raw.get("train_jsonl", "train.jsonl")).strip(),
         eval_jsonl=str(output_raw.get("eval_jsonl", "eval.jsonl")).strip(),
+    )
+
+    micro_batch_raw = raw.get("micro_batch", {}) or {}
+    micro_batch = MicroBatchConfig(
+        batch_size=max(1, int(micro_batch_raw.get("batch_size", 100))),
+        checkpoint_dir=str(micro_batch_raw.get("checkpoint_dir", "")).strip(),
+        resume=bool(micro_batch_raw.get("resume", True)),
+        max_requeue_rounds=max(0, int(micro_batch_raw.get("max_requeue_rounds", 3))),
+        max_parallel_batches=max(1, int(micro_batch_raw.get("max_parallel_batches", 1))),
     )
 
     cfg = CgftPipelineConfig(
@@ -1138,6 +1231,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         refinement=refinement,
         split=split,
         output=output,
+        micro_batch=micro_batch,
         random_seed=int(raw.get("random_seed", 42)),
     )
     cfg.resolve_api_keys()
