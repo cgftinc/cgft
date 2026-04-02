@@ -36,11 +36,6 @@ QA_TYPE_STYLE_DISTRIBUTIONS: dict[str, dict[str, float]] = {
         QUERY_STYLE_NATURAL: 0.60,
         QUERY_STYLE_EXPERT: 0.30,
     },
-    "cross_document_multi_hop": {
-        QUERY_STYLE_KEYWORD: 0.05,
-        QUERY_STYLE_NATURAL: 0.55,
-        QUERY_STYLE_EXPERT: 0.40,
-    },
 }
 
 

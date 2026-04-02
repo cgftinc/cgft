@@ -22,11 +22,14 @@ from cgft.qa_generation.transformers.base import BaseQuestionTransformer
 logger = logging.getLogger(__name__)
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+_MAX_KEYWORD_TOKENS = 7
 
 _DEFAULT_SYSTEM_PROMPT = (
-    "You rewrite user questions into a target style while preserving intent and answerability.\n"
+    "You rewrite user questions into a target style while preserving answerability.\n"
     "You may also apply small, style-appropriate mutations to simulate realistic user queries.\n"
-    "Do not change entities, constraints, or factual intent.\n"
+    "Do not invent new entities or change factual intent.\n"
+    "For keyword style: capture the user's most likely FIRST search query — pick the single\n"
+    "most specific concept, not all of them. Real users refine searches after seeing results.\n"
     'Return JSON: {"question":"..."}'
 )
 
@@ -35,10 +38,13 @@ _DEFAULT_USER_TEMPLATE = (
     "Noise level: {noise_level}\n\n"
     "Style definitions:\n\n"
     "**keyword** (search box query)\n"
-    "- 2-7 tokens, no punctuation, no question mark\n"
-    "- Dense with domain terms, like a search engine query\n"
-    '- Examples: "posthog feature flag python", "session replay network requests"\n'
-    "- Appropriate noise: omit 1-2 filler words, use abbreviations (PH, SDK, API)\n\n"
+    "- STRICT: exactly 2-5 tokens, no punctuation, no question mark\n"
+    "- Pick the SINGLE most specific concept from the question, not all of them\n"
+    "- Think: what would a user type into a search bar BEFORE knowing the full answer?\n"
+    '- GOOD: "posthog feature flag python", "session replay network tab"\n'
+    '- BAD: "PostHog SQL editor variable event filter browser language query" (too many concepts)\n'  # noqa: E501
+    '- BAD: "PH Java backend SDK local eval default polling server monthly FF charged" (keyword soup)\n'  # noqa: E501
+    "- Appropriate noise: abbreviations (PH, SDK, API, FF, k8s), omit product name if obvious\n\n"
     "**natural** (conversational question)\n"
     "- Complete sentence with question mark\n"
     "- Conversational tone, as if asking a colleague\n"
@@ -86,18 +92,30 @@ class LLMStyleTransformer(BaseQuestionTransformer):
         qa_type = str(item.qa.get("qa_type", "")).strip()
         target_style = self._sample_style(context, qa_type=qa_type)
         noise_level = str(getattr(self.cfg, "noise_level", "light") or "light").strip()
+        # For keyword style, omit the answer — a real user typing keywords
+        # doesn't know the answer yet, so including it biases toward answer terms.
+        answer = "" if target_style == "keyword" else str(item.qa.get("answer", "")).strip()
         prompt_vars = {
             "target_style": target_style,
             "noise_level": noise_level,
             "question": original_question,
-            "answer": str(item.qa.get("answer", "")).strip(),
+            "answer": answer,
         }
         system_prompt = str(self.cfg.system_prompt or "").strip() or _DEFAULT_SYSTEM_PROMPT
+        corpus_language = str(context.get("corpus_language", "") or "").strip()
+        if corpus_language:
+            system_prompt = (
+                f"LANGUAGE REQUIREMENT: You MUST rewrite the question in {corpus_language}. "
+                f"Do not translate or switch to any other language.\n\n{system_prompt}"
+            )
         user_template = str(self.cfg.user_template or "").strip() or _DEFAULT_USER_TEMPLATE
         try:
             user_prompt = user_template.format(**prompt_vars)
         except KeyError:
             user_prompt = _DEFAULT_USER_TEMPLATE.format(**prompt_vars)
+
+        if target_style == "keyword":
+            user_prompt = user_prompt.replace("Answer: \n\n", "\n")
 
         try:
             response = self.client.chat.completions.create(
@@ -108,6 +126,7 @@ class LLMStyleTransformer(BaseQuestionTransformer):
                 ],
                 temperature=0.2,
                 response_format={"type": "json_object"},
+                timeout=60.0,
             )
         except Exception:
             logger.exception("LLM style rewrite failed.")
@@ -119,6 +138,20 @@ class LLMStyleTransformer(BaseQuestionTransformer):
                 "target_style": target_style,
                 "error": "rewrite_parse_failed",
             }
+
+        # Post-hoc keyword length check: reject if model ignored the token limit.
+        if target_style == "keyword":
+            token_count = len(rewritten.split())
+            if token_count > _MAX_KEYWORD_TOKENS:
+                logger.warning(
+                    "Keyword rewrite too long (%d tokens), falling back to original.",
+                    token_count,
+                )
+                return original_question, {
+                    "target_style": target_style,
+                    "error": "keyword_too_long",
+                    "keyword_tokens": token_count,
+                }
 
         return rewritten, {"target_style": target_style}
 
