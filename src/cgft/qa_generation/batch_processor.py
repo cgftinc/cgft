@@ -130,10 +130,7 @@ class BatchResult:
         successful_count = self.num_responses
         if successful_count == 0:
             return 0.0
-        return (
-            sum(r.latency_ms for r in self.responses if r is not None)
-            / successful_count
-        )
+        return sum(r.latency_ms for r in self.responses if r is not None) / successful_count
 
 
 async def call_openai_async(
@@ -204,6 +201,7 @@ async def batch_process_async(
     max_concurrent: int = 10,
     show_progress: bool = True,
     temperature: float = 1.0,
+    desc: str = "Processing prompts",
 ) -> BatchResult:
     """Process multiple prompts in parallel with rate limiting.
 
@@ -245,7 +243,7 @@ async def batch_process_async(
     start_time = time.time()
 
     # Create progress bar if enabled
-    pbar = tqdm(total=len(prompts), desc="Processing prompts", disable=not show_progress)
+    pbar = tqdm(total=len(prompts), desc=desc, disable=not show_progress)
 
     async def process_with_semaphore(idx: int, prompt: str) -> BatchResponse:
         async with semaphore:
@@ -301,6 +299,7 @@ def batch_process_sync(
     max_concurrent: int = 10,
     show_progress: bool = True,
     temperature: float = 1.0,
+    desc: str = "Processing prompts",
 ) -> BatchResult:
     """Synchronous wrapper for batch_process_async.
 
@@ -339,6 +338,7 @@ def batch_process_sync(
         max_concurrent=max_concurrent,
         show_progress=show_progress,
         temperature=temperature,
+        desc=desc,
     )
 
     try:

@@ -48,6 +48,7 @@ class GeneratedQA:
     generation_metadata: dict[str, Any] = field(default_factory=dict)
     filter_verdict: FilterVerdict | None = None
     regeneration_history: list[dict[str, Any]] = field(default_factory=list)
+    journey_events: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_passed(self) -> bool:
@@ -67,3 +68,40 @@ class GeneratedQA:
     def to_qa_data_point(self) -> QADataPoint:
         """Return the underlying QADataPoint."""
         return self.qa
+
+    def append_journey_event(
+        self,
+        *,
+        stage: str,
+        event_type: str,
+        task_id: str = "",
+        refinement_count: int | None = None,
+        qa_type_before: str = "",
+        qa_type_after: str = "",
+        reason_code: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a normalized item-lifecycle event for later analysis."""
+        resolved_task_id = str(task_id).strip() or str(
+            self.generation_metadata.get("task_id", "")
+        ).strip()
+        if refinement_count is None:
+            try:
+                resolved_refinement_count = int(self.generation_metadata.get("refinement_count", 0))
+            except (TypeError, ValueError):
+                resolved_refinement_count = 0
+        else:
+            resolved_refinement_count = int(refinement_count)
+
+        self.journey_events.append(
+            {
+                "stage": str(stage).strip(),
+                "event_type": str(event_type).strip(),
+                "task_id": resolved_task_id,
+                "refinement_count": resolved_refinement_count,
+                "qa_type_before": str(qa_type_before).strip(),
+                "qa_type_after": str(qa_type_after).strip(),
+                "reason_code": str(reason_code).strip(),
+                "details": dict(details) if isinstance(details, dict) else {},
+            }
+        )
