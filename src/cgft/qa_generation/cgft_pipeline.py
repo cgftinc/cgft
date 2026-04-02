@@ -8,8 +8,10 @@ import logging
 import random
 import re
 import time
+from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from openai import (
     APIConnectionError,
@@ -167,7 +169,9 @@ def _load_source(cfg: CgftPipelineConfig) -> CorporaChunkSource:
         source.populate_from_folder(cfg.corpus.docs_path, show_summary=cfg.corpus.show_summary)
         return source
     if cfg.corpus.corpus_id:
-        source.populate_from_existing_corpus(cfg.corpus.corpus_id, show_summary=cfg.corpus.show_summary)
+        source.populate_from_existing_corpus(
+            cfg.corpus.corpus_id, show_summary=cfg.corpus.show_summary
+        )
         return source
     source.populate_from_existing_corpus_name(
         cfg.corpus.corpus_name,
@@ -191,13 +195,22 @@ def _build_linker(
             "Use 'metadata' instead."
         )
 
+    # Default: metadata linker (zero LLM calls during linking).
+    if cfg.linker.type not in ("metadata",):
+        logger.warning(
+            "Unknown linker type '%s'; falling back to 'metadata'.",
+            cfg.linker.type,
+        )
     if profile is None:
         raise ValueError(
             "Linker type 'metadata' requires a CorpusProfile but none is available "
             "(corpus_context must be enabled in stages 2/3)."
         )
 
-    from cgft.qa_generation.metadata_linker import MetadataChunkLinker, MetadataLinkerConfig
+    from cgft.qa_generation.metadata_linker import (
+        MetadataChunkLinker,
+        MetadataLinkerConfig,
+    )
 
     mcfg = cfg.linker.metadata
     return MetadataChunkLinker(
@@ -300,9 +313,7 @@ def _build_filter_chain(
     source: Any,
 ) -> tuple[list[str], list[EvaluatorFilter]]:
     chain_names = [
-        str(name).strip().lower()
-        for name in (cfg.filtering.filters or [])
-        if str(name).strip()
+        str(name).strip().lower() for name in (cfg.filtering.filters or []) if str(name).strip()
     ]
     filters = [
         _build_filter_from_stage_name(
@@ -317,25 +328,21 @@ def _build_filter_chain(
 
 def _mark_rejected(items: list[GeneratedQA], *, reason: str, reason_code: str) -> list[GeneratedQA]:
     for item in items:
-        item.filter_verdict = FilterVerdict(
-            status="rejected",
-            reason=reason,
-            reasoning=reason,
-            metadata={
-                "filter_mode": "pipeline",
-                "reason_code": reason_code,
-                "confidence": 1.0,
-                "retrieval_query": str(item.qa.get("question", "")).strip(),
-                "ref_overlap_ratio": None,
-                "feedback_type": None,
-                "refinement_hint": None,
-            },
+        _reject_item(item, reason=reason, reason_code=reason_code)
+        qa_type = str(item.qa.get("qa_type", "")).strip()
+        item.append_journey_event(
+            stage="pipeline",
+            event_type="filter_rejected",
+            qa_type_before=qa_type,
+            qa_type_after=qa_type,
+            reason_code=reason_code,
         )
     return items
 
 
 def _serialize_qa_with_filter_details(item: GeneratedQA) -> dict[str, Any]:
     row = dict(item.qa)
+    row["journey_events"] = list(item.journey_events)
     verdict = item.filter_verdict
     if verdict is None:
         return row
@@ -360,6 +367,291 @@ def _short_text(value: Any, *, max_chars: int) -> str:
     return f"{text[: max_chars - 3]}..."
 
 
+def _reject_item(
+    item: GeneratedQA,
+    *,
+    reason: str,
+    reason_code: str,
+    metadata_extra: dict[str, Any] | None = None,
+) -> None:
+    """Set a rejection verdict while preserving the original verdict metadata."""
+    original_verdict = item.filter_verdict
+    original_meta: dict[str, Any] = {}
+    if original_verdict is not None:
+        original_meta = {
+            "original_filter_status": original_verdict.status,
+            "original_filter_reason": original_verdict.reason,
+            "original_filter_reasoning": original_verdict.reasoning,
+            "original_filter_metadata": (
+                dict(original_verdict.metadata)
+                if isinstance(original_verdict.metadata, dict)
+                else {}
+            ),
+        }
+    extra = dict(metadata_extra) if isinstance(metadata_extra, dict) else {}
+    item.filter_verdict = FilterVerdict(
+        status="rejected",
+        reason=reason,
+        reasoning=reason,
+        metadata={
+            "filter_mode": "pipeline",
+            "reason_code": reason_code,
+            **original_meta,
+            **extra,
+        },
+    )
+
+
+def _reason_code_from_verdict(verdict: FilterVerdict | None) -> str:
+    if verdict is None:
+        return ""
+    metadata = dict(verdict.metadata) if isinstance(verdict.metadata, dict) else {}
+    return str(metadata.get("reason_code", "")).strip() or str(verdict.reason).strip()
+
+
+def _resolve_effective_qa_type(item: GeneratedQA) -> tuple[str, bool, str]:
+    """Return the effective QA type implied by the item's reference structure."""
+    qa_type = str(item.qa.get("qa_type", "")).strip().lower()
+    if not qa_type:
+        qa_type = (
+            str(item.generation_metadata.get("qa_type_target", "")).strip().lower() or "lookup"
+        )
+    ref_chunks = list(
+        item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []) or []
+    )
+
+    if qa_type == "lookup" and len(ref_chunks) >= 2:
+        return "multi_hop", True, "lookup_to_multi_hop"
+    if qa_type == "multi_hop" and len(ref_chunks) <= 1:
+        return "lookup", True, "multi_hop_to_lookup"
+    return qa_type or "lookup", False, ""
+
+
+def _compute_target_type_counts(cfg: CgftPipelineConfig) -> dict[str, int]:
+    from cgft.qa_generation.cgft_models import allocate_largest_remainder_generic
+
+    counts = allocate_largest_remainder_generic(
+        cfg.targets.total_samples,
+        cfg.targets.primary_type_distribution,
+    )
+    counts.setdefault("lookup", 0)
+    counts.setdefault("multi_hop", 0)
+    return {str(k): int(v) for k, v in counts.items()}
+
+
+def _count_items_by_effective_type(items: list[GeneratedQA]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for item in items:
+        qa_type, _, _ = _resolve_effective_qa_type(item)
+        counts[qa_type] += 1
+    return dict(counts)
+
+
+def _record_filter_events(items: list[GeneratedQA], *, event_type: str) -> None:
+    for item in items:
+        qa_type = str(item.qa.get("qa_type", "")).strip()
+        item.append_journey_event(
+            stage="filter",
+            event_type=event_type,
+            qa_type_before=qa_type,
+            qa_type_after=qa_type,
+            reason_code=_reason_code_from_verdict(item.filter_verdict),
+            details={
+                "filter_reason": str(
+                    item.filter_verdict.reason if item.filter_verdict else ""
+                ).strip(),
+            },
+        )
+
+
+def _annotate_generated_items(items: list[GeneratedQA]) -> None:
+    for item in items:
+        qa_type = (
+            str(item.generation_metadata.get("qa_type_target", "")).strip()
+            or str(item.qa.get("qa_type", "")).strip()
+        )
+        item.append_journey_event(
+            stage="generator",
+            event_type="generated",
+            qa_type_before=qa_type,
+            qa_type_after=qa_type,
+            details={
+                "generation_mode": str(item.generation_metadata.get("generation_mode", "")).strip(),
+                "source_task_id": str(item.generation_metadata.get("source_task_id", "")).strip(),
+            },
+        )
+
+
+def _annotate_transformed_items(items: list[GeneratedQA]) -> None:
+    for item in items:
+        transform_meta = dict(item.generation_metadata.get("transformation", {}) or {})
+        steps = list(transform_meta.get("steps", []) or [])
+        latest_step = steps[-1] if steps else {}
+        qa_type = str(item.qa.get("qa_type", "")).strip()
+        item.append_journey_event(
+            stage="transform",
+            event_type="transformed",
+            qa_type_before=qa_type,
+            qa_type_after=qa_type,
+            details={
+                "changed": bool(latest_step.get("changed", False)),
+                "validation_reason": str(latest_step.get("validation_reason", "")).strip(),
+                "target_style": str(latest_step.get("target_style", "")).strip(),
+            },
+        )
+
+
+def _accept_items_under_type_quota(
+    items: list[GeneratedQA],
+    *,
+    accepted_type_counts: dict[str, int],
+    target_type_counts: dict[str, int],
+) -> tuple[list[GeneratedQA], list[GeneratedQA]]:
+    accepted: list[GeneratedQA] = []
+    rejected: list[GeneratedQA] = []
+
+    for item in items:
+        original_type = str(item.qa.get("qa_type", "")).strip() or (
+            str(item.generation_metadata.get("qa_type_target", "")).strip() or "lookup"
+        )
+        effective_type, was_relabeled, relabel_direction = _resolve_effective_qa_type(item)
+        item.qa["qa_type"] = effective_type
+
+        if was_relabeled:
+            item.append_journey_event(
+                stage="type_balancer",
+                event_type="relabelled",
+                qa_type_before=original_type,
+                qa_type_after=effective_type,
+                reason_code=relabel_direction,
+            )
+
+        remaining = max(0, int(target_type_counts.get(effective_type, 0))) - max(
+            0, int(accepted_type_counts.get(effective_type, 0))
+        )
+        if remaining > 0:
+            accepted_type_counts[effective_type] = (
+                int(accepted_type_counts.get(effective_type, 0)) + 1
+            )
+            item.append_journey_event(
+                stage="type_balancer",
+                event_type="accepted",
+                qa_type_before=original_type,
+                qa_type_after=effective_type,
+                details={
+                    "requested_qa_type": str(
+                        item.generation_metadata.get("qa_type_target", "")
+                    ).strip(),
+                    "remaining_quota_after_accept": remaining - 1,
+                },
+            )
+            accepted.append(item)
+            continue
+
+        _reject_item(
+            item,
+            reason="type_quota_exceeded",
+            reason_code="type_quota_exceeded",
+            metadata_extra={
+                "requested_qa_type": str(
+                    item.generation_metadata.get("qa_type_target", "")
+                ).strip(),
+                "effective_qa_type": effective_type,
+                "was_relabelled": was_relabeled,
+                "relabel_direction": relabel_direction,
+                "quota_remaining_at_rejection": remaining,
+            },
+        )
+        item.append_journey_event(
+            stage="type_balancer",
+            event_type="quota_rejected",
+            qa_type_before=original_type,
+            qa_type_after=effective_type,
+            reason_code="type_quota_exceeded",
+            details={
+                "requested_qa_type": str(
+                    item.generation_metadata.get("qa_type_target", "")
+                ).strip(),
+                "effective_qa_type": effective_type,
+                "was_relabelled": was_relabeled,
+                "relabel_direction": relabel_direction,
+                "quota_remaining_at_rejection": remaining,
+            },
+        )
+        rejected.append(item)
+
+    return accepted, rejected
+
+
+def _collect_journey_stats(
+    *,
+    passed_items: list[GeneratedQA],
+    rejected_items: list[GeneratedQA],
+) -> dict[str, Any]:
+    event_counts: Counter[str] = Counter()
+    relabel_counts: Counter[str] = Counter()
+    quota_rejected_by_effective_type: Counter[str] = Counter()
+    accepted_by_requested_type: Counter[str] = Counter()
+    accepted_by_effective_type: Counter[str] = Counter()
+    accepted_requested_to_effective: Counter[str] = Counter()
+
+    for item in [*passed_items, *rejected_items]:
+        for event in item.journey_events:
+            event_type = str(event.get("event_type", "")).strip()
+            if event_type:
+                event_counts[event_type] += 1
+            if event_type == "relabelled":
+                relabel_key = str(event.get("reason_code", "")).strip() or (
+                    f"{event.get('qa_type_before', '')}->{event.get('qa_type_after', '')}"
+                )
+                relabel_counts[relabel_key] += 1
+            if event_type == "quota_rejected":
+                effective_type = (
+                    str(event.get("qa_type_after", "")).strip()
+                    or str(event.get("details", {}).get("effective_qa_type", "")).strip()
+                )
+                if effective_type:
+                    quota_rejected_by_effective_type[effective_type] += 1
+
+    for item in passed_items:
+        requested_type = (
+            str(item.generation_metadata.get("qa_type_target", "")).strip()
+            or str(item.qa.get("qa_type", "")).strip()
+            or "lookup"
+        )
+        effective_type = str(item.qa.get("qa_type", "")).strip() or requested_type
+        accepted_by_requested_type[requested_type] += 1
+        accepted_by_effective_type[effective_type] += 1
+        accepted_requested_to_effective[f"{requested_type}->{effective_type}"] += 1
+
+    return {
+        "event_counts": dict(event_counts),
+        "relabeled": dict(relabel_counts),
+        "quota_rejected_by_effective_type": dict(quota_rejected_by_effective_type),
+        "accepted_by_requested_type": dict(accepted_by_requested_type),
+        "accepted_by_effective_type": dict(accepted_by_effective_type),
+        "accepted_requested_to_effective": dict(accepted_requested_to_effective),
+    }
+
+
+def _relabel_qa_types(items: list[GeneratedQA]) -> dict[str, int]:
+    """Correct qa_type labels based on actual reference chunk structure.
+
+    A ``lookup`` with chunks from multiple distinct files is actually multi-hop.
+    A ``multi_hop`` with only one reference chunk (or all chunks from the same
+    file) is effectively a lookup.
+    """
+    stats = {"relabeled": 0, "lookup_to_multi_hop": 0, "multi_hop_to_lookup": 0}
+    for item in items:
+        effective_type, was_relabeled, relabel_direction = _resolve_effective_qa_type(item)
+        item.qa["qa_type"] = effective_type
+        if was_relabeled:
+            stats["relabeled"] += 1
+            if relabel_direction:
+                stats[relabel_direction] += 1
+    return stats
+
+
 def _normalize_failure_type_for_regeneration(
     *,
     metadata: dict[str, Any],
@@ -368,7 +660,7 @@ def _normalize_failure_type_for_regeneration(
     verdict_reasoning: str = "",
 ) -> str:
     raw = str(metadata.get("failure_type", "")).strip().lower()
-    if raw in {"too_easy", "unsupported"}:
+    if raw in {"too_easy", "unsupported", "redundant_chunk"}:
         return raw
 
     text = " ".join(
@@ -400,23 +692,37 @@ def _select_regeneration_seed(
     same_seed_failures: int,
     max_same_seed_attempts_before_reanchor: int,
     force_reanchor: bool = False,
+    context: Any = None,
 ) -> tuple[str, bool]:
-    if force_reanchor:
-        candidates = [seed_id for seed_id in seed_ids if seed_id and seed_id != current_seed_chunk_id]
-        if not candidates:
-            return current_seed_chunk_id, False
-        next_seed = candidates[(item_index + current_refinement_count) % len(candidates)]
-        return next_seed, True
+    should_reanchor = force_reanchor
+    if not should_reanchor and max_same_seed_attempts_before_reanchor > 0:
+        should_reanchor = same_seed_failures >= max_same_seed_attempts_before_reanchor
 
-    if max_same_seed_attempts_before_reanchor <= 0:
-        return current_seed_chunk_id, False
-    if same_seed_failures < max_same_seed_attempts_before_reanchor:
+    if not should_reanchor:
         return current_seed_chunk_id, False
 
-    candidates = [seed_id for seed_id in seed_ids if seed_id and seed_id != current_seed_chunk_id]
+    # Try to sample a fresh chunk from the corpus instead of rotating
+    # within the stale seed pool.
+    if context is not None:
+        source = getattr(context, "source", None)
+        min_chars = getattr(context.config.corpus, "min_chunk_chars", 0) if context else 0
+        if source is not None:
+            try:
+                fresh = source.sample_chunks(1, min_chars=min_chars)
+                if fresh:
+                    chunk = fresh[0]
+                    # Register in the seed lookup so the linker can find it.
+                    seed_lookup = context.get("seed_chunk_lookup", {})
+                    if isinstance(seed_lookup, dict):
+                        seed_lookup[chunk.hash] = chunk
+                    return chunk.hash, True
+            except Exception:
+                logger.debug("Fresh seed sampling failed; falling back to pool.")
+
+    # Fallback: pick from the existing pool.
+    candidates = [sid for sid in seed_ids if sid and sid != current_seed_chunk_id]
     if not candidates:
         return current_seed_chunk_id, False
-
     next_seed = candidates[(item_index + current_refinement_count) % len(candidates)]
     return next_seed, True
 
@@ -432,7 +738,9 @@ def _build_regeneration_prompt(
 ) -> str:
     verdict = item.filter_verdict
     metadata = dict(verdict.metadata) if verdict is not None else {}
-    reason_code = str(metadata.get("reason_code", "")).strip() or (verdict.reason if verdict else "unknown")
+    reason_code = str(metadata.get("reason_code", "")).strip() or (
+        verdict.reason if verdict else "unknown"
+    )
     reasoning = str(verdict.reasoning if verdict is not None else "").strip()
     hint = str(metadata.get("refinement_hint", "")).strip()
     judge_reasoning = str(metadata.get("judge_reasoning", "")).strip()
@@ -477,7 +785,7 @@ def _build_regeneration_prompt(
             f"- question: {question}",
             f"- answer: {answer}",
             (
-                "Rewrite the QA to address the failure reason while staying grounded in the provided "
+                "Rewrite the QA to address the failure reason while staying grounded in the provided "  # noqa: E501
                 "primary/secondary chunks for this attempt."
             ),
         ]
@@ -497,7 +805,9 @@ def _create_generation_task(task_kwargs: dict[str, Any]) -> GenerationTask:
         if not supported_keys:
             raise
 
-        compatible_kwargs = {key: value for key, value in task_kwargs.items() if key in supported_keys}
+        compatible_kwargs = {
+            key: value for key, value in task_kwargs.items() if key in supported_keys
+        }
         if len(compatible_kwargs) == len(task_kwargs):
             raise
 
@@ -537,7 +847,9 @@ def _build_regeneration_tasks(
     for idx, item in enumerate(items):
         meta = dict(item.generation_metadata)
         verdict_meta = dict(item.filter_verdict.metadata) if item.filter_verdict is not None else {}
-        verdict_reason = str(item.filter_verdict.reason if item.filter_verdict is not None else "").strip()
+        verdict_reason = str(
+            item.filter_verdict.reason if item.filter_verdict is not None else ""
+        ).strip()
         verdict_reasoning = str(
             item.filter_verdict.reasoning if item.filter_verdict is not None else ""
         ).strip()
@@ -555,7 +867,9 @@ def _build_regeneration_tasks(
         same_seed_failures = max(0, _int_or(meta.get("same_seed_refinement_count", 0), 0))
         force_reanchor = bool(verdict_meta.get("force_reanchor", False))
 
-        qa_type = str(meta.get("qa_type_target", "")).strip() or str(item.qa.get("qa_type", "")).strip()
+        qa_type = (
+            str(meta.get("qa_type_target", "")).strip() or str(item.qa.get("qa_type", "")).strip()
+        )
         if not qa_type:
             qa_type = "lookup"
 
@@ -569,7 +883,11 @@ def _build_regeneration_tasks(
 
         seed_chunk_id = str(meta.get("seed_chunk_id", "")).strip()
         if not seed_chunk_id:
-            reference_chunks = list(item.qa.get("reference_chunks", []) or [])
+            reference_chunks = list(
+                item.qa.get("verified_reference_chunks")
+                or item.qa.get("reference_chunks", [])
+                or []
+            )
             if reference_chunks:
                 seed_chunk_id = str((reference_chunks[0] or {}).get("id", "")).strip()
         if not seed_chunk_id and fallback_seed_ids:
@@ -583,6 +901,7 @@ def _build_regeneration_tasks(
             same_seed_failures=same_seed_failures,
             max_same_seed_attempts_before_reanchor=max_same_seed_attempts_before_reanchor,
             force_reanchor=force_reanchor,
+            context=context,
         )
 
         source_task_id = str(meta.get("task_id", "")).strip() or f"task_refine_{idx:05d}"
@@ -660,7 +979,9 @@ def _regenerate_with_generator(
         source_meta = dict(source_item.generation_metadata)
         current_count = max(0, _int_or(source_meta.get("refinement_count", 0), 0))
         next_count = current_count + 1
-        previous_seed_chunk_id = str(source_meta.get("seed_chunk_id", "")).strip() or task.seed_chunk_id
+        previous_seed_chunk_id = (
+            str(source_meta.get("seed_chunk_id", "")).strip() or task.seed_chunk_id
+        )
         same_seed_failures = max(0, _int_or(source_meta.get("same_seed_refinement_count", 0), 0))
         next_same_seed_failures = same_seed_failures + 1
         if task.seed_chunk_id != previous_seed_chunk_id:
@@ -671,11 +992,16 @@ def _regenerate_with_generator(
         merged_meta["seed_chunk_id"] = task.seed_chunk_id
         merged_meta["refinement_count"] = next_count
         merged_meta["same_seed_refinement_count"] = next_same_seed_failures
-        merged_meta["source_task_id"] = task.source_task_id or str(source_meta.get("task_id", "")).strip()
+        merged_meta["source_task_id"] = (
+            task.source_task_id or str(source_meta.get("task_id", "")).strip()
+        )
         merged_meta["regeneration_attempt"] = task.regeneration_attempt
 
         regenerated.generation_metadata = merged_meta
         regenerated.filter_verdict = None
+        regenerated.journey_events = list(source_item.journey_events) + list(
+            regenerated.journey_events
+        )
         regenerated.regeneration_history = source_item.regeneration_history + [
             {
                 "type": "generator_retry",
@@ -685,6 +1011,23 @@ def _regenerate_with_generator(
                 "reanchored": task.seed_chunk_id != previous_seed_chunk_id,
             }
         ]
+        qa_type = str(regenerated.qa.get("qa_type", "")).strip()
+        regenerated.append_journey_event(
+            stage="regeneration",
+            event_type="regenerated",
+            task_id=task.task_id,
+            refinement_count=next_count,
+            qa_type_before=qa_type,
+            qa_type_after=qa_type,
+            reason_code=str(task.previous_failure_type).strip(),
+            details={
+                "source_task_id": str(
+                    task.source_task_id or source_meta.get("task_id", "")
+                ).strip(),
+                "seed_chunk_id": task.seed_chunk_id,
+                "reanchored": task.seed_chunk_id != previous_seed_chunk_id,
+            },
+        )
         regenerated_for_retry.append(regenerated)
 
     return regenerated_for_retry, failed_to_regenerate
@@ -709,8 +1052,7 @@ def _generate_entity_extraction_patterns(
         return None
 
     chunk_samples_text = "\n\n---\n\n".join(
-        chunk.chunk_str() if hasattr(chunk, "chunk_str") else str(chunk)
-        for chunk in samples
+        chunk.chunk_str() if hasattr(chunk, "chunk_str") else str(chunk) for chunk in samples
     )
     user_prompt = _ENTITY_EXTRACTION_USER_TEMPLATE.format(chunk_samples=chunk_samples_text)
 
@@ -756,7 +1098,7 @@ def _generate_entity_extraction_patterns(
         )
     except Exception as exc:
         logger.warning(
-            "Entity extraction pattern generation failed; BM25 will use metadata fallback. reason=%s",
+            "Entity extraction pattern generation failed; BM25 will use metadata fallback. reason=%s",  # noqa: E501
             exc,
         )
         return None
@@ -774,6 +1116,7 @@ def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftCon
     context["corpus_queries"] = default_queries_bulleted
     context["corpus_example_queries"] = default_queries
     context["corpus_description"] = profile_cfg.description
+    context["corpus_language"] = profile_cfg.language
 
     has_user_context = bool(profile_cfg.description.strip() or default_queries)
     if not profile_cfg.enabled or not has_user_context:
@@ -816,19 +1159,11 @@ def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftCon
             f"Example queries provided by user: {', '.join(default_queries)}"
         ),
         "top_level_content": "\n\n".join(
-            (
-                chunk.chunk_str()
-                if hasattr(chunk, "chunk_str")
-                else str(chunk)
-            )
+            (chunk.chunk_str() if hasattr(chunk, "chunk_str") else str(chunk))
             for chunk in sampled_top_level
         ),
         "random_content": "\n\n".join(
-            (
-                chunk.chunk_str()
-                if hasattr(chunk, "chunk_str")
-                else str(chunk)
-            )
+            (chunk.chunk_str() if hasattr(chunk, "chunk_str") else str(chunk))
             for chunk in sampled_random
         ),
     }
@@ -893,7 +1228,25 @@ class CgftPipeline:
         self.source_factory = source_factory or _load_source
         self.rollout_client_factory = rollout_client_factory
 
+    @property
+    def checkpoint_dir(self) -> Path:
+        """Resolve the checkpoint directory path from config (mirrors _run_work_queue logic)."""
+        cfg = self.cfg
+        ckpt_dir_str = cfg.micro_batch.checkpoint_dir.strip()
+        if not ckpt_dir_str:
+            return Path(cfg.output.dir) / ".checkpoints"
+        return Path(ckpt_dir_str)
+
     def run(self) -> dict[str, Any]:
+        context = self._prepare_context()
+        return self._run_from_context(context)
+
+    def _prepare_context(self) -> CgftContext:
+        """Run stages 1-3: load source, build corpus profile, extract entities.
+
+        Returns a fully populated CgftContext with ``profile`` set, ready for
+        ``_run_from_context``.  Resolves API keys as a side-effect.
+        """
         cfg = self.cfg
         cfg.resolve_api_keys()
 
@@ -901,37 +1254,44 @@ class CgftPipeline:
         rng = random.Random(cfg.random_seed)
         context = CgftContext(config=cfg, source=source, rng=rng)
 
-        _print_progress("[1/8] Loading chunks from corpus...", verbose=cfg.verbose)
-        seed_chunks = source.sample_chunks(cfg.targets.total_samples, min_chars=cfg.corpus.min_chunk_chars)
+        _print_progress("[1/6] Loading chunks from corpus...", verbose=cfg.verbose)
+        seed_chunks = source.sample_chunks(
+            cfg.targets.total_samples, min_chars=cfg.corpus.min_chunk_chars
+        )
         if not seed_chunks and getattr(source, "collection", None) is not None:
             seed_chunks = list(source.collection)[: cfg.targets.total_samples]
         if not seed_chunks:
             raise RuntimeError("No eligible chunks were found for CgftPipeline generation.")
         _print_progress(
-            f"[1/8] Loaded {len(seed_chunks)} seed chunks from corpus", verbose=cfg.verbose
+            f"[1/6] Loaded {len(seed_chunks)} seed chunks from corpus", verbose=cfg.verbose
         )
 
+        # Build diverse profile sample for stages 2-3 (NOT for linker selection).
+        pool_size = max(200, len(seed_chunks))
         profile_sample = diverse_profile_sample(
             source,
-            sample_size=max(200, len(seed_chunks)),
+            sample_size=pool_size,
             min_chars=cfg.corpus.min_chunk_chars,
             rng=rng,
         )
         if not profile_sample:
             profile_sample = list(seed_chunks)
 
+        # Keep corpus_pool in context for backward compatibility.
+        corpus_pool = profile_sample
         context["seed_chunk_lookup"] = {chunk.hash: chunk for chunk in seed_chunks}
         context["corpus_pool"] = profile_sample
         context["seed_chunks"] = seed_chunks
         context["corpus_language"] = str(cfg.corpus_context.language or "").strip()
-
+        # Detect search capabilities from source.
         search_modes, best_search_mode = detect_search_capabilities(source)
-        _print_progress("[2/8] Building corpus profile...", verbose=cfg.verbose)
+
+        _print_progress("[2/6] Building corpus profile...", verbose=cfg.verbose)
         _build_corpus_profile(cfg, source, context)
-        _print_progress("[2/8] Built corpus profile", verbose=cfg.verbose)
+        _print_progress("[2/6] Built corpus profile", verbose=cfg.verbose)
 
         if cfg.corpus_context.generate_entity_patterns:
-            _print_progress("[3/8] Generating entity patterns...", verbose=cfg.verbose)
+            _print_progress("[3/6] Generating entity patterns...", verbose=cfg.verbose)
             extraction = _generate_entity_extraction_patterns(cfg, source, context)
             if extraction is not None:
                 cfg.corpus_context.entity_extraction = extraction
@@ -946,13 +1306,14 @@ class CgftPipeline:
                 n_entities = len(extraction.entity_names)
                 n_patterns = len(extraction.code_patterns) + len(extraction.domain_terms)
                 _print_progress(
-                    f"[3/8] Generated entity patterns: {n_entities} entities,"
+                    f"[3/6] Generated entity patterns: {n_entities} entities,"
                     f" {n_patterns} patterns",
                     verbose=cfg.verbose,
                 )
         else:
-            _print_progress("[3/8] Skipped entity pattern generation", verbose=cfg.verbose)
+            _print_progress("[3/6] Skipped entity pattern generation", verbose=cfg.verbose)
 
+        # --- Build CorpusProfile from stages 2-3 outputs ---
         from cgft.qa_generation.corpus_capabilities import CorpusCapabilities
 
         entity_patterns = []
@@ -964,9 +1325,17 @@ class CgftPipeline:
                 domain_terms=ext.domain_terms,
             )
             compute_entity_document_frequency(entity_patterns, profile_sample)
+            n_ubiquitous = sum(1 for e in entity_patterns if e.document_frequency >= 0.80)
+            if n_ubiquitous > 0:
+                logger.info(
+                    "Entity DF filtering: %d/%d entities are ubiquitous (DF >= 0.80)",
+                    n_ubiquitous,
+                    len(entity_patterns),
+                )
 
         token_df, token_df_n = compute_token_document_frequency(profile_sample)
-        context.profile = CorpusProfile(
+
+        profile = CorpusProfile(
             corpus_summary=context.get("corpus_summary", ""),
             corpus_queries=context.get("corpus_example_queries", []),
             corpus_description=context.get("corpus_description", ""),
@@ -977,15 +1346,30 @@ class CgftPipeline:
             token_document_frequency=token_df,
             token_df_sample_size=token_df_n,
         )
+        context.profile = profile
+        return context
 
+    def _run_from_context(self, context: CgftContext) -> dict[str, Any]:
+        """Run stages 4-8 given a context already populated by ``_prepare_context``.
+
+        This is the compute-heavy phase: task creation, generation, filtering,
+        refinement, dedup, and formatting.  The method also drives the micro-batch
+        work queue and writes checkpoint files.
+        """
+        cfg = self.cfg
+        seed_chunks = context.get("seed_chunks") or []
+        source = context.source
+        profile = context.profile
+
+        _print_progress("[4/6] Creating generation tasks...", verbose=cfg.verbose)
         tasks = build_generation_tasks(
             cfg,
             seed_chunk_ids=[chunk.hash for chunk in seed_chunks],
         )
         context["tasks"] = tasks
-        _print_progress(f"[4/8] Created {len(tasks)} generation tasks", verbose=cfg.verbose)
+        _print_progress(f"[4/6] Created {len(tasks)} generation tasks", verbose=cfg.verbose)
 
-        linker = _build_linker(cfg, source, profile=context.profile)
+        linker = _build_linker(cfg, source, profile=profile)
         generator = _build_generator(
             cfg,
             linker=linker,
@@ -1000,175 +1384,89 @@ class CgftPipeline:
         transformer = _build_transformer(cfg)
         formatter = TrainEvalFormatter(output_cfg=cfg.output, split_cfg=cfg.split)
 
-        _print_progress(f"[5/8] Generating {len(tasks)} QA candidates...", verbose=cfg.verbose)
-        raw_items = generator.generate(tasks, context)
-        context["raw_candidates"] = [item.qa for item in raw_items]
-        context["raw_count"] = len(raw_items)
-        _failed_to_parse = len(tasks) - len(raw_items)
-        _parse_note = f" ({_failed_to_parse} failed to parse)" if _failed_to_parse else ""
+        # --- Micro-batch work queue (generate → filter → transform) ---
         _print_progress(
-            f"[5/8] Generated {len(raw_items)} QA candidates{_parse_note}", verbose=cfg.verbose
-        )
-
-        final_passed: list[GeneratedQA] = []
-        final_rejected: list[GeneratedQA] = []
-        active_items = list(raw_items)
-        total_regens = 0
-
-        _print_progress(
-            f"[6/8] Starting filtering (max {cfg.refinement.max_rounds} rounds)...",
+            f"[5/6] Starting work queue ({len(tasks)} tasks,"
+            f" batch_size={cfg.micro_batch.batch_size})...",
             verbose=cfg.verbose,
         )
-        for round_idx in range(cfg.refinement.max_rounds + 1):
-            if not active_items:
-                break
-            for item in active_items:
-                item.filter_verdict = None
-
-            _print_progress(
-                f"  Round {round_idx + 1}/{cfg.refinement.max_rounds + 1}:"
-                f" {len(active_items)} items to evaluate",
-                verbose=cfg.verbose,
-            )
-
-            active_items = guard_filter.evaluate(active_items, context)
-            _passed = sum(1 for i in active_items if i.is_passed)
-            _refine = sum(1 for i in active_items if i.needs_refinement)
-            _rejected = sum(1 for i in active_items if i.is_rejected)
-            _print_progress(
-                f"    deterministic_guards: {_passed} passed, {_refine} need refinement,"
-                f" {_rejected} rejected",
-                verbose=cfg.verbose,
-            )
-
-            for stage_name, stage_filter in zip(filter_stage_names, filter_chain):
-                _n_to_eval = sum(1 for i in active_items if not i.is_passed and not i.is_rejected)
-                _print_progress(
-                    f"    {stage_name}: evaluating {_n_to_eval} items...", verbose=cfg.verbose
-                )
-                active_items = stage_filter.evaluate(active_items, context)
-                _passed = sum(1 for i in active_items if i.is_passed)
-                _refine = sum(1 for i in active_items if i.needs_refinement)
-                _rejected = sum(1 for i in active_items if i.is_rejected)
-                _print_progress(
-                    f"    {stage_name}: {_passed} passed, {_refine} need refinement,"
-                    f" {_rejected} rejected",
-                    verbose=cfg.verbose,
-                )
-
-            passed = [item for item in active_items if item.is_passed]
-            needs_refinement = [item for item in active_items if item.needs_refinement]
-            rejected = [item for item in active_items if item.is_rejected]
-            final_passed.extend(passed)
-            final_rejected.extend(rejected)
-
-            if not needs_refinement:
-                active_items = []
-                break
-
-            if not cfg.refinement.enabled or round_idx >= cfg.refinement.max_rounds:
-                final_rejected.extend(
-                    _mark_rejected(
-                        needs_refinement,
-                        reason="max_rounds_reached",
-                        reason_code="max_rounds_reached",
-                    )
-                )
-                active_items = []
-                break
-
-            remaining_budget = cfg.refinement.max_total_regenerations - total_regens
-            if remaining_budget <= 0:
-                final_rejected.extend(
-                    _mark_rejected(
-                        needs_refinement,
-                        reason="global_regeneration_budget_exhausted",
-                        reason_code="global_regeneration_budget_exhausted",
-                    )
-                )
-                active_items = []
-                break
-
-            to_refine = needs_refinement[:remaining_budget]
-            overflow = needs_refinement[remaining_budget:]
-            if overflow:
-                final_rejected.extend(
-                    _mark_rejected(
-                        overflow,
-                        reason="global_regeneration_budget_exhausted",
-                        reason_code="global_regeneration_budget_exhausted",
-                    )
-                )
-
-            _print_progress(
-                f"    Regenerating {len(to_refine)} items...", verbose=cfg.verbose
-            )
-            refined_items, regen_failures = _regenerate_with_generator(
-                to_refine,
-                generator=generator,
-                context=context,
-            )
-            if regen_failures:
-                final_rejected.extend(
-                    _mark_rejected(
-                        regen_failures,
-                        reason="generator_regeneration_failed",
-                        reason_code="generator_regeneration_failed",
-                    )
-                )
-            total_regens += len(to_refine)
-            _regen_fail_note = f" ({len(regen_failures)} failed)" if regen_failures else ""
-            _print_progress(
-                f"    Regenerated {len(to_refine)} items{_regen_fail_note}", verbose=cfg.verbose
-            )
-            next_active: list[GeneratedQA] = []
-            for item in refined_items:
-                if item.filter_verdict is None:
-                    next_active.append(item)
-                elif item.is_rejected:
-                    final_rejected.append(item)
-                elif item.is_passed:
-                    final_passed.append(item)
-                else:
-                    item.filter_verdict = None
-                    next_active.append(item)
-            active_items = next_active
-
-        if active_items:
-            final_rejected.extend(
-                _mark_rejected(
-                    active_items,
-                    reason="pipeline_terminated_with_unresolved_items",
-                    reason_code="unresolved_items",
-                )
-            )
-
-        final_passed = transformer.transform(final_passed, context)
-        _print_progress(
-            f"[7/8] Transformed {len(final_passed)} passed items", verbose=cfg.verbose
+        all_passed, all_rejected, total_regens, raw_items = self._run_work_queue(
+            initial_tasks=tasks,
+            source=source,
+            generator=generator,
+            guard_filter=guard_filter,
+            filter_stage_names=filter_stage_names,
+            filter_chain=filter_chain,
+            transformer=transformer,
+            context=context,
         )
-        context["rejected_items"] = [_serialize_qa_with_filter_details(item) for item in final_rejected]
-        context["passed_items"] = [item.qa for item in final_passed]
+
+        # --- Global post-processing ---
+
+        # Dedup: remove near-duplicate questions.
+        from cgft.qa_generation.transformers.dedup import (  # noqa: I001
+            DedupConfig as _DedupCfg,
+            QuestionDeduplicator,
+        )
+
+        dedup_cfg = cfg.dedup
+        deduplicator = QuestionDeduplicator(
+            cfg=_DedupCfg(
+                enabled=dedup_cfg.enabled,
+                similarity_threshold=dedup_cfg.similarity_threshold,
+                ngram_size=dedup_cfg.ngram_size,
+                stats_key=dedup_cfg.stats_key,
+            )
+        )
+        pre_dedup = len(all_passed)
+        all_passed, all_rejected = deduplicator.deduplicate(all_passed, all_rejected, context)
+        n_deduped = pre_dedup - len(all_passed)
+        if n_deduped > 0:
+            _print_progress(
+                f"    Dedup: removed {n_deduped} near-duplicates",
+                verbose=cfg.verbose,
+            )
+
+        relabel_stats = _relabel_qa_types(all_passed)
+        if relabel_stats["relabeled"] > 0:
+            _print_progress(
+                f"    Warning: {relabel_stats['relabeled']} accepted items were still misaligned"
+                f" ({relabel_stats['lookup_to_multi_hop']} lookup→multi_hop,"
+                f" {relabel_stats['multi_hop_to_lookup']} multi_hop→lookup)",
+                verbose=cfg.verbose,
+            )
+
+        context["rejected_items"] = [
+            _serialize_qa_with_filter_details(item) for item in all_rejected
+        ]
+        context["passed_items"] = [_serialize_qa_with_filter_details(item) for item in all_passed]
         context["total_regenerations"] = total_regens
 
-        result = formatter.format(final_passed, context)
+        _print_progress("[6/6] Formatting output...", verbose=cfg.verbose)
+        result = formatter.format(all_passed, context)
         _train = result.get("stats", {}).get("train", 0)
         _eval = result.get("stats", {}).get("eval", 0)
         _print_progress(
-            f"[8/8] Formatted output: {_train} train, {_eval} eval", verbose=cfg.verbose
+            f"[6/6] Formatted output: {_train} train, {_eval} eval",
+            verbose=cfg.verbose,
         )
         _print_progress(
-            f"\nPipeline complete: {len(final_passed)} passed, {len(final_rejected)} rejected"
+            f"\nPipeline complete: {len(all_passed)} passed,"
+            f" {len(all_rejected)} rejected"
             f" ({total_regens} regenerations)",
             verbose=cfg.verbose,
         )
         result["raw_candidates"] = [item.qa for item in raw_items]
-        result["filtered_dataset"] = [item.qa for item in final_passed]
-        result["rejected_dataset"] = [_serialize_qa_with_filter_details(item) for item in final_rejected]
+        result["filtered_dataset"] = [
+            _serialize_qa_with_filter_details(item) for item in all_passed
+        ]
+        result["rejected_dataset"] = [
+            _serialize_qa_with_filter_details(item) for item in all_rejected
+        ]
         run_stats = CgftRunStats(
             raw_candidates_total=len(raw_items),
-            passed_total=len(final_passed),
-            rejected_total=len(final_rejected),
+            passed_total=len(all_passed),
+            rejected_total=len(all_rejected),
             regenerated_total=total_regens,
             round_limit=cfg.refinement.max_rounds,
         )
@@ -1193,11 +1491,543 @@ class CgftPipeline:
         if isinstance(transformation_stats, dict) and transformation_stats:
             result["stats"]["transformation"] = dict(transformation_stats)
 
+        dedup_stats = context.get("dedup_stats")
+        if isinstance(dedup_stats, dict) and dedup_stats:
+            result["stats"]["dedup"] = dict(dedup_stats)
         hop_count_stats = context.get("hop_count_validity_stats")
         if isinstance(hop_count_stats, dict) and hop_count_stats:
             result["stats"]["hop_count_validity"] = dict(hop_count_stats)
 
+        journey_stats = _collect_journey_stats(
+            passed_items=all_passed,
+            rejected_items=all_rejected,
+        )
+        if journey_stats:
+            context["journey_stats"] = journey_stats
+            result["stats"]["journey"] = journey_stats
         return result
+
+    # ------------------------------------------------------------------
+    # Micro-batch work queue
+    # ------------------------------------------------------------------
+
+    def _process_batch(
+        self,
+        tasks: list[GenerationTask],
+        *,
+        generator: QuestionGenerator,
+        guard_filter: DeterministicGuardsFilter,
+        filter_stage_names: list[str],
+        filter_chain: list[EvaluatorFilter],
+        transformer: QuestionTransformer,
+        context: CgftContext,
+    ) -> tuple[list[GeneratedQA], list[GeneratedQA], list[GeneratedQA], int]:
+        """Run stages 5-7 on a single micro-batch.
+
+        Returns:
+            (passed, rejected, raw_items, regens_count)
+        """
+        cfg = self.cfg
+
+        # Stage 5: Generate QA candidates.
+        raw_items = generator.generate(tasks, context)
+        _annotate_generated_items(raw_items)
+
+        # Stage 6: Filter + regeneration loop.
+        final_passed: list[GeneratedQA] = []
+        final_rejected: list[GeneratedQA] = []
+        active_items = list(raw_items)
+        total_regens = 0
+
+        for round_idx in range(cfg.refinement.max_rounds + 1):
+            if not active_items:
+                break
+            for item in active_items:
+                item.filter_verdict = None
+
+            active_items = guard_filter.evaluate(active_items, context)
+
+            for _stage_name, stage_filter in zip(filter_stage_names, filter_chain):
+                active_items = stage_filter.evaluate(active_items, context)
+
+            passed = [item for item in active_items if item.is_passed]
+            needs_refinement = [item for item in active_items if item.needs_refinement]
+            rejected = [item for item in active_items if item.is_rejected]
+            _record_filter_events(passed, event_type="filter_passed")
+            _record_filter_events(needs_refinement, event_type="filter_needs_refinement")
+            _record_filter_events(rejected, event_type="filter_rejected")
+            final_passed.extend(passed)
+            final_rejected.extend(rejected)
+
+            if not needs_refinement:
+                active_items = []
+                break
+
+            if not cfg.refinement.enabled or round_idx >= cfg.refinement.max_rounds:
+                final_rejected.extend(
+                    _mark_rejected(
+                        needs_refinement,
+                        reason="max_rounds_reached",
+                        reason_code="max_rounds_reached",
+                    )
+                )
+                active_items = []
+                break
+
+            refined_items, regen_failures = _regenerate_with_generator(
+                needs_refinement,
+                generator=generator,
+                context=context,
+            )
+            if regen_failures:
+                final_rejected.extend(
+                    _mark_rejected(
+                        regen_failures,
+                        reason="generator_regeneration_failed",
+                        reason_code="generator_regeneration_failed",
+                    )
+                )
+            total_regens += len(needs_refinement)
+
+            next_active: list[GeneratedQA] = []
+            for item in refined_items:
+                if item.filter_verdict is None:
+                    next_active.append(item)
+                elif item.is_rejected:
+                    final_rejected.append(item)
+                elif item.is_passed:
+                    final_passed.append(item)
+                else:
+                    item.filter_verdict = None
+                    next_active.append(item)
+            active_items = next_active
+
+        if active_items:
+            final_rejected.extend(
+                _mark_rejected(
+                    active_items,
+                    reason="pipeline_terminated_with_unresolved_items",
+                    reason_code="unresolved_items",
+                )
+            )
+
+        # Stage 7: Transform passed items.
+        final_passed = transformer.transform(final_passed, context)
+        _annotate_transformed_items(final_passed)
+
+        return final_passed, final_rejected, raw_items, total_regens
+
+    def _run_work_queue(
+        self,
+        *,
+        initial_tasks: list[GenerationTask],
+        source: Any,
+        generator: QuestionGenerator,
+        guard_filter: DeterministicGuardsFilter,
+        filter_stage_names: list[str],
+        filter_chain: list[EvaluatorFilter],
+        transformer: QuestionTransformer,
+        context: CgftContext,
+    ) -> tuple[list[GeneratedQA], list[GeneratedQA], int, list[GeneratedQA]]:
+        """Run stages 5-7 in micro-batches with checkpointing and re-queuing.
+
+        Returns:
+            (all_passed, all_rejected, total_regens, all_raw_items)
+        """
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+        from pathlib import Path
+
+        from cgft.qa_generation.checkpoint import (
+            CheckpointManager,
+            compute_config_hash,
+        )
+
+        cfg = self.cfg
+        target = cfg.targets.total_samples
+        batch_size = cfg.micro_batch.batch_size
+
+        # Partition tasks into micro-batches.
+        batches: list[list[GenerationTask]] = [
+            initial_tasks[i : i + batch_size] for i in range(0, len(initial_tasks), batch_size)
+        ]
+        queue: deque[list[GenerationTask]] = deque(batches)
+
+        # Initialize checkpoint manager.
+        ckpt_dir_str = cfg.micro_batch.checkpoint_dir.strip()
+        if not ckpt_dir_str:
+            ckpt_dir = Path(cfg.output.dir) / ".checkpoints"
+        else:
+            ckpt_dir = Path(ckpt_dir_str)
+
+        config_hash = compute_config_hash(
+            random_seed=cfg.random_seed,
+            total_samples=target,
+            corpus_id=cfg.corpus.corpus_id,
+            primary_type_distribution=cfg.targets.primary_type_distribution,
+            acceptance_policy="quota_aware_v1",
+        )
+        ckpt_mgr = CheckpointManager(checkpoint_dir=ckpt_dir, config_hash=config_hash)
+        target_type_counts = _compute_target_type_counts(cfg)
+
+        # Resume from checkpoint if available.
+        resume = ckpt_mgr.resume_state() if cfg.micro_batch.resume else None
+        if resume and resume.passed_items:
+            all_passed = resume.passed_items
+            accepted_type_counts = _count_items_by_effective_type(all_passed)
+            batch_idx = resume.completed_batch_count
+            requeue_round = resume.requeue_round
+            # Skip already-completed batches in the queue.
+            for _ in range(min(batch_idx, len(queue))):
+                queue.popleft()
+            _print_progress(
+                f"  Resumed from checkpoint: {len(all_passed)} passed,"
+                f" {batch_idx} batches completed",
+                verbose=cfg.verbose,
+            )
+            # If we still need more items but the queue is empty
+            # (original batches all done, re-queued tasks were lost),
+            # seed the queue with replacement tasks for the deficit.
+            deficit = target - len(all_passed)
+            if deficit > 0 and not queue and requeue_round < cfg.micro_batch.max_requeue_rounds:
+                remaining_type_counts = {
+                    qa_type: max(
+                        0,
+                        int(target_type_counts.get(qa_type, 0))
+                        - int(accepted_type_counts.get(qa_type, 0)),
+                    )
+                    for qa_type in target_type_counts
+                }
+                new_tasks = _create_replacement_tasks(
+                    deficit,
+                    source=source,
+                    cfg=cfg,
+                    requeue_round=requeue_round,
+                    remaining_type_counts=remaining_type_counts,
+                )
+                for i in range(0, len(new_tasks), batch_size):
+                    queue.append(new_tasks[i : i + batch_size])
+                requeue_round += 1
+                _print_progress(
+                    f"  Re-seeded queue with {len(new_tasks)} tasks"
+                    f" ({len(queue)} batches) for deficit of {deficit}",
+                    verbose=cfg.verbose,
+                )
+        else:
+            all_passed: list[GeneratedQA] = []
+            accepted_type_counts = {qa_type: 0 for qa_type in target_type_counts}
+            batch_idx = 0
+            requeue_round = 0
+
+        all_rejected: list[GeneratedQA] = []
+        all_raw: list[GeneratedQA] = []
+        total_regens = 0
+
+        pbar = _tqdm(
+            total=target,
+            initial=len(all_passed),
+            desc="[5/6] Work queue",
+            unit="samples",
+        )
+
+        max_parallel = cfg.micro_batch.max_parallel_batches
+
+        if max_parallel <= 1:
+            # Sequential processing.
+            while len(all_passed) < target and queue:
+                batch_tasks = queue.popleft()
+
+                passed, rejected, raw, regens = self._process_batch(
+                    batch_tasks,
+                    generator=generator,
+                    guard_filter=guard_filter,
+                    filter_stage_names=filter_stage_names,
+                    filter_chain=filter_chain,
+                    transformer=transformer,
+                    context=context,
+                )
+
+                accepted, quota_rejected = _accept_items_under_type_quota(
+                    passed,
+                    accepted_type_counts=accepted_type_counts,
+                    target_type_counts=target_type_counts,
+                )
+                batch_rejected = [*rejected, *quota_rejected]
+                all_passed.extend(accepted)
+                all_rejected.extend(batch_rejected)
+                all_raw.extend(raw)
+                total_regens += regens
+                pbar.update(len(accepted))
+
+                ckpt_mgr.save_batch(batch_idx, accepted, batch_rejected, regens)
+                batch_idx += 1
+
+                _print_progress(
+                    f"  Batch {batch_idx}: {len(raw)} generated"
+                    f" → {len(accepted)} accepted,"
+                    f" {len(batch_rejected)} rejected,"
+                    f" {regens} regenerated",
+                    verbose=cfg.verbose,
+                )
+
+                # Re-queue failures as fresh tasks.
+                self._maybe_requeue(
+                    queue=queue,
+                    rejected_items=batch_rejected,
+                    all_passed_count=len(all_passed),
+                    target=target,
+                    requeue_round=requeue_round,
+                    source=source,
+                    cfg=cfg,
+                    accepted_type_counts=accepted_type_counts,
+                    target_type_counts=target_type_counts,
+                )
+                # Bump requeue round when all original batches are done.
+                if not queue:
+                    pass  # No more batches.
+                elif all(getattr(t[0], "task_id", "").startswith("requeue_") for t in queue if t):
+                    requeue_round += 1
+        else:
+            # Parallel processing with ThreadPoolExecutor.
+            import copy
+            import threading
+
+            lock = threading.Lock()
+
+            def _run_one_batch(
+                batch_tasks: list[GenerationTask],
+                batch_context: CgftContext,
+            ) -> tuple[list[GeneratedQA], list[GeneratedQA], list[GeneratedQA], int]:
+                return self._process_batch(
+                    batch_tasks,
+                    generator=generator,
+                    guard_filter=guard_filter,
+                    filter_stage_names=filter_stage_names,
+                    filter_chain=filter_chain,
+                    transformer=transformer,
+                    context=batch_context,
+                )
+
+            with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+                futures: dict[Any, int] = {}
+
+                def _submit_next() -> None:
+                    nonlocal batch_idx
+                    while queue and len(futures) < max_parallel and len(all_passed) < target:
+                        batch_tasks = queue.popleft()
+                        # Shallow copy context state for thread safety.
+                        batch_context = copy.copy(context)
+                        batch_context.state = dict(context.state)
+                        fut = pool.submit(_run_one_batch, batch_tasks, batch_context)
+                        futures[fut] = batch_idx
+                        batch_idx += 1
+
+                _submit_next()
+
+                while futures:
+                    done = [f for f in futures if f.done()]
+                    if not done:
+                        # Wait for at least one to complete.
+                        import concurrent.futures
+
+                        done_set, _ = concurrent.futures.wait(
+                            futures.keys(),
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        done = list(done_set)
+
+                    for fut in done:
+                        b_idx = futures.pop(fut)
+                        passed, rejected, raw, regens = fut.result()
+
+                        with lock:
+                            accepted, quota_rejected = _accept_items_under_type_quota(
+                                passed,
+                                accepted_type_counts=accepted_type_counts,
+                                target_type_counts=target_type_counts,
+                            )
+                            batch_rejected = [*rejected, *quota_rejected]
+                            all_passed.extend(accepted)
+                            all_rejected.extend(batch_rejected)
+                            all_raw.extend(raw)
+                            total_regens += regens
+                            pbar.update(len(accepted))
+                            ckpt_mgr.save_batch(b_idx, accepted, batch_rejected, regens)
+
+                        _print_progress(
+                            f"  Batch {b_idx + 1}: {len(raw)} generated"
+                            f" → {len(accepted)} accepted,"
+                            f" {len(batch_rejected)} rejected,"
+                            f" {regens} regenerated",
+                            verbose=cfg.verbose,
+                        )
+
+                        with lock:
+                            self._maybe_requeue(
+                                queue=queue,
+                                rejected_items=batch_rejected,
+                                all_passed_count=len(all_passed),
+                                target=target,
+                                requeue_round=requeue_round,
+                                source=source,
+                                cfg=cfg,
+                                accepted_type_counts=accepted_type_counts,
+                                target_type_counts=target_type_counts,
+                            )
+
+                    _submit_next()
+
+        pbar.close()
+
+        # Clean up checkpoints on success (unless keep_checkpoints is set).
+        if not cfg.micro_batch.keep_checkpoints:
+            ckpt_mgr.cleanup()
+
+        context["raw_candidates"] = [item.qa for item in all_raw]
+        context["raw_count"] = len(all_raw)
+
+        return all_passed, all_rejected, total_regens, all_raw
+
+    @staticmethod
+    def _maybe_requeue(
+        *,
+        queue: Any,  # deque[list[GenerationTask]]
+        rejected_items: list[GeneratedQA],
+        all_passed_count: int,
+        target: int,
+        requeue_round: int,
+        source: Any,
+        cfg: CgftPipelineConfig,
+        accepted_type_counts: dict[str, int],
+        target_type_counts: dict[str, int],
+    ) -> None:
+        """Re-queue failed items as fresh tasks if below target."""
+        n_rejected = len(rejected_items)
+        still_needed = target - all_passed_count
+        n_requeue = min(n_rejected, still_needed)
+        if n_requeue <= 0:
+            return
+        if requeue_round >= cfg.micro_batch.max_requeue_rounds:
+            return
+        remaining_type_counts = {
+            qa_type: max(
+                0,
+                int(target_type_counts.get(qa_type, 0)) - int(accepted_type_counts.get(qa_type, 0)),
+            )
+            for qa_type in target_type_counts
+        }
+        new_tasks = _create_replacement_tasks(
+            n_requeue,
+            source=source,
+            cfg=cfg,
+            requeue_round=requeue_round,
+            remaining_type_counts=remaining_type_counts,
+        )
+        for item, task in zip(rejected_items, new_tasks):
+            qa_type = str(item.qa.get("qa_type", "")).strip()
+            item.append_journey_event(
+                stage="requeue",
+                event_type="requeued_replacement_created",
+                qa_type_before=qa_type,
+                qa_type_after=qa_type,
+                reason_code="requeue_deficit",
+                details={
+                    "replacement_task_id": task.task_id,
+                    "replacement_qa_type": task.qa_type,
+                },
+            )
+        queue.append(new_tasks)
+
+
+def _create_replacement_tasks(
+    n: int,
+    *,
+    source: Any,
+    cfg: CgftPipelineConfig,
+    requeue_round: int,
+    remaining_type_counts: dict[str, int] | None = None,
+) -> list[GenerationTask]:
+    """Create fresh generation tasks to replace rejected items."""
+    from cgft.qa_generation.cgft_models import allocate_largest_remainder_generic
+
+    rng = random.Random(cfg.random_seed + requeue_round + 1)
+
+    # Sample fresh seed chunks on-demand.
+    new_seeds = source.sample_chunks(n, min_chars=cfg.corpus.min_chunk_chars)
+    if not new_seeds:
+        # Fallback: reuse existing seed chunks if source is exhausted.
+        seed_ids = [f"fallback_{i}" for i in range(n)]
+    else:
+        seed_ids = [c.hash for c in new_seeds]
+
+    # Allocate qa_type distribution for replacement tasks.
+    positive_remaining = (
+        {str(k): int(v) for k, v in remaining_type_counts.items() if int(v) > 0}
+        if remaining_type_counts
+        else {}
+    )
+    if positive_remaining:
+        remaining_total = sum(positive_remaining.values())
+        type_distribution = {
+            qa_type: count / remaining_total for qa_type, count in positive_remaining.items()
+        }
+        type_counts = allocate_largest_remainder_generic(n, type_distribution)
+    else:
+        type_counts = allocate_largest_remainder_generic(n, cfg.targets.primary_type_distribution)
+    hop_counts = allocate_largest_remainder_generic(
+        type_counts.get("multi_hop", 0),
+        {str(k): v for k, v in cfg.targets.hop_distribution.items()},
+    )
+    mode_counts = allocate_largest_remainder_generic(
+        type_counts.get("multi_hop", 0),
+        cfg.targets.reasoning_mode_distribution,
+    )
+
+    mode_pool: list[str] = []
+    for mode, count in sorted(mode_counts.items()):
+        mode_pool.extend([mode] * count)
+    rng.shuffle(mode_pool)
+
+    hop_pool: list[int] = []
+    for hop_str, count in sorted(hop_counts.items()):
+        hop_pool.extend([int(hop_str)] * count)
+    rng.shuffle(hop_pool)
+
+    tasks: list[GenerationTask] = []
+    multi_hop_idx = 0
+    idx = 0
+
+    for _ in range(type_counts.get("lookup", 0)):
+        seed_id = seed_ids[idx % len(seed_ids)]
+        idx += 1
+        tasks.append(
+            GenerationTask(
+                task_id=f"requeue_{requeue_round}_{len(tasks):05d}",
+                qa_type="lookup",
+                target_hop_count=1,
+                seed_chunk_id=seed_id,
+                reasoning_mode="",
+            )
+        )
+
+    for _ in range(type_counts.get("multi_hop", 0)):
+        seed_id = seed_ids[idx % len(seed_ids)]
+        idx += 1
+        mode = mode_pool[multi_hop_idx] if multi_hop_idx < len(mode_pool) else "factual"
+        hop = hop_pool[multi_hop_idx] if multi_hop_idx < len(hop_pool) else 2
+        multi_hop_idx += 1
+        tasks.append(
+            GenerationTask(
+                task_id=f"requeue_{requeue_round}_{len(tasks):05d}",
+                qa_type="multi_hop",
+                target_hop_count=hop,
+                seed_chunk_id=seed_id,
+                reasoning_mode=mode,
+            )
+        )
+
+    rng.shuffle(tasks)
+    return tasks
 
 
 def run_cgft_pipeline(
