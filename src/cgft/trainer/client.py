@@ -305,7 +305,7 @@ class TrainerClient:
 ROLLOUT_SERVER_URL = "https://autobots.cgft.io"
 
 _VALIDATION_MODEL = "grok-4-fast-reasoning"
-_VALIDATION_LLM_BASE_URL = "https://app.cgft.io/api/llm"
+_VALIDATION_LLM_BASE_URL = "https://llm.cgft.io/v1"
 
 # ANSI colours
 _GREEN = "\033[32m"

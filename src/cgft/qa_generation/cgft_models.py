@@ -158,7 +158,7 @@ class ModelConfig:
 
     model: str = "gpt-5.4"
     api_key: str = ""
-    base_url: str = "https://app.cgft.io/api/llm"
+    base_url: str = "https://llm.cgft.io/v1"
 
 
 @dataclass
@@ -203,7 +203,7 @@ class PlatformConfig:
     api_key: str
     base_url: str = "https://app.cgft.io"
     llm_api_key: str = ""
-    llm_base_url: str = "https://app.cgft.io/api/llm"
+    llm_base_url: str = "https://llm.cgft.io/v1"
 
 
 @dataclass
@@ -405,7 +405,7 @@ class RetrievalLLMFilterConfig:
     enabled: bool = True
     judge_model: str = "gpt-5.4"
     judge_api_key: str = ""
-    judge_base_url: str = ""
+    judge_base_url: str = "https://llm.cgft.io/v1"
     judge_system_prompt: str = DEFAULT_RETRIEVAL_JUDGE_SYSTEM_PROMPT
     judge_user_template: str = DEFAULT_RETRIEVAL_JUDGE_USER_TEMPLATE
     top_k: int = 5
@@ -425,7 +425,7 @@ class GroundingLLMFilterConfig:
     enabled: bool = True
     judge_model: str = "gpt-5.4"
     judge_api_key: str = ""
-    judge_base_url: str = ""
+    judge_base_url: str = "https://llm.cgft.io/v1"
     judge_system_prompt: str = DEFAULT_GROUNDING_JUDGE_SYSTEM_PROMPT
     judge_user_template: str = DEFAULT_GROUNDING_JUDGE_USER_TEMPLATE
     top_k: int = 5
@@ -442,10 +442,10 @@ class LLMEnvFilterConfig:
     enabled: bool = True
     model: str = "gpt-5.4"
     api_key: str = ""
-    base_url: str = ""
+    base_url: str = "https://llm.cgft.io/v1"
     judge_model: str = "gpt-5.4"
     judge_api_key: str = ""
-    judge_base_url: str = ""
+    judge_base_url: str = "https://llm.cgft.io/v1"
     env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
     rollout_limits: RolloutLimits = field(default_factory=RolloutLimits)
 
@@ -459,7 +459,7 @@ class HopCountValidityCfg:
     max_judge_calls: int = 3
     judge_model: str = "gpt-5.4"
     judge_api_key: str = ""
-    judge_base_url: str = ""
+    judge_base_url: str = "https://llm.cgft.io/v1"
     max_concurrent: int = 8
     batch_enabled: bool = True
     show_batch_progress: bool = True
@@ -570,7 +570,7 @@ class CgftPipelineConfig:
     def resolve_api_keys(self) -> None:
         """Fill unset component API keys/base URLs with shared platform LLM settings."""
         shared_llm_key = self.platform.llm_api_key or self.platform.api_key
-        shared_llm_base_url = self.platform.llm_base_url.strip() or "https://app.cgft.io/api/llm"
+        shared_llm_base_url = self.platform.llm_base_url.strip() or "https://llm.cgft.io/v1"
 
         if not self.generation.llm_direct.api_key:
             self.generation.llm_direct.api_key = shared_llm_key
@@ -920,7 +920,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         api_key=api_key,
         base_url=str(platform_raw.get("base_url", "https://app.cgft.io")).strip(),
         llm_api_key=str(platform_raw.get("llm_api_key", "")).strip(),
-        llm_base_url=str(platform_raw.get("llm_base_url", "https://app.cgft.io/api/llm")).strip(),
+        llm_base_url=str(platform_raw.get("llm_base_url", "https://llm.cgft.io/v1")).strip(),
     )
 
     corpus_raw = raw.get("corpus", {}) or {}
