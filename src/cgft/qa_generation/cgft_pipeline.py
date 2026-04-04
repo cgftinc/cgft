@@ -30,7 +30,6 @@ from cgft.qa_generation.cgft_models import (
     CgftRunStats,
     EntityExtractionConfig,
     GenerationTask,
-    build_generation_tasks,
     load_cgft_config,
 )
 from cgft.qa_generation.corpus_profile import (
@@ -410,7 +409,10 @@ def _reason_code_from_verdict(verdict: FilterVerdict | None) -> str:
 
 
 def _resolve_effective_qa_type(item: GeneratedQA) -> tuple[str, bool, str]:
-    """Return the effective QA type implied by the item's reference structure."""
+    """Return the effective QA type implied by the item's reference structure.
+
+    KEEP IN SYNC with _resolve_effective_type_for_checkpoint in checkpoint.py
+    """
     qa_type = str(item.qa.get("qa_type", "")).strip().lower()
     if not qa_type:
         qa_type = (
@@ -877,8 +879,10 @@ def _build_regeneration_tasks(
             1,
             _int_or(meta.get("target_hop_count", item.qa.get("min_hop_count", 1)), 1),
         )
-        if failure_type == "too_easy":
-            # Too-easy retries should increase composition depth by default.
+        if failure_type == "too_easy" and qa_type != "lookup":
+            # Too-easy retries for multi-hop should increase composition depth.
+            # Lookup items stay at hop_count=1 — the prompt already instructs
+            # the LLM to rephrase for reduced lexical overlap.
             target_hop_count = min(max(target_hop_count + 1, 2), 6)
 
         seed_chunk_id = str(meta.get("seed_chunk_id", "")).strip()
@@ -1357,17 +1361,10 @@ class CgftPipeline:
         work queue and writes checkpoint files.
         """
         cfg = self.cfg
-        seed_chunks = context.get("seed_chunks") or []
         source = context.source
         profile = context.profile
 
-        _print_progress("[4/6] Creating generation tasks...", verbose=cfg.verbose)
-        tasks = build_generation_tasks(
-            cfg,
-            seed_chunk_ids=[chunk.hash for chunk in seed_chunks],
-        )
-        context["tasks"] = tasks
-        _print_progress(f"[4/6] Created {len(tasks)} generation tasks", verbose=cfg.verbose)
+        _print_progress("[4/6] Preparing generation...", verbose=cfg.verbose)
 
         linker = _build_linker(cfg, source, profile=profile)
         generator = _build_generator(
@@ -1386,12 +1383,10 @@ class CgftPipeline:
 
         # --- Micro-batch work queue (generate → filter → transform) ---
         _print_progress(
-            f"[5/6] Starting work queue ({len(tasks)} tasks,"
-            f" batch_size={cfg.micro_batch.batch_size})...",
+            f"[5/6] Starting work queue (batch_size={cfg.micro_batch.batch_size})...",
             verbose=cfg.verbose,
         )
         all_passed, all_rejected, total_regens, raw_items = self._run_work_queue(
-            initial_tasks=tasks,
             source=source,
             generator=generator,
             guard_filter=guard_filter,
@@ -1620,7 +1615,6 @@ class CgftPipeline:
     def _run_work_queue(
         self,
         *,
-        initial_tasks: list[GenerationTask],
         source: Any,
         generator: QuestionGenerator,
         guard_filter: DeterministicGuardsFilter,
@@ -1629,15 +1623,15 @@ class CgftPipeline:
         transformer: QuestionTransformer,
         context: CgftContext,
     ) -> tuple[list[GeneratedQA], list[GeneratedQA], int, list[GeneratedQA]]:
-        """Run stages 5-7 in micro-batches with checkpointing and re-queuing.
+        """Run stages 5-7 in micro-batches with dynamic distribution.
 
         Returns:
             (all_passed, all_rejected, total_regens, all_raw_items)
         """
-        from collections import deque
         from concurrent.futures import ThreadPoolExecutor
         from pathlib import Path
 
+        from cgft.qa_generation.cgft_models import allocate_largest_remainder_generic
         from cgft.qa_generation.checkpoint import (
             CheckpointManager,
             compute_config_hash,
@@ -1646,12 +1640,18 @@ class CgftPipeline:
         cfg = self.cfg
         target = cfg.targets.total_samples
         batch_size = cfg.micro_batch.batch_size
+        max_iterations = cfg.micro_batch.max_iterations
 
-        # Partition tasks into micro-batches.
-        batches: list[list[GenerationTask]] = [
-            initial_tasks[i : i + batch_size] for i in range(0, len(initial_tasks), batch_size)
-        ]
-        queue: deque[list[GenerationTask]] = deque(batches)
+        # Compute target counts for type, mode, hop distributions.
+        target_type_counts = _compute_target_type_counts(cfg)
+        target_mode_counts = allocate_largest_remainder_generic(
+            target_type_counts.get("multi_hop", 0),
+            cfg.targets.reasoning_mode_distribution,
+        )
+        target_hop_counts = allocate_largest_remainder_generic(
+            target_type_counts.get("multi_hop", 0),
+            {str(k): v for k, v in cfg.targets.hop_distribution.items()},
+        )
 
         # Initialize checkpoint manager.
         ckpt_dir_str = cfg.micro_batch.checkpoint_dir.strip()
@@ -1661,67 +1661,42 @@ class CgftPipeline:
             ckpt_dir = Path(ckpt_dir_str)
 
         config_hash = compute_config_hash(
-            random_seed=cfg.random_seed,
             total_samples=target,
             corpus_id=cfg.corpus.corpus_id,
             primary_type_distribution=cfg.targets.primary_type_distribution,
+            reasoning_mode_distribution=(cfg.targets.reasoning_mode_distribution),
+            hop_distribution={str(k): v for k, v in cfg.targets.hop_distribution.items()},
             acceptance_policy="quota_aware_v1",
         )
         ckpt_mgr = CheckpointManager(checkpoint_dir=ckpt_dir, config_hash=config_hash)
-        target_type_counts = _compute_target_type_counts(cfg)
 
         # Resume from checkpoint if available.
         resume = ckpt_mgr.resume_state() if cfg.micro_batch.resume else None
         if resume and resume.passed_items:
             all_passed = resume.passed_items
-            accepted_type_counts = _count_items_by_effective_type(all_passed)
+            accepted_type_counts = dict(resume.accepted_by_type)
+            accepted_mode_counts = dict(resume.accepted_by_reasoning_mode)
+            accepted_hop_counts = dict(resume.accepted_by_hop_count)
             batch_idx = resume.completed_batch_count
-            requeue_round = resume.requeue_round
-            # Skip already-completed batches in the queue.
-            for _ in range(min(batch_idx, len(queue))):
-                queue.popleft()
+            iteration_count = resume.iteration_count
             _print_progress(
                 f"  Resumed from checkpoint: {len(all_passed)} passed,"
-                f" {batch_idx} batches completed",
+                f" {batch_idx} batches completed,"
+                f" iteration {iteration_count}",
                 verbose=cfg.verbose,
             )
-            # If we still need more items but the queue is empty
-            # (original batches all done, re-queued tasks were lost),
-            # seed the queue with replacement tasks for the deficit.
-            deficit = target - len(all_passed)
-            if deficit > 0 and not queue and requeue_round < cfg.micro_batch.max_requeue_rounds:
-                remaining_type_counts = {
-                    qa_type: max(
-                        0,
-                        int(target_type_counts.get(qa_type, 0))
-                        - int(accepted_type_counts.get(qa_type, 0)),
-                    )
-                    for qa_type in target_type_counts
-                }
-                new_tasks = _create_replacement_tasks(
-                    deficit,
-                    source=source,
-                    cfg=cfg,
-                    requeue_round=requeue_round,
-                    remaining_type_counts=remaining_type_counts,
-                )
-                for i in range(0, len(new_tasks), batch_size):
-                    queue.append(new_tasks[i : i + batch_size])
-                requeue_round += 1
-                _print_progress(
-                    f"  Re-seeded queue with {len(new_tasks)} tasks"
-                    f" ({len(queue)} batches) for deficit of {deficit}",
-                    verbose=cfg.verbose,
-                )
         else:
             all_passed: list[GeneratedQA] = []
             accepted_type_counts = {qa_type: 0 for qa_type in target_type_counts}
+            accepted_mode_counts: dict[str, int] = {}
+            accepted_hop_counts: dict[str, int] = {}
             batch_idx = 0
-            requeue_round = 0
+            iteration_count = 0
 
         all_rejected: list[GeneratedQA] = []
         all_raw: list[GeneratedQA] = []
         total_regens = 0
+        consecutive_empty = 0
 
         pbar = _tqdm(
             total=target,
@@ -1734,11 +1709,24 @@ class CgftPipeline:
 
         if max_parallel <= 1:
             # Sequential processing.
-            while len(all_passed) < target and queue:
-                batch_tasks = queue.popleft()
+            while True:
+                tasks = compute_next_batch(
+                    target_type_counts=target_type_counts,
+                    accepted_type_counts=accepted_type_counts,
+                    target_mode_counts=target_mode_counts,
+                    accepted_mode_counts=accepted_mode_counts,
+                    target_hop_counts=target_hop_counts,
+                    accepted_hop_counts=accepted_hop_counts,
+                    batch_size=batch_size,
+                    source=source,
+                    cfg=cfg,
+                    iteration_count=iteration_count,
+                )
+                if not tasks or iteration_count >= max_iterations:
+                    break
 
                 passed, rejected, raw, regens = self._process_batch(
-                    batch_tasks,
+                    tasks,
                     generator=generator,
                     guard_filter=guard_filter,
                     filter_stage_names=filter_stage_names,
@@ -1753,14 +1741,43 @@ class CgftPipeline:
                     target_type_counts=target_type_counts,
                 )
                 batch_rejected = [*rejected, *quota_rejected]
+
+                if len(accepted) == 0:
+                    consecutive_empty += 1
+                else:
+                    consecutive_empty = 0
+
+                if consecutive_empty >= 5:
+                    logger.warning("No items accepted in 5 consecutive batches, stopping early")
+                    all_rejected.extend(batch_rejected)
+                    all_raw.extend(raw)
+                    total_regens += regens
+                    break
+
+                _update_subdistribution_counts(
+                    accepted,
+                    accepted_mode_counts=accepted_mode_counts,
+                    accepted_hop_counts=accepted_hop_counts,
+                )
+
                 all_passed.extend(accepted)
                 all_rejected.extend(batch_rejected)
                 all_raw.extend(raw)
                 total_regens += regens
                 pbar.update(len(accepted))
 
-                ckpt_mgr.save_batch(batch_idx, accepted, batch_rejected, regens)
+                ckpt_mgr.save_batch(
+                    batch_idx,
+                    accepted,
+                    batch_rejected,
+                    regens,
+                    accepted_by_type=accepted_type_counts,
+                    accepted_by_reasoning_mode=accepted_mode_counts,
+                    accepted_by_hop_count=accepted_hop_counts,
+                    iteration_count=iteration_count,
+                )
                 batch_idx += 1
+                iteration_count += 1
 
                 _print_progress(
                     f"  Batch {batch_idx}: {len(raw)} generated"
@@ -1769,24 +1786,6 @@ class CgftPipeline:
                     f" {regens} regenerated",
                     verbose=cfg.verbose,
                 )
-
-                # Re-queue failures as fresh tasks.
-                self._maybe_requeue(
-                    queue=queue,
-                    rejected_items=batch_rejected,
-                    all_passed_count=len(all_passed),
-                    target=target,
-                    requeue_round=requeue_round,
-                    source=source,
-                    cfg=cfg,
-                    accepted_type_counts=accepted_type_counts,
-                    target_type_counts=target_type_counts,
-                )
-                # Bump requeue round when all original batches are done.
-                if not queue:
-                    pass  # No more batches.
-                elif all(getattr(t[0], "task_id", "").startswith("requeue_") for t in queue if t):
-                    requeue_round += 1
         else:
             # Parallel processing with ThreadPoolExecutor.
             import copy
@@ -1797,7 +1796,12 @@ class CgftPipeline:
             def _run_one_batch(
                 batch_tasks: list[GenerationTask],
                 batch_context: CgftContext,
-            ) -> tuple[list[GeneratedQA], list[GeneratedQA], list[GeneratedQA], int]:
+            ) -> tuple[
+                list[GeneratedQA],
+                list[GeneratedQA],
+                list[GeneratedQA],
+                int,
+            ]:
                 return self._process_batch(
                     batch_tasks,
                     generator=generator,
@@ -1812,47 +1816,83 @@ class CgftPipeline:
                 futures: dict[Any, int] = {}
 
                 def _submit_next() -> None:
-                    nonlocal batch_idx
-                    while queue and len(futures) < max_parallel and len(all_passed) < target:
-                        batch_tasks = queue.popleft()
-                        # Shallow copy context state for thread safety.
+                    nonlocal batch_idx, iteration_count
+                    while len(futures) < max_parallel and iteration_count < max_iterations:
+                        tasks = compute_next_batch(
+                            target_type_counts=target_type_counts,
+                            accepted_type_counts=accepted_type_counts,
+                            target_mode_counts=target_mode_counts,
+                            accepted_mode_counts=accepted_mode_counts,
+                            target_hop_counts=target_hop_counts,
+                            accepted_hop_counts=accepted_hop_counts,
+                            batch_size=batch_size,
+                            source=source,
+                            cfg=cfg,
+                            iteration_count=iteration_count,
+                        )
+                        if not tasks:
+                            break
                         batch_context = copy.copy(context)
                         batch_context.state = dict(context.state)
-                        fut = pool.submit(_run_one_batch, batch_tasks, batch_context)
+                        fut = pool.submit(_run_one_batch, tasks, batch_context)
                         futures[fut] = batch_idx
                         batch_idx += 1
+                        iteration_count += 1
 
                 _submit_next()
 
                 while futures:
                     done = [f for f in futures if f.done()]
                     if not done:
-                        # Wait for at least one to complete.
                         import concurrent.futures
 
                         done_set, _ = concurrent.futures.wait(
                             futures.keys(),
-                            return_when=concurrent.futures.FIRST_COMPLETED,
+                            return_when=(concurrent.futures.FIRST_COMPLETED),
                         )
                         done = list(done_set)
 
-                    for fut in done:
-                        b_idx = futures.pop(fut)
+                    def _collect_result(fut: Any, b_idx: int) -> None:
+                        nonlocal consecutive_empty, total_regens
                         passed, rejected, raw, regens = fut.result()
 
                         with lock:
                             accepted, quota_rejected = _accept_items_under_type_quota(
                                 passed,
-                                accepted_type_counts=accepted_type_counts,
+                                accepted_type_counts=(accepted_type_counts),
                                 target_type_counts=target_type_counts,
                             )
-                            batch_rejected = [*rejected, *quota_rejected]
+                            batch_rejected = [
+                                *rejected,
+                                *quota_rejected,
+                            ]
+
+                            if len(accepted) == 0:
+                                consecutive_empty += 1
+                            else:
+                                consecutive_empty = 0
+
+                            _update_subdistribution_counts(
+                                accepted,
+                                accepted_mode_counts=accepted_mode_counts,
+                                accepted_hop_counts=accepted_hop_counts,
+                            )
+
                             all_passed.extend(accepted)
                             all_rejected.extend(batch_rejected)
                             all_raw.extend(raw)
                             total_regens += regens
                             pbar.update(len(accepted))
-                            ckpt_mgr.save_batch(b_idx, accepted, batch_rejected, regens)
+                            ckpt_mgr.save_batch(
+                                b_idx,
+                                accepted,
+                                batch_rejected,
+                                regens,
+                                accepted_by_type=accepted_type_counts,
+                                accepted_by_reasoning_mode=(accepted_mode_counts),
+                                accepted_by_hop_count=(accepted_hop_counts),
+                                iteration_count=iteration_count,
+                            )
 
                         _print_progress(
                             f"  Batch {b_idx + 1}: {len(raw)} generated"
@@ -1862,24 +1902,28 @@ class CgftPipeline:
                             verbose=cfg.verbose,
                         )
 
-                        with lock:
-                            self._maybe_requeue(
-                                queue=queue,
-                                rejected_items=batch_rejected,
-                                all_passed_count=len(all_passed),
-                                target=target,
-                                requeue_round=requeue_round,
-                                source=source,
-                                cfg=cfg,
-                                accepted_type_counts=accepted_type_counts,
-                                target_type_counts=target_type_counts,
-                            )
+                    for fut in done:
+                        b_idx = futures.pop(fut)
+                        _collect_result(fut, b_idx)
 
-                    _submit_next()
+                    with lock:
+                        _should_stop = consecutive_empty >= 5
+
+                    if _should_stop:
+                        # Drain remaining in-flight futures.
+                        for fut, b_idx in list(futures.items()):
+                            fut.result()  # wait
+                            _collect_result(fut, b_idx)
+                        futures.clear()
+                        logger.warning("No items accepted in 5 consecutive batches, stopping early")
+                        break
+
+                    with lock:
+                        _submit_next()
 
         pbar.close()
 
-        # Clean up checkpoints on success (unless keep_checkpoints is set).
+        # Clean up checkpoints on success (unless keep_checkpoints).
         if not cfg.micro_batch.keep_checkpoints:
             ckpt_mgr.cleanup()
 
@@ -1888,100 +1932,71 @@ class CgftPipeline:
 
         return all_passed, all_rejected, total_regens, all_raw
 
-    @staticmethod
-    def _maybe_requeue(
-        *,
-        queue: Any,  # deque[list[GenerationTask]]
-        rejected_items: list[GeneratedQA],
-        all_passed_count: int,
-        target: int,
-        requeue_round: int,
-        source: Any,
-        cfg: CgftPipelineConfig,
-        accepted_type_counts: dict[str, int],
-        target_type_counts: dict[str, int],
-    ) -> None:
-        """Re-queue failed items as fresh tasks if below target."""
-        n_rejected = len(rejected_items)
-        still_needed = target - all_passed_count
-        n_requeue = min(n_rejected, still_needed)
-        if n_requeue <= 0:
-            return
-        if requeue_round >= cfg.micro_batch.max_requeue_rounds:
-            return
-        remaining_type_counts = {
-            qa_type: max(
-                0,
-                int(target_type_counts.get(qa_type, 0)) - int(accepted_type_counts.get(qa_type, 0)),
-            )
-            for qa_type in target_type_counts
-        }
-        new_tasks = _create_replacement_tasks(
-            n_requeue,
-            source=source,
-            cfg=cfg,
-            requeue_round=requeue_round,
-            remaining_type_counts=remaining_type_counts,
-        )
-        for item, task in zip(rejected_items, new_tasks):
-            qa_type = str(item.qa.get("qa_type", "")).strip()
-            item.append_journey_event(
-                stage="requeue",
-                event_type="requeued_replacement_created",
-                qa_type_before=qa_type,
-                qa_type_after=qa_type,
-                reason_code="requeue_deficit",
-                details={
-                    "replacement_task_id": task.task_id,
-                    "replacement_qa_type": task.qa_type,
-                },
-            )
-        queue.append(new_tasks)
 
-
-def _create_replacement_tasks(
-    n: int,
+def compute_next_batch(
     *,
+    target_type_counts: dict[str, int],
+    accepted_type_counts: dict[str, int],
+    target_mode_counts: dict[str, int],
+    accepted_mode_counts: dict[str, int],
+    target_hop_counts: dict[str, int],
+    accepted_hop_counts: dict[str, int],
+    batch_size: int,
     source: Any,
     cfg: CgftPipelineConfig,
-    requeue_round: int,
-    remaining_type_counts: dict[str, int] | None = None,
+    iteration_count: int,
 ) -> list[GenerationTask]:
-    """Create fresh generation tasks to replace rejected items."""
+    """Compute the next batch of generation tasks based on remaining quotas."""
     from cgft.qa_generation.cgft_models import allocate_largest_remainder_generic
 
-    rng = random.Random(cfg.random_seed + requeue_round + 1)
+    remaining = {
+        t: max(0, target - accepted_type_counts.get(t, 0))
+        for t, target in target_type_counts.items()
+    }
+    total_remaining = sum(remaining.values())
+    if total_remaining == 0:
+        return []
 
-    # Sample fresh seed chunks on-demand.
-    new_seeds = source.sample_chunks(n, min_chars=cfg.corpus.min_chunk_chars)
-    if not new_seeds:
-        # Fallback: reuse existing seed chunks if source is exhausted.
-        seed_ids = [f"fallback_{i}" for i in range(n)]
-    else:
-        seed_ids = [c.hash for c in new_seeds]
+    n = min(batch_size, total_remaining)
 
-    # Allocate qa_type distribution for replacement tasks.
-    positive_remaining = (
-        {str(k): int(v) for k, v in remaining_type_counts.items() if int(v) > 0}
-        if remaining_type_counts
-        else {}
-    )
-    if positive_remaining:
-        remaining_total = sum(positive_remaining.values())
-        type_distribution = {
-            qa_type: count / remaining_total for qa_type, count in positive_remaining.items()
-        }
-        type_counts = allocate_largest_remainder_generic(n, type_distribution)
+    # Multi-hop priority: allocate multi_hop first, fill rest with lookup.
+    n_multi_hop = min(n, remaining.get("multi_hop", 0))
+    n_lookup = min(n - n_multi_hop, remaining.get("lookup", 0))
+    # If there's still room (e.g. one type is full), fill from the other.
+    leftover = n - n_multi_hop - n_lookup
+    if leftover > 0:
+        if remaining.get("multi_hop", 0) > n_multi_hop:
+            n_multi_hop += min(leftover, remaining["multi_hop"] - n_multi_hop)
+        elif remaining.get("lookup", 0) > n_lookup:
+            n_lookup += min(leftover, remaining["lookup"] - n_lookup)
+
+    # For multi_hop: allocate reasoning_mode and hop_count proportionally
+    # to remaining sub-distribution counts.
+    remaining_mode = {
+        m: max(0, target_mode_counts.get(m, 0) - accepted_mode_counts.get(m, 0))
+        for m in target_mode_counts
+    }
+    remaining_hop = {
+        h: max(0, target_hop_counts.get(h, 0) - accepted_hop_counts.get(h, 0))
+        for h in target_hop_counts
+    }
+
+    mode_total = sum(remaining_mode.values())
+    if mode_total > 0:
+        mode_dist = {m: c / mode_total for m, c in remaining_mode.items() if c > 0}
     else:
-        type_counts = allocate_largest_remainder_generic(n, cfg.targets.primary_type_distribution)
-    hop_counts = allocate_largest_remainder_generic(
-        type_counts.get("multi_hop", 0),
-        {str(k): v for k, v in cfg.targets.hop_distribution.items()},
-    )
-    mode_counts = allocate_largest_remainder_generic(
-        type_counts.get("multi_hop", 0),
-        cfg.targets.reasoning_mode_distribution,
-    )
+        mode_dist = dict(cfg.targets.reasoning_mode_distribution)
+    mode_counts = allocate_largest_remainder_generic(n_multi_hop, mode_dist)
+
+    hop_total = sum(remaining_hop.values())
+    if hop_total > 0:
+        hop_dist = {h: c / hop_total for h, c in remaining_hop.items() if c > 0}
+    else:
+        hop_dist = {str(k): v for k, v in cfg.targets.hop_distribution.items()}
+    hop_counts = allocate_largest_remainder_generic(n_multi_hop, hop_dist)
+
+    # Build mode and hop pools.
+    rng = random.Random(cfg.random_seed + iteration_count + 1)
 
     mode_pool: list[str] = []
     for mode, count in sorted(mode_counts.items()):
@@ -1993,16 +2008,24 @@ def _create_replacement_tasks(
         hop_pool.extend([int(hop_str)] * count)
     rng.shuffle(hop_pool)
 
-    tasks: list[GenerationTask] = []
-    multi_hop_idx = 0
-    idx = 0
+    # Sample fresh seed chunks.
+    total_tasks = n_lookup + n_multi_hop
+    new_seeds = source.sample_chunks(total_tasks, min_chars=cfg.corpus.min_chunk_chars)
+    if not new_seeds:
+        seed_ids = [f"fallback_{i}" for i in range(total_tasks)]
+    else:
+        seed_ids = [c.hash for c in new_seeds]
 
-    for _ in range(type_counts.get("lookup", 0)):
-        seed_id = seed_ids[idx % len(seed_ids)]
+    tasks: list[GenerationTask] = []
+    idx = 0
+    multi_hop_idx = 0
+
+    for _ in range(n_lookup):
+        seed_id = seed_ids[idx % len(seed_ids)] if seed_ids else "fallback_0"
         idx += 1
         tasks.append(
             GenerationTask(
-                task_id=f"requeue_{requeue_round}_{len(tasks):05d}",
+                task_id=f"iter_{iteration_count}_{len(tasks):05d}",
                 qa_type="lookup",
                 target_hop_count=1,
                 seed_chunk_id=seed_id,
@@ -2010,15 +2033,15 @@ def _create_replacement_tasks(
             )
         )
 
-    for _ in range(type_counts.get("multi_hop", 0)):
-        seed_id = seed_ids[idx % len(seed_ids)]
+    for _ in range(n_multi_hop):
+        seed_id = seed_ids[idx % len(seed_ids)] if seed_ids else "fallback_0"
         idx += 1
         mode = mode_pool[multi_hop_idx] if multi_hop_idx < len(mode_pool) else "factual"
         hop = hop_pool[multi_hop_idx] if multi_hop_idx < len(hop_pool) else 2
         multi_hop_idx += 1
         tasks.append(
             GenerationTask(
-                task_id=f"requeue_{requeue_round}_{len(tasks):05d}",
+                task_id=f"iter_{iteration_count}_{len(tasks):05d}",
                 qa_type="multi_hop",
                 target_hop_count=hop,
                 seed_chunk_id=seed_id,
@@ -2028,6 +2051,30 @@ def _create_replacement_tasks(
 
     rng.shuffle(tasks)
     return tasks
+
+
+def _update_subdistribution_counts(
+    accepted_items: list[GeneratedQA],
+    *,
+    accepted_mode_counts: dict[str, int],
+    accepted_hop_counts: dict[str, int],
+) -> None:
+    """Update reasoning_mode and hop_count counts for accepted items."""
+    for item in accepted_items:
+        effective_type, _, _ = _resolve_effective_qa_type(item)
+        if effective_type != "multi_hop":
+            continue
+        mode = (
+            str(item.generation_metadata.get("reasoning_mode", "")).strip()
+            or str(item.qa.get("reasoning_mode", "")).strip()
+        )
+        if mode:
+            accepted_mode_counts[mode] = accepted_mode_counts.get(mode, 0) + 1
+        ref_chunks = list(
+            item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []) or []
+        )
+        hop_key = str(len(ref_chunks))
+        accepted_hop_counts[hop_key] = accepted_hop_counts.get(hop_key, 0) + 1
 
 
 def run_cgft_pipeline(

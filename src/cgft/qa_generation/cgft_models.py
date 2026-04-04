@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -525,6 +526,7 @@ class MicroBatchConfig:
     checkpoint_dir: str = ""  # "" = auto: {output.dir}/.checkpoints/
     resume: bool = True
     max_requeue_rounds: int = 3
+    max_iterations: int = 50
     max_parallel_batches: int = 1
     keep_checkpoints: bool = False
 
@@ -767,7 +769,12 @@ def build_generation_tasks(
     *,
     seed_chunk_ids: list[str],
 ) -> list[GenerationTask]:
-    """Build tasks from matrix targets with deterministic seed assignment."""
+    """Build tasks from matrix targets with deterministic seed assignment.
+
+    Note: the internal pipeline no longer uses this path for its main loop —
+    it uses ``compute_next_batch`` for dynamic per-iteration task creation.
+    This function is kept for external callers and tests.
+    """
     if not seed_chunk_ids:
         return []
     return _build_consolidated_tasks(cfg, seed_chunk_ids=seed_chunk_ids)
@@ -778,7 +785,12 @@ def _build_consolidated_tasks(
     *,
     seed_chunk_ids: list[str],
 ) -> list[GenerationTask]:
-    """Build tasks using the 2-type + reasoning mode system."""
+    """Build tasks using the 2-type + reasoning mode system.
+
+    Note: the internal pipeline no longer uses this path — it uses
+    ``compute_next_batch`` for dynamic per-iteration task creation.
+    Kept for external callers and tests.
+    """
     rng = random.Random(cfg.random_seed)
     targets = cfg.targets
 
@@ -1211,11 +1223,19 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
     )
 
     micro_batch_raw = raw.get("micro_batch", {}) or {}
+    _max_requeue_raw = micro_batch_raw.get("max_requeue_rounds")
+    if _max_requeue_raw is not None and int(_max_requeue_raw) != 3:
+        warnings.warn(
+            "max_requeue_rounds is deprecated, use max_iterations instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     micro_batch = MicroBatchConfig(
         batch_size=max(1, int(micro_batch_raw.get("batch_size", 100))),
         checkpoint_dir=str(micro_batch_raw.get("checkpoint_dir", "")).strip(),
         resume=bool(micro_batch_raw.get("resume", True)),
         max_requeue_rounds=max(0, int(micro_batch_raw.get("max_requeue_rounds", 3))),
+        max_iterations=max(1, int(micro_batch_raw.get("max_iterations", 50))),
         max_parallel_batches=max(1, int(micro_batch_raw.get("max_parallel_batches", 1))),
     )
 
