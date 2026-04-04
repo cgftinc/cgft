@@ -277,6 +277,16 @@ def train(
         results (dry_run mode).
     """
 
+    # Minimum dataset size check — training batch config requires at least 16 samples
+    MIN_TRAIN_SAMPLES = 16
+    if len(train_dataset) < MIN_TRAIN_SAMPLES:
+        raise ValueError(
+            f"Training dataset has {len(train_dataset)} samples, but at least "
+            f"{MIN_TRAIN_SAMPLES} are required. The training batch configuration "
+            f"cannot split fewer than {MIN_TRAIN_SAMPLES} samples across GPUs. "
+            f"Add more training examples and try again."
+        )
+
     # Run local environment validation before uploading anything
     if validate_env:
         from cgft.trainer.validation import validate_env as _validate_env
