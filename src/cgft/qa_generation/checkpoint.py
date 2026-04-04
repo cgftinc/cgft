@@ -114,7 +114,6 @@ def compute_config_hash(
 class Manifest:
     """Checkpoint manifest tracking pipeline progress."""
 
-    manifest_version: int = 2
     config_hash: str = ""
     completed_batch_count: int = 0
     total_passed: int = 0
@@ -126,7 +125,6 @@ class Manifest:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "manifest_version": self.manifest_version,
             "config_hash": self.config_hash,
             "completed_batch_count": self.completed_batch_count,
             "total_passed": self.total_passed,
@@ -140,7 +138,6 @@ class Manifest:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Manifest:
         return cls(
-            manifest_version=int(d.get("manifest_version", 2)),
             config_hash=str(d.get("config_hash", "")),
             completed_batch_count=int(d.get("completed_batch_count", 0)),
             total_passed=int(d.get("total_passed", 0)),

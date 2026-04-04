@@ -223,7 +223,6 @@ class TestManifest:
         )
         d = m.to_dict()
         m2 = Manifest.from_dict(d)
-        assert m2.manifest_version == 2
         assert m2.config_hash == m.config_hash
         assert m2.completed_batch_count == m.completed_batch_count
         assert m2.total_passed == m.total_passed
