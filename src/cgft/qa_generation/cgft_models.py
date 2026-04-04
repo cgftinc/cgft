@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import random
-import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -525,7 +524,6 @@ class MicroBatchConfig:
     batch_size: int = 100
     checkpoint_dir: str = ""  # "" = auto: {output.dir}/.checkpoints/
     resume: bool = True
-    max_requeue_rounds: int = 3
     max_iterations: int = 50
     max_parallel_batches: int = 1
     keep_checkpoints: bool = False
@@ -762,105 +760,6 @@ def allocate_largest_remainder_generic(
         for key in order[:remainder]:
             base[key] += 1
     return base
-
-
-def build_generation_tasks(
-    cfg: CgftPipelineConfig,
-    *,
-    seed_chunk_ids: list[str],
-) -> list[GenerationTask]:
-    """Build tasks from matrix targets with deterministic seed assignment.
-
-    Note: the internal pipeline no longer uses this path for its main loop —
-    it uses ``compute_next_batch`` for dynamic per-iteration task creation.
-    This function is kept for external callers and tests.
-    """
-    if not seed_chunk_ids:
-        return []
-    return _build_consolidated_tasks(cfg, seed_chunk_ids=seed_chunk_ids)
-
-
-def _build_consolidated_tasks(
-    cfg: CgftPipelineConfig,
-    *,
-    seed_chunk_ids: list[str],
-) -> list[GenerationTask]:
-    """Build tasks using the 2-type + reasoning mode system.
-
-    Note: the internal pipeline no longer uses this path — it uses
-    ``compute_next_batch`` for dynamic per-iteration task creation.
-    Kept for external callers and tests.
-    """
-    rng = random.Random(cfg.random_seed)
-    targets = cfg.targets
-
-    # Allocate primary types (lookup vs multi_hop).
-    type_counts = allocate_largest_remainder_generic(
-        targets.total_samples,
-        targets.primary_type_distribution,
-    )
-
-    # Allocate reasoning modes within multi_hop.
-    n_multi_hop = type_counts.get("multi_hop", 0)
-    mode_counts = allocate_largest_remainder_generic(
-        n_multi_hop,
-        targets.reasoning_mode_distribution,
-    )
-
-    # Allocate hop counts within multi_hop.
-    hop_counts = allocate_largest_remainder_generic(
-        n_multi_hop,
-        {str(k): v for k, v in targets.hop_distribution.items()},
-    )
-
-    # Build a pool of (reasoning_mode, hop_count) assignments for multi_hop.
-    mode_pool: list[str] = []
-    for mode, count in sorted(mode_counts.items()):
-        mode_pool.extend([mode] * count)
-    rng.shuffle(mode_pool)
-
-    hop_pool: list[int] = []
-    for hop_str, count in sorted(hop_counts.items()):
-        hop_pool.extend([int(hop_str)] * count)
-    rng.shuffle(hop_pool)
-
-    tasks: list[GenerationTask] = []
-    idx = 0
-    multi_hop_idx = 0
-
-    # Lookup tasks first.
-    for _ in range(type_counts.get("lookup", 0)):
-        seed_chunk_id = seed_chunk_ids[idx % len(seed_chunk_ids)]
-        idx += 1
-        tasks.append(
-            GenerationTask(
-                task_id=f"task_{len(tasks):05d}",
-                qa_type="lookup",
-                target_hop_count=1,
-                seed_chunk_id=seed_chunk_id,
-                reasoning_mode="",
-            )
-        )
-
-    # Multi-hop tasks with reasoning modes and hop counts.
-    for _ in range(n_multi_hop):
-        seed_chunk_id = seed_chunk_ids[idx % len(seed_chunk_ids)]
-        idx += 1
-        mode = mode_pool[multi_hop_idx] if multi_hop_idx < len(mode_pool) else "factual"
-        hop = hop_pool[multi_hop_idx] if multi_hop_idx < len(hop_pool) else 2
-        multi_hop_idx += 1
-        tasks.append(
-            GenerationTask(
-                task_id=f"task_{len(tasks):05d}",
-                qa_type="multi_hop",
-                target_hop_count=hop,
-                seed_chunk_id=seed_chunk_id,
-                reasoning_mode=mode,
-            )
-        )
-
-    rng.shuffle(tasks)
-    return tasks
 
 
 def _parse_model_cfg(raw: Any, *, fallback: ModelConfig) -> ModelConfig:
@@ -1223,18 +1122,10 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
     )
 
     micro_batch_raw = raw.get("micro_batch", {}) or {}
-    _max_requeue_raw = micro_batch_raw.get("max_requeue_rounds")
-    if _max_requeue_raw is not None and int(_max_requeue_raw) != 3:
-        warnings.warn(
-            "max_requeue_rounds is deprecated, use max_iterations instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
     micro_batch = MicroBatchConfig(
         batch_size=max(1, int(micro_batch_raw.get("batch_size", 100))),
         checkpoint_dir=str(micro_batch_raw.get("checkpoint_dir", "")).strip(),
         resume=bool(micro_batch_raw.get("resume", True)),
-        max_requeue_rounds=max(0, int(micro_batch_raw.get("max_requeue_rounds", 3))),
         max_iterations=max(1, int(micro_batch_raw.get("max_iterations", 50))),
         max_parallel_batches=max(1, int(micro_batch_raw.get("max_parallel_batches", 1))),
     )

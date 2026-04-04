@@ -336,7 +336,6 @@ class TestMicroBatchConfig:
         cfg = MicroBatchConfig()
         assert cfg.batch_size == 100
         assert cfg.resume is True
-        assert cfg.max_requeue_rounds == 3
         assert cfg.max_iterations == 50
         assert cfg.max_parallel_batches == 1
 
