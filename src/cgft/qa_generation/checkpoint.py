@@ -168,25 +168,6 @@ class ResumeState:
     accepted_by_hop_count: dict[str, int] = field(default_factory=dict)
 
 
-def _resolve_effective_type_for_checkpoint(item: GeneratedQA) -> str:
-    """Resolve effective QA type from item structure.
-
-    KEEP IN SYNC with _resolve_effective_qa_type in cgft_pipeline.py
-    """
-    qa_type = str(item.qa.get("qa_type", "")).strip().lower()
-    if not qa_type:
-        qa_type = (
-            str(item.generation_metadata.get("qa_type_target", "")).strip().lower() or "lookup"
-        )
-    ref_chunks = list(
-        item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []) or []
-    )
-    if qa_type == "lookup" and len(ref_chunks) >= 2:
-        return "multi_hop"
-    if qa_type == "multi_hop" and len(ref_chunks) <= 1:
-        return "lookup"
-    return qa_type or "lookup"
-
 
 class CheckpointManager:
     """Manages checkpoint I/O for micro-batch pipeline processing."""
@@ -250,7 +231,7 @@ class CheckpointManager:
         by_mode: dict[str, int] = {}
         by_hop: dict[str, int] = {}
         for item in passed_items:
-            effective_type = _resolve_effective_type_for_checkpoint(item)
+            effective_type = item.resolve_effective_qa_type()
             by_type[effective_type] = by_type.get(effective_type, 0) + 1
             if effective_type == "multi_hop":
                 mode = (

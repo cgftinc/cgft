@@ -411,22 +411,19 @@ def _reason_code_from_verdict(verdict: FilterVerdict | None) -> str:
 def _resolve_effective_qa_type(item: GeneratedQA) -> tuple[str, bool, str]:
     """Return the effective QA type implied by the item's reference structure.
 
-    KEEP IN SYNC with _resolve_effective_type_for_checkpoint in checkpoint.py
+    Delegates to ``GeneratedQA.resolve_effective_qa_type`` for the core logic
+    and adds relabel metadata (was_relabeled flag and direction string).
     """
-    qa_type = str(item.qa.get("qa_type", "")).strip().lower()
-    if not qa_type:
-        qa_type = (
+    original_type = str(item.qa.get("qa_type", "")).strip().lower()
+    if not original_type:
+        original_type = (
             str(item.generation_metadata.get("qa_type_target", "")).strip().lower() or "lookup"
         )
-    ref_chunks = list(
-        item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []) or []
-    )
-
-    if qa_type == "lookup" and len(ref_chunks) >= 2:
-        return "multi_hop", True, "lookup_to_multi_hop"
-    if qa_type == "multi_hop" and len(ref_chunks) <= 1:
-        return "lookup", True, "multi_hop_to_lookup"
-    return qa_type or "lookup", False, ""
+    effective_type = item.resolve_effective_qa_type()
+    if effective_type != original_type:
+        direction = f"{original_type}_to_{effective_type}"
+        return effective_type, True, direction
+    return effective_type, False, ""
 
 
 def _compute_target_type_counts(cfg: CgftPipelineConfig) -> dict[str, int]:
