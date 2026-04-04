@@ -40,8 +40,7 @@ def _make_item(
         "question": question,
         "answer": answer,
         "qa_type": qa_type,
-        "reference_chunks": chunks
-        or [{"id": "c1", "content": "chunk text", "metadata": {}}],
+        "reference_chunks": chunks or [{"id": "c1", "content": "chunk text", "metadata": {}}],
     }
     verdict = None
     if verdict_status is not None:
@@ -156,27 +155,51 @@ class TestSerialization:
 
 class TestConfigHash:
     def test_deterministic(self) -> None:
-        h1 = compute_config_hash(random_seed=42, total_samples=100, corpus_id="abc")
-        h2 = compute_config_hash(random_seed=42, total_samples=100, corpus_id="abc")
+        h1 = compute_config_hash(total_samples=100, corpus_id="abc")
+        h2 = compute_config_hash(total_samples=100, corpus_id="abc")
         assert h1 == h2
 
     def test_different_inputs(self) -> None:
-        h1 = compute_config_hash(random_seed=42, total_samples=100, corpus_id="abc")
-        h2 = compute_config_hash(random_seed=99, total_samples=100, corpus_id="abc")
+        h1 = compute_config_hash(total_samples=100, corpus_id="abc")
+        h2 = compute_config_hash(total_samples=200, corpus_id="abc")
         assert h1 != h2
 
     def test_distribution_changes_hash(self) -> None:
         h1 = compute_config_hash(
-            random_seed=42,
             total_samples=100,
             corpus_id="abc",
             primary_type_distribution={"lookup": 0.5, "multi_hop": 0.5},
         )
         h2 = compute_config_hash(
-            random_seed=42,
             total_samples=100,
             corpus_id="abc",
             primary_type_distribution={"lookup": 0.3, "multi_hop": 0.7},
+        )
+        assert h1 != h2
+
+    def test_reasoning_mode_changes_hash(self) -> None:
+        h1 = compute_config_hash(
+            total_samples=100,
+            corpus_id="abc",
+            reasoning_mode_distribution={"factual": 0.5, "inference": 0.5},
+        )
+        h2 = compute_config_hash(
+            total_samples=100,
+            corpus_id="abc",
+            reasoning_mode_distribution={"factual": 0.3, "inference": 0.7},
+        )
+        assert h1 != h2
+
+    def test_hop_distribution_changes_hash(self) -> None:
+        h1 = compute_config_hash(
+            total_samples=100,
+            corpus_id="abc",
+            hop_distribution={2: 0.5, 3: 0.5},
+        )
+        h2 = compute_config_hash(
+            total_samples=100,
+            corpus_id="abc",
+            hop_distribution={2: 0.8, 3: 0.2},
         )
         assert h1 != h2
 
@@ -193,7 +216,10 @@ class TestManifest:
             completed_batch_count=5,
             total_passed=400,
             total_rejected=100,
-            requeue_round=1,
+            iteration_count=3,
+            accepted_by_type={"lookup": 120, "multi_hop": 280},
+            accepted_by_reasoning_mode={"factual": 100, "inference": 180},
+            accepted_by_hop_count={"2": 140, "3": 140},
         )
         d = m.to_dict()
         m2 = Manifest.from_dict(d)
@@ -201,7 +227,10 @@ class TestManifest:
         assert m2.completed_batch_count == m.completed_batch_count
         assert m2.total_passed == m.total_passed
         assert m2.total_rejected == m.total_rejected
-        assert m2.requeue_round == m.requeue_round
+        assert m2.iteration_count == m.iteration_count
+        assert m2.accepted_by_type == m.accepted_by_type
+        assert m2.accepted_by_reasoning_mode == m.accepted_by_reasoning_mode
+        assert m2.accepted_by_hop_count == m.accepted_by_hop_count
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +335,7 @@ class TestMicroBatchConfig:
         cfg = MicroBatchConfig()
         assert cfg.batch_size == 100
         assert cfg.resume is True
-        assert cfg.max_requeue_rounds == 3
+        assert cfg.max_iterations == 50
         assert cfg.max_parallel_batches == 1
 
     def test_on_pipeline_config(self) -> None:
@@ -322,9 +351,9 @@ class TestMicroBatchConfig:
 # ---------------------------------------------------------------------------
 
 
-class TestCreateReplacementTasks:
+class TestComputeNextBatch:
     def test_creates_correct_count(self) -> None:
-        from cgft.qa_generation.cgft_pipeline import _create_replacement_tasks
+        from cgft.qa_generation.cgft_pipeline import compute_next_batch
 
         source = MagicMock()
         chunk_mock = MagicMock()
@@ -336,51 +365,46 @@ class TestCreateReplacementTasks:
             targets=TargetsConfig(total_samples=10),
         )
 
-        tasks = _create_replacement_tasks(5, source=source, cfg=cfg, requeue_round=0)
-        assert len(tasks) == 5
-        assert all(t.task_id.startswith("requeue_0_") for t in tasks)
-
-    def test_task_types_match_distribution(self) -> None:
-        from cgft.qa_generation.cgft_pipeline import _create_replacement_tasks
-
-        source = MagicMock()
-        chunk_mock = MagicMock()
-        chunk_mock.hash = "seed_456"
-        source.sample_chunks.return_value = [chunk_mock] * 10
-
-        cfg = CgftPipelineConfig(
-            platform=PlatformConfig(api_key="test"),
-            targets=TargetsConfig(
-                total_samples=100,
-                primary_type_distribution={
-                    "lookup": 0.5,
-                    "multi_hop": 0.5,
-                },
-            ),
+        tasks = compute_next_batch(
+            target_type_counts={"lookup": 3, "multi_hop": 7},
+            accepted_type_counts={"lookup": 0, "multi_hop": 0},
+            target_mode_counts={"factual": 3, "inference": 4},
+            accepted_mode_counts={},
+            target_hop_counts={"2": 4, "3": 3},
+            accepted_hop_counts={},
+            batch_size=5,
+            source=source,
+            cfg=cfg,
+            iteration_count=0,
         )
+        assert len(tasks) == 5
+        assert all(t.task_id.startswith("iter_0_") for t in tasks)
 
-        tasks = _create_replacement_tasks(10, source=source, cfg=cfg, requeue_round=1)
-        lookups = sum(1 for t in tasks if t.qa_type == "lookup")
-        multi_hops = sum(1 for t in tasks if t.qa_type == "multi_hop")
-        assert lookups == 5
-        assert multi_hops == 5
-
-    def test_fallback_when_source_empty(self) -> None:
-        from cgft.qa_generation.cgft_pipeline import _create_replacement_tasks
+    def test_returns_empty_when_targets_met(self) -> None:
+        from cgft.qa_generation.cgft_pipeline import compute_next_batch
 
         source = MagicMock()
-        source.sample_chunks.return_value = []
-
         cfg = CgftPipelineConfig(
             platform=PlatformConfig(api_key="test"),
             targets=TargetsConfig(total_samples=10),
         )
 
-        tasks = _create_replacement_tasks(3, source=source, cfg=cfg, requeue_round=0)
-        assert len(tasks) == 3
+        tasks = compute_next_batch(
+            target_type_counts={"lookup": 3, "multi_hop": 7},
+            accepted_type_counts={"lookup": 3, "multi_hop": 7},
+            target_mode_counts={},
+            accepted_mode_counts={},
+            target_hop_counts={},
+            accepted_hop_counts={},
+            batch_size=5,
+            source=source,
+            cfg=cfg,
+            iteration_count=0,
+        )
+        assert tasks == []
 
     def test_task_types_follow_remaining_deficits(self) -> None:
-        from cgft.qa_generation.cgft_pipeline import _create_replacement_tasks
+        from cgft.qa_generation.cgft_pipeline import compute_next_batch
 
         source = MagicMock()
         chunk_mock = MagicMock()
@@ -395,17 +419,47 @@ class TestCreateReplacementTasks:
             ),
         )
 
-        tasks = _create_replacement_tasks(
-            5,
+        tasks = compute_next_batch(
+            target_type_counts={"lookup": 50, "multi_hop": 50},
+            accepted_type_counts={"lookup": 49, "multi_hop": 46},
+            target_mode_counts={"factual": 25, "inference": 25},
+            accepted_mode_counts={"factual": 23, "inference": 23},
+            target_hop_counts={"2": 25, "3": 25},
+            accepted_hop_counts={"2": 23, "3": 23},
+            batch_size=10,
             source=source,
             cfg=cfg,
-            requeue_round=0,
-            remaining_type_counts={"lookup": 1, "multi_hop": 4},
+            iteration_count=0,
         )
         lookups = sum(1 for t in tasks if t.qa_type == "lookup")
         multi_hops = sum(1 for t in tasks if t.qa_type == "multi_hop")
         assert lookups == 1
         assert multi_hops == 4
+
+    def test_fallback_when_source_empty(self) -> None:
+        from cgft.qa_generation.cgft_pipeline import compute_next_batch
+
+        source = MagicMock()
+        source.sample_chunks.return_value = []
+
+        cfg = CgftPipelineConfig(
+            platform=PlatformConfig(api_key="test"),
+            targets=TargetsConfig(total_samples=10),
+        )
+
+        tasks = compute_next_batch(
+            target_type_counts={"lookup": 3, "multi_hop": 7},
+            accepted_type_counts={"lookup": 0, "multi_hop": 0},
+            target_mode_counts={"factual": 3, "inference": 4},
+            accepted_mode_counts={},
+            target_hop_counts={"2": 4, "3": 3},
+            accepted_hop_counts={},
+            batch_size=5,
+            source=source,
+            cfg=cfg,
+            iteration_count=0,
+        )
+        assert len(tasks) == 5
 
 
 class TestQuotaAcceptance:

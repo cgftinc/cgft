@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,19 +85,25 @@ def deserialize_generated_qa(row: dict[str, Any]) -> GeneratedQA:
 
 def compute_config_hash(
     *,
-    random_seed: int,
     total_samples: int,
     corpus_id: str,
     primary_type_distribution: dict[str, float] | None = None,
+    reasoning_mode_distribution: dict[str, float] | None = None,
+    hop_distribution: dict[int | str, float] | None = None,
     acceptance_policy: str = "default",
 ) -> str:
     """Deterministic hash of pipeline config for checkpoint invalidation."""
     payload = {
-        "random_seed": random_seed,
         "total_samples": total_samples,
         "corpus_id": corpus_id,
         "primary_type_distribution": (
             {str(k): float(v) for k, v in sorted((primary_type_distribution or {}).items())}
+        ),
+        "reasoning_mode_distribution": (
+            {str(k): float(v) for k, v in sorted((reasoning_mode_distribution or {}).items())}
+        ),
+        "hop_distribution": (
+            {str(k): float(v) for k, v in sorted((hop_distribution or {}).items())}
         ),
         "acceptance_policy": str(acceptance_policy),
     }
@@ -111,7 +118,10 @@ class Manifest:
     completed_batch_count: int = 0
     total_passed: int = 0
     total_rejected: int = 0
-    requeue_round: int = 0
+    iteration_count: int = 0
+    accepted_by_type: dict[str, int] = field(default_factory=dict)
+    accepted_by_reasoning_mode: dict[str, int] = field(default_factory=dict)
+    accepted_by_hop_count: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -119,7 +129,10 @@ class Manifest:
             "completed_batch_count": self.completed_batch_count,
             "total_passed": self.total_passed,
             "total_rejected": self.total_rejected,
-            "requeue_round": self.requeue_round,
+            "iteration_count": self.iteration_count,
+            "accepted_by_type": dict(self.accepted_by_type),
+            "accepted_by_reasoning_mode": dict(self.accepted_by_reasoning_mode),
+            "accepted_by_hop_count": dict(self.accepted_by_hop_count),
         }
 
     @classmethod
@@ -129,7 +142,14 @@ class Manifest:
             completed_batch_count=int(d.get("completed_batch_count", 0)),
             total_passed=int(d.get("total_passed", 0)),
             total_rejected=int(d.get("total_rejected", 0)),
-            requeue_round=int(d.get("requeue_round", 0)),
+            iteration_count=int(d.get("iteration_count", 0)),
+            accepted_by_type={str(k): int(v) for k, v in (d.get("accepted_by_type") or {}).items()},
+            accepted_by_reasoning_mode={
+                str(k): int(v) for k, v in (d.get("accepted_by_reasoning_mode") or {}).items()
+            },
+            accepted_by_hop_count={
+                str(k): int(v) for k, v in (d.get("accepted_by_hop_count") or {}).items()
+            },
         )
 
 
@@ -139,7 +159,11 @@ class ResumeState:
 
     passed_items: list[GeneratedQA] = field(default_factory=list)
     completed_batch_count: int = 0
-    requeue_round: int = 0
+    iteration_count: int = 0
+    accepted_by_type: dict[str, int] = field(default_factory=dict)
+    accepted_by_reasoning_mode: dict[str, int] = field(default_factory=dict)
+    accepted_by_hop_count: dict[str, int] = field(default_factory=dict)
+
 
 
 class CheckpointManager:
@@ -169,8 +193,10 @@ class CheckpointManager:
 
     def save_manifest(self, manifest: Manifest) -> None:
         self._ensure_dir()
-        with self.manifest_path.open("w", encoding="utf-8") as fh:
+        tmp = self.manifest_path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
             json.dump(manifest.to_dict(), fh, ensure_ascii=False)
+        os.replace(tmp, self.manifest_path)
         self._manifest = manifest
 
     def resume_state(self) -> ResumeState:
@@ -197,10 +223,57 @@ class CheckpointManager:
                     if line:
                         passed_items.append(deserialize_generated_qa(json.loads(line)))
 
+        # Re-derive distribution counts from JSONL as source of truth.
+        by_type: dict[str, int] = {}
+        by_mode: dict[str, int] = {}
+        by_hop: dict[str, int] = {}
+        for item in passed_items:
+            effective_type = item.resolve_effective_qa_type()
+            by_type[effective_type] = by_type.get(effective_type, 0) + 1
+            if effective_type == "multi_hop":
+                mode = (
+                    str(item.generation_metadata.get("reasoning_mode", "")).strip()
+                    or str(item.qa.get("reasoning_mode", "")).strip()
+                )
+                if mode:
+                    by_mode[mode] = by_mode.get(mode, 0) + 1
+                ref_chunks = list(
+                    item.qa.get("verified_reference_chunks")
+                    or item.qa.get("reference_chunks", [])
+                    or []
+                )
+                hop_key = str(len(ref_chunks))
+                by_hop[hop_key] = by_hop.get(hop_key, 0) + 1
+
+        # Warn if manifest counts disagree with JSONL-derived counts.
+        if manifest.accepted_by_type and manifest.accepted_by_type != by_type:
+            logger.warning(
+                "Manifest accepted_by_type %s disagrees with JSONL-derived %s — using JSONL counts",
+                manifest.accepted_by_type,
+                by_type,
+            )
+        if manifest.accepted_by_reasoning_mode and manifest.accepted_by_reasoning_mode != by_mode:
+            logger.warning(
+                "Manifest accepted_by_reasoning_mode %s disagrees with "
+                "JSONL-derived %s — using JSONL counts",
+                manifest.accepted_by_reasoning_mode,
+                by_mode,
+            )
+        if manifest.accepted_by_hop_count and manifest.accepted_by_hop_count != by_hop:
+            logger.warning(
+                "Manifest accepted_by_hop_count %s disagrees with "
+                "JSONL-derived %s — using JSONL counts",
+                manifest.accepted_by_hop_count,
+                by_hop,
+            )
+
         return ResumeState(
             passed_items=passed_items,
             completed_batch_count=manifest.completed_batch_count,
-            requeue_round=manifest.requeue_round,
+            iteration_count=manifest.iteration_count,
+            accepted_by_type=by_type,
+            accepted_by_reasoning_mode=by_mode,
+            accepted_by_hop_count=by_hop,
         )
 
     def save_batch(
@@ -209,6 +282,10 @@ class CheckpointManager:
         passed: list[GeneratedQA],
         rejected: list[GeneratedQA],
         regens_count: int = 0,
+        accepted_by_type: dict[str, int] | None = None,
+        accepted_by_reasoning_mode: dict[str, int] | None = None,
+        accepted_by_hop_count: dict[str, int] | None = None,
+        iteration_count: int = 0,
     ) -> None:
         """Checkpoint a completed batch. Appends passed to cumulative JSONL."""
         self._ensure_dir()
@@ -226,9 +303,16 @@ class CheckpointManager:
 
         # Update manifest.
         manifest = self.load_manifest() or Manifest(config_hash=self.config_hash)
-        manifest.completed_batch_count = batch_idx + 1
+        manifest.completed_batch_count = max(manifest.completed_batch_count, batch_idx + 1)
         manifest.total_passed += len(passed)
         manifest.total_rejected += len(rejected)
+        manifest.iteration_count = iteration_count
+        if accepted_by_type is not None:
+            manifest.accepted_by_type = dict(accepted_by_type)
+        if accepted_by_reasoning_mode is not None:
+            manifest.accepted_by_reasoning_mode = dict(accepted_by_reasoning_mode)
+        if accepted_by_hop_count is not None:
+            manifest.accepted_by_hop_count = dict(accepted_by_hop_count)
         self.save_manifest(manifest)
 
     def cleanup(self) -> None:

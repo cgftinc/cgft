@@ -69,6 +69,29 @@ class GeneratedQA:
         """Return the underlying QADataPoint."""
         return self.qa
 
+    def resolve_effective_qa_type(self) -> str:
+        """Return the effective QA type implied by the item's reference structure.
+
+        Lookup items with ≥2 reference chunks are treated as multi_hop;
+        multi_hop items with ≤1 reference chunk are treated as lookup.
+        """
+        qa_type = str(self.qa.get("qa_type", "")).strip().lower()
+        if not qa_type:
+            qa_type = (
+                str(self.generation_metadata.get("qa_type_target", "")).strip().lower()
+                or "lookup"
+            )
+        ref_chunks = list(
+            self.qa.get("verified_reference_chunks")
+            or self.qa.get("reference_chunks", [])
+            or []
+        )
+        if qa_type == "lookup" and len(ref_chunks) >= 2:
+            return "multi_hop"
+        if qa_type == "multi_hop" and len(ref_chunks) <= 1:
+            return "lookup"
+        return qa_type or "lookup"
+
     def append_journey_event(
         self,
         *,
