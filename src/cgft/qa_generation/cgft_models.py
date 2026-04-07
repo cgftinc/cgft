@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from cgft.qa_generation.retrieval_query import QueryRewriteConfig
+from cgft.qa_generation.scoring import ScoringConfig
 from cgft.qa_generation.style_controls import (
     QUERY_STYLE_EXPERT,
     QUERY_STYLE_KEYWORD,
@@ -328,30 +329,11 @@ class LLMDirectGenerationConfig:
 
 
 @dataclass
-class LLMEnvGenerationConfig:
-    """Rollout-backed generation controls."""
-
-    model: str = "gpt-5.4"
-    api_key: str = ""
-    base_url: str = ""
-    env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
-    rollout_limits: RolloutLimits = field(default_factory=RolloutLimits)
-    prompt_template: str = (
-        "Generate one QA pair as JSON with keys question and answer. "
-        "qa_type={qa_type}; target_hop_count={target_hop_count}.\n\n"
-        "Corpus summary:\n{corpus_summary}\n\n"
-        "Example queries:\n{corpus_queries}\n\n"
-        "Primary:\n{primary_chunk}\n\nSecondary:\n{secondary_chunks}\n"
-    )
-
-
-@dataclass
 class GenerationConfig:
     """Generator mode selection."""
 
     mode: str = "llm_direct"
     llm_direct: LLMDirectGenerationConfig = field(default_factory=LLMDirectGenerationConfig)
-    llm_env: LLMEnvGenerationConfig = field(default_factory=LLMEnvGenerationConfig)
 
 
 @dataclass
@@ -477,8 +459,8 @@ class FilteringConfig:
     )
     filters: list[str] = field(
         default_factory=lambda: [
-            "grounding_llm",
             "retrieval_too_easy_llm",
+            "grounding_llm",
             "hop_count_validity",
         ]
     )
@@ -486,6 +468,7 @@ class FilteringConfig:
     retrieval_llm: RetrievalLLMFilterConfig = field(default_factory=RetrievalLLMFilterConfig)
     grounding_llm: GroundingLLMFilterConfig = field(default_factory=GroundingLLMFilterConfig)
     hop_count_validity: HopCountValidityCfg = field(default_factory=HopCountValidityCfg)
+    env_rollout: LLMEnvFilterConfig = field(default_factory=LLMEnvFilterConfig)
 
 
 @dataclass
@@ -521,11 +504,11 @@ class DedupConfig:
 class MicroBatchConfig:
     """Micro-batch processing and checkpointing controls."""
 
-    batch_size: int = 100
+    batch_size: int = 0  # 0 = auto-computed from total_samples
     checkpoint_dir: str = ""  # "" = auto: {output.dir}/.checkpoints/
     resume: bool = True
     max_iterations: int = 50
-    max_parallel_batches: int = 1
+    max_parallel_batches: int = 0  # 0 = auto-computed from total_samples
     keep_checkpoints: bool = False
 
 
@@ -563,6 +546,7 @@ class CgftPipelineConfig:
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    scoring: ScoringConfig = field(default_factory=ScoringConfig)
     micro_batch: MicroBatchConfig = field(default_factory=MicroBatchConfig)
     random_seed: int = 42
     verbose: bool = True
@@ -576,10 +560,6 @@ class CgftPipelineConfig:
             self.generation.llm_direct.api_key = shared_llm_key
         if not self.generation.llm_direct.base_url:
             self.generation.llm_direct.base_url = shared_llm_base_url
-        if not self.generation.llm_env.api_key:
-            self.generation.llm_env.api_key = shared_llm_key
-        if not self.generation.llm_env.base_url:
-            self.generation.llm_env.base_url = shared_llm_base_url
 
         if not self.transformation.api_key:
             self.transformation.api_key = shared_llm_key
@@ -619,6 +599,15 @@ class CgftPipelineConfig:
             self.filtering.hop_count_validity.judge_api_key = shared_llm_key
         if not self.filtering.hop_count_validity.judge_base_url:
             self.filtering.hop_count_validity.judge_base_url = shared_llm_base_url
+
+        if not self.filtering.env_rollout.api_key:
+            self.filtering.env_rollout.api_key = shared_llm_key
+        if not self.filtering.env_rollout.base_url:
+            self.filtering.env_rollout.base_url = shared_llm_base_url
+        if not self.filtering.env_rollout.judge_api_key:
+            self.filtering.env_rollout.judge_api_key = shared_llm_key
+        if not self.filtering.env_rollout.judge_base_url:
+            self.filtering.env_rollout.judge_base_url = shared_llm_base_url
 
         if not self.refinement.api_key:
             self.refinement.api_key = shared_llm_key
@@ -668,6 +657,7 @@ class CgftContext:
     rng: random.Random = field(default_factory=random.Random)
     state: dict[str, Any] = field(default_factory=dict)
     profile: Any = None  # CorpusProfile | None (Any to avoid circular import)
+    metrics: Any = None  # PipelineMetrics | None (Any to avoid circular import)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.state.get(key, default)
@@ -779,6 +769,7 @@ def _collect_removed_config_keys(raw: dict[str, Any]) -> list[str]:
     removed_keys: list[str] = []
 
     targets_raw = raw.get("targets", {}) or {}
+    generation_raw = raw.get("generation", {}) or {}
     filtering_raw = raw.get("filtering", {}) or {}
     guards_raw = filtering_raw.get("deterministic_guards", {}) or {}
     retrieval_raw = filtering_raw.get("retrieval_llm", {}) or {}
@@ -789,6 +780,8 @@ def _collect_removed_config_keys(raw: dict[str, Any]) -> list[str]:
     if "enforce_style_mismatch_guard" in guards_raw:
         removed_keys.append("filtering.deterministic_guards.enforce_style_mismatch_guard")
 
+    if "llm_env" in generation_raw:
+        removed_keys.append("generation.llm_env")
     if "mode" in filtering_raw:
         removed_keys.append("filtering.mode")
     if "llm_env" in filtering_raw:
@@ -898,9 +891,6 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
 
     generation_raw = raw.get("generation", {}) or {}
     direct_raw = generation_raw.get("llm_direct", {}) or {}
-    env_gen_raw = generation_raw.get("llm_env", {}) or {}
-    env_gen_bundle_raw = env_gen_raw.get("env_bundle", {}) or {}
-    env_gen_limits_raw = env_gen_raw.get("rollout_limits", {}) or {}
     generation = GenerationConfig(
         mode=str(generation_raw.get("mode", "llm_direct")).strip().lower() or "llm_direct",
         llm_direct=LLMDirectGenerationConfig(
@@ -926,28 +916,6 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
             max_concurrent=max(1, int(direct_raw.get("max_concurrent", 8))),
             batch_enabled=bool(direct_raw.get("batch_enabled", True)),
             show_batch_progress=bool(direct_raw.get("show_batch_progress", True)),
-        ),
-        llm_env=LLMEnvGenerationConfig(
-            model=str(env_gen_raw.get("model", "gpt-5.4")),
-            api_key=str(env_gen_raw.get("api_key", "")),
-            base_url=str(env_gen_raw.get("base_url", "")).strip(),
-            env_bundle=EnvBundleConfig(
-                env_cls_path=str(env_gen_bundle_raw.get("env_cls_path", "")),
-                env_metadata_path=str(env_gen_bundle_raw.get("env_metadata_path", "")),
-                env_cls_file=str(env_gen_bundle_raw.get("env_cls_file", "")),
-                env_metadata_file=str(env_gen_bundle_raw.get("env_metadata_file", "")),
-            ),
-            rollout_limits=RolloutLimits(
-                max_turns=max(1, int(env_gen_limits_raw.get("max_turns", 16))),
-                max_tool_calls=max(1, int(env_gen_limits_raw.get("max_tool_calls", 24))),
-                max_completion_tokens=max(
-                    100, int(env_gen_limits_raw.get("max_completion_tokens", 2048))
-                ),
-                timeout=max(10.0, float(env_gen_limits_raw.get("timeout", 120.0))),
-            ),
-            prompt_template=str(
-                env_gen_raw.get("prompt_template", LLMEnvGenerationConfig().prompt_template)
-            ),
         ),
     )
 
@@ -1130,6 +1098,16 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         max_parallel_batches=max(1, int(micro_batch_raw.get("max_parallel_batches", 1))),
     )
 
+    scoring_raw = raw.get("scoring", {}) or {}
+    scoring = ScoringConfig(
+        min_quality_score=max(0.0, float(scoring_raw.get("min_quality_score", 0.0))),
+        grounding_weight=max(0.0, float(scoring_raw.get("grounding_weight", 0.4))),
+        retrieval_difficulty_weight=max(
+            0.0, float(scoring_raw.get("retrieval_difficulty_weight", 0.3))
+        ),
+        hop_validity_weight=max(0.0, float(scoring_raw.get("hop_validity_weight", 0.3))),
+    )
+
     cfg = CgftPipelineConfig(
         platform=platform,
         corpus=corpus,
@@ -1142,6 +1120,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         refinement=refinement,
         split=split,
         output=output,
+        scoring=scoring,
         micro_batch=micro_batch,
         random_seed=int(raw.get("random_seed", 42)),
     )

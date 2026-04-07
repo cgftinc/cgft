@@ -561,6 +561,7 @@ class DirectLLMGenerator:
                 "target_hop_count_requested": pt.requested_hop_count,
                 "reasoning_mode": pt.task.reasoning_mode,
                 "anchor_bundle": anchor,
+                "linking_hints": dict(anchor.structural_hints) if anchor.structural_hints else {},
                 "generation_mode": "llm_direct",
                 "refinement_count": 0,
                 "same_seed_refinement_count": 0,

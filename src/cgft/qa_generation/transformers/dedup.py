@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 
 from cgft.qa_generation.cgft_models import CgftContext
@@ -122,3 +123,73 @@ def _jaccard(a: set, b: set) -> float:
     if not union:
         return 0.0
     return len(a & b) / len(union)
+
+
+class IncrementalDeduplicator:
+    """Maintains a growing set of accepted question n-grams for per-batch dedup.
+
+    Used inside the work queue to catch duplicates before they enter
+    the expensive filter chain.  Thread-safe for parallel batch mode.
+    """
+
+    def __init__(
+        self,
+        similarity_threshold: float = 0.70,
+        ngram_size: int = 2,
+    ) -> None:
+        self.similarity_threshold = similarity_threshold
+        self.ngram_size = ngram_size
+        self._accepted_ngrams: list[set[tuple[str, ...]]] = []
+        self._lock = threading.Lock()
+
+    def check_batch(
+        self,
+        items: list[GeneratedQA],
+    ) -> tuple[list[GeneratedQA], list[GeneratedQA]]:
+        """Check a batch against accepted set.
+
+        Returns:
+            (unique, duplicates) — duplicates have filter_verdict set.
+        """
+        with self._lock:
+            unique: list[GeneratedQA] = []
+            duplicates: list[GeneratedQA] = []
+            for item in items:
+                question = str(item.qa.get("question", ""))
+                ngrams = self._compute_ngrams(question)
+                if self._is_duplicate(ngrams):
+                    item.filter_verdict = FilterVerdict(
+                        status="rejected",
+                        reason="early_near_duplicate",
+                        reasoning=("Near-duplicate of already-accepted question."),
+                        metadata={
+                            "reason_code": "early_near_duplicate",
+                        },
+                    )
+                    duplicates.append(item)
+                else:
+                    unique.append(item)
+            return unique, duplicates
+
+    def register_accepted(self, items: list[GeneratedQA]) -> None:
+        """Add newly accepted items to the dedup index."""
+        with self._lock:
+            for item in items:
+                question = str(item.qa.get("question", ""))
+                ngrams = self._compute_ngrams(question)
+                self._accepted_ngrams.append(ngrams)
+
+    def _is_duplicate(self, ngrams: set[tuple[str, ...]]) -> bool:
+        if not ngrams:
+            return False
+        for accepted in self._accepted_ngrams:
+            if not accepted:
+                continue
+            if _jaccard(ngrams, accepted) >= self.similarity_threshold:
+                return True
+        return False
+
+    def _compute_ngrams(self, text: str) -> set[tuple[str, ...]]:
+        tokens = _WORD_RE.findall(text.lower())
+        n = self.ngram_size
+        return {tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)}

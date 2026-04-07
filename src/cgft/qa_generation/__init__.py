@@ -20,7 +20,7 @@ from .filters import (
 )
 from .formatters import TrainEvalFormatter
 from .generated_qa import FilterVerdict, GeneratedQA
-from .generators import DirectLLMGenerator, EnvRolloutGenerator
+from .generators import DirectLLMGenerator
 from .protocols import (
     ChunkLinker,
     EvaluatorFilter,
@@ -29,6 +29,7 @@ from .protocols import (
     LLMSupportedGenerator,
     QuestionGenerator,
 )
+from .search_agent_linker import SearchAgentLinker
 
 __all__ = [
     "BatchResponse",
@@ -51,7 +52,7 @@ __all__ = [
     "LLMBasedFilter",
     "Formatter",
     "DirectLLMGenerator",
-    "EnvRolloutGenerator",
+    "SearchAgentLinker",
     "DeterministicGuardsFilter",
     "RetrievalLLMFilter",
     "GroundingLLMFilter",

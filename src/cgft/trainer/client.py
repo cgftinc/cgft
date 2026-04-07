@@ -6,9 +6,10 @@ import base64
 import hashlib
 import json
 import textwrap
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -394,9 +395,7 @@ def _debug_event_fields(
             child_path = f"{path}.{key}" if path else key
             key_l = key.lower()
             path_l = child_path.lower()
-            is_tracked = any(
-                k in key_l or k in path_l for k in _DEBUG_KEY_SUBSTRINGS
-            )
+            is_tracked = any(k in key_l or k in path_l for k in _DEBUG_KEY_SUBSTRINGS)
 
             if isinstance(child, (dict, list)):
                 _debug_event_fields(
@@ -470,12 +469,9 @@ def _print_event(
                                 text,
                             )
                         else:
-                            preview = textwrap.shorten(
-                                text, width=120, placeholder="…"
-                            )
+                            preview = textwrap.shorten(text, width=120, placeholder="…")
                             print(
-                                f"{prefix} → message [{role}/text] "
-                                f"(chars={len(text)}): {preview}"
+                                f"{prefix} → message [{role}/text] (chars={len(text)}): {preview}"
                             )
                     elif btype == "tool_use":
                         call_text = (
@@ -485,8 +481,7 @@ def _print_event(
                         )
                         if full_messages:
                             _print_multiline(
-                                f"{prefix} → message [{role}/tool_use] "
-                                f"(chars={len(call_text)}):",
+                                f"{prefix} → message [{role}/tool_use] (chars={len(call_text)}):",
                                 call_text,
                             )
                         else:
@@ -504,9 +499,7 @@ def _print_event(
                                 tool_text,
                             )
                         else:
-                            preview = textwrap.shorten(
-                                tool_text, width=120, placeholder="…"
-                            )
+                            preview = textwrap.shorten(tool_text, width=120, placeholder="…")
                             print(
                                 f"{prefix} → message [{role}/tool_result] "
                                 f"(chars={len(tool_text)}): {preview}"
@@ -577,6 +570,7 @@ class RolloutClient:
         env_metadata_path: str | None,
         env_cls_bytes: bytes | None,
         env_metadata_bytes: bytes | None,
+        env_args_bytes: bytes | None = None,
     ) -> dict[str, str]:
         """Build the ``env`` dict for the request payload.
 
@@ -599,10 +593,13 @@ class RolloutClient:
                 "env_metadata_path": env_metadata_path,  # type: ignore[dict-item]
             }
 
-        return {
+        result: dict[str, str] = {
             "env_cls_bytes": base64.b64encode(env_cls_bytes).decode(),  # type: ignore[arg-type]
             "env_metadata_bytes": base64.b64encode(env_metadata_bytes).decode(),  # type: ignore[arg-type]
         }
+        if env_args_bytes is not None:
+            result["env_args_bytes"] = base64.b64encode(env_args_bytes).decode()
+        return result
 
     def stream_rollout(
         self,
@@ -612,6 +609,7 @@ class RolloutClient:
         *,
         env_cls_bytes: bytes | None = None,
         env_metadata_bytes: bytes | None = None,
+        env_args_bytes: bytes | None = None,
         example_index: int = 0,
         llm_base_url: str = _VALIDATION_LLM_BASE_URL,
         llm_model: str = _VALIDATION_MODEL,
@@ -657,7 +655,11 @@ class RolloutClient:
             RuntimeError: If the HTTP request itself fails or returns non-200.
         """
         env = self._build_env(
-            env_cls_path, env_metadata_path, env_cls_bytes, env_metadata_bytes
+            env_cls_path,
+            env_metadata_path,
+            env_cls_bytes,
+            env_metadata_bytes,
+            env_args_bytes=env_args_bytes,
         )
 
         payload = {
@@ -668,7 +670,7 @@ class RolloutClient:
                 "base_url": llm_base_url,
                 "api_key": llm_api_key or self._api_key,
                 "model": llm_model,
-                "api-version": llm_api_version
+                "api-version": llm_api_version,
             },
             "options": {
                 "max_turns": max_turns,
@@ -769,7 +771,7 @@ class RolloutClient:
                     env_cls_bytes=env_cls_bytes,
                     env_metadata_bytes=env_metadata_bytes,
                     example_index=i,
-                    llm_model="gpt-5.4-nano"
+                    llm_model="gpt-5.4-nano",
                 )
                 if not final.get("success"):
                     all_ok = False

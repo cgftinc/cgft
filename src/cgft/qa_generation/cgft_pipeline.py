@@ -24,6 +24,13 @@ from openai import (
 from tqdm.auto import tqdm as _tqdm
 
 from cgft.corpus.corpora.source import CorporaChunkSource
+from cgft.qa_generation.auto_tune import (
+    CorpusStats,
+    auto_tune,
+    compute_batch_heuristics,
+    emit_corpus_warnings,
+    should_early_stop,
+)
 from cgft.qa_generation.cgft_models import (
     CgftContext,
     CgftPipelineConfig,
@@ -47,8 +54,10 @@ from cgft.qa_generation.filters import (
 )
 from cgft.qa_generation.formatters import TrainEvalFormatter
 from cgft.qa_generation.generated_qa import FilterVerdict, GeneratedQA
-from cgft.qa_generation.generators import DirectLLMGenerator, EnvRolloutGenerator
+from cgft.qa_generation.generators import DirectLLMGenerator
 from cgft.qa_generation.helpers import render_template
+from cgft.qa_generation.metadata_linker import MetadataChunkLinker
+from cgft.qa_generation.metrics import BatchMetrics, PipelineMetrics, stage_timer
 from cgft.qa_generation.protocols import (
     ChunkLinker,
     EvaluatorFilter,
@@ -56,7 +65,9 @@ from cgft.qa_generation.protocols import (
     QuestionTransformer,
 )
 from cgft.qa_generation.response_parsers import parse_corpus_summary_response
+from cgft.qa_generation.scoring import compute_eval_scores, extract_filter_scores
 from cgft.qa_generation.transformers import LLMStyleTransformer
+from cgft.qa_generation.transformers.dedup import IncrementalDeduplicator
 from cgft.trainer.client import RolloutClient
 
 logger = logging.getLogger(__name__)
@@ -94,10 +105,12 @@ Return JSON only:
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
 _GROUNDING_FILTER_STAGE = "grounding_llm"
 _HOP_COUNT_VALIDITY_FILTER_STAGE = "hop_count_validity"
+_ENV_ROLLOUT_FILTER_STAGE = "env_rollout"
 _SUPPORTED_FILTER_STAGES = (
     _GROUNDING_FILTER_STAGE,
     _RETRIEVAL_TOO_EASY_FILTER_STAGE,
     _HOP_COUNT_VALIDITY_FILTER_STAGE,
+    _ENV_ROLLOUT_FILTER_STAGE,
 )
 
 
@@ -183,33 +196,12 @@ def _build_rollout_client(cfg: CgftPipelineConfig) -> RolloutClient:
     return RolloutClient(api_key=cfg.platform.api_key)
 
 
-def _build_linker(
+def _build_metadata_linker(
     cfg: CgftPipelineConfig,
     source: Any,
-    profile: CorpusProfile | None = None,
-) -> ChunkLinker:
-    if cfg.linker.type == "search_agent":
-        raise NotImplementedError(
-            "Linker type 'search_agent' is defined in config but not yet implemented. "
-            "Use 'metadata' instead."
-        )
-
-    # Default: metadata linker (zero LLM calls during linking).
-    if cfg.linker.type not in ("metadata",):
-        logger.warning(
-            "Unknown linker type '%s'; falling back to 'metadata'.",
-            cfg.linker.type,
-        )
-    if profile is None:
-        raise ValueError(
-            "Linker type 'metadata' requires a CorpusProfile but none is available "
-            "(corpus_context must be enabled in stages 2/3)."
-        )
-
-    from cgft.qa_generation.metadata_linker import (
-        MetadataChunkLinker,
-        MetadataLinkerConfig,
-    )
+    profile: CorpusProfile,
+) -> MetadataChunkLinker:
+    from cgft.qa_generation.metadata_linker import MetadataLinkerConfig
 
     mcfg = cfg.linker.metadata
     return MetadataChunkLinker(
@@ -228,22 +220,54 @@ def _build_linker(
     )
 
 
+def _build_linker(
+    cfg: CgftPipelineConfig,
+    source: Any,
+    profile: CorpusProfile | None = None,
+) -> ChunkLinker:
+    if cfg.linker.type not in ("metadata", "search_agent"):
+        logger.warning(
+            "Unknown linker type '%s'; falling back to 'metadata'.",
+            cfg.linker.type,
+        )
+    if profile is None:
+        raise ValueError(
+            "Linker requires a CorpusProfile but none is available "
+            "(corpus_context must be enabled in stages 2/3)."
+        )
+
+    if cfg.linker.type == "search_agent":
+        from cgft.corpus.corpora.search import CorporaSearch
+        from cgft.qa_generation.search_agent_linker import SearchAgentLinker
+
+        metadata_linker = _build_metadata_linker(cfg, source, profile)
+        search_client = CorporaSearch(
+            api_key=cfg.platform.api_key,
+            corpus_name=cfg.corpus.corpus_name,
+            base_url=cfg.platform.base_url,
+            corpus_id=cfg.corpus.corpus_id or None,
+        )
+        llm_cfg = cfg.generation.llm_direct
+        return SearchAgentLinker(
+            metadata_linker=metadata_linker,
+            source=source,
+            cfg=cfg.linker.search_agent,
+            search_agent_pct=cfg.linker.search_agent_pct,
+            rollout_client=_build_rollout_client(cfg),
+            search_client=search_client,
+            llm_model=llm_cfg.model,
+            llm_base_url=llm_cfg.base_url,
+            llm_api_key=llm_cfg.api_key,
+        )
+
+    return _build_metadata_linker(cfg, source, profile)
+
+
 def _build_generator(
     cfg: CgftPipelineConfig,
     *,
     linker: ChunkLinker,
-    rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> QuestionGenerator:
-    if cfg.generation.mode == "llm_env":
-        rollout_client = (
-            rollout_client_factory(cfg) if rollout_client_factory else _build_rollout_client(cfg)
-        )
-        return EnvRolloutGenerator(
-            rollout_client=rollout_client,
-            linker=linker,
-            cfg=cfg.generation.llm_env,
-        )
-
     generation_cfg = cfg.generation.llm_direct
     generation_client = _build_openai_client(
         api_key=generation_cfg.api_key,
@@ -265,6 +289,7 @@ def _build_filter_from_stage_name(
     cfg: CgftPipelineConfig,
     *,
     source: Any,
+    rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> EvaluatorFilter:
     stage = str(stage_name or "").strip().lower()
     if stage == _GROUNDING_FILTER_STAGE:
@@ -300,6 +325,18 @@ def _build_filter_from_stage_name(
                 lopsided_low_threshold=hcfg.lopsided_low_threshold,
             ),
         )
+    if stage == _ENV_ROLLOUT_FILTER_STAGE:
+        from cgft.qa_generation.filters.env_rollout import EnvRolloutFilter
+
+        if rollout_client_factory is None:
+            raise ValueError(
+                "env_rollout filter requires a rollout_client_factory. "
+                "Pass one when constructing CgftPipeline."
+            )
+        return EnvRolloutFilter(
+            rollout_client=rollout_client_factory(cfg),
+            cfg=cfg.filtering.env_rollout,
+        )
     raise ValueError(
         f"Unknown filter stage '{stage_name}'. "
         f"Supported filter stage names: {', '.join(_SUPPORTED_FILTER_STAGES)}."
@@ -310,6 +347,7 @@ def _build_filter_chain(
     cfg: CgftPipelineConfig,
     *,
     source: Any,
+    rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> tuple[list[str], list[EvaluatorFilter]]:
     chain_names = [
         str(name).strip().lower() for name in (cfg.filtering.filters or []) if str(name).strip()
@@ -319,6 +357,7 @@ def _build_filter_chain(
             stage_name,
             cfg,
             source=source,
+            rollout_client_factory=rollout_client_factory,
         )
         for stage_name in chain_names
     ]
@@ -508,6 +547,13 @@ def _accept_items_under_type_quota(
 ) -> tuple[list[GeneratedQA], list[GeneratedQA]]:
     accepted: list[GeneratedQA] = []
     rejected: list[GeneratedQA] = []
+
+    # Sort by composite score descending so higher-quality items fill quota first.
+    items = sorted(
+        items,
+        key=lambda i: i.qa.get("eval_scores", {}).get("composite", 0),
+        reverse=True,
+    )
 
     for item in items:
         original_type = str(item.qa.get("qa_type", "")).strip() or (
@@ -1239,7 +1285,9 @@ class CgftPipeline:
         return Path(ckpt_dir_str)
 
     def run(self) -> dict[str, Any]:
+        t_prep = time.monotonic()
         context = self._prepare_context()
+        context["prepare_context_seconds"] = time.monotonic() - t_prep
         return self._run_from_context(context)
 
     def _prepare_context(self) -> CgftContext:
@@ -1348,6 +1396,39 @@ class CgftPipeline:
             token_df_sample_size=token_df_n,
         )
         context.profile = profile
+
+        # --- Corpus-aware auto-tuning and warnings ---
+        corpus_stats = CorpusStats.from_source(source)
+        context["corpus_stats"] = corpus_stats
+
+        warnings = emit_corpus_warnings(corpus_stats, cfg)
+        for w in warnings:
+            logger.warning(w)
+
+        tuned = auto_tune(corpus_stats, cfg)
+        if tuned:
+            if "total_samples" in tuned:
+                original = cfg.targets.total_samples
+                cfg.targets.total_samples = tuned["total_samples"]
+                logger.info(
+                    "Auto-tune: total_samples %d -> %d (corpus has %d chunks)",
+                    original,
+                    tuned["total_samples"],
+                    corpus_stats.chunk_count,
+                )
+            if "primary_type_distribution" in tuned:
+                cfg.targets.primary_type_distribution = tuned["primary_type_distribution"]
+                logger.info(
+                    "Auto-tune: primary_type_distribution -> %s",
+                    tuned["primary_type_distribution"],
+                )
+            if "hop_distribution" in tuned:
+                cfg.targets.hop_distribution = tuned["hop_distribution"]
+                logger.info(
+                    "Auto-tune: hop_distribution -> %s",
+                    tuned["hop_distribution"],
+                )
+
         return context
 
     def _run_from_context(self, context: CgftContext) -> dict[str, Any]:
@@ -1361,26 +1442,30 @@ class CgftPipeline:
         source = context.source
         profile = context.profile
 
+        pipeline_metrics = PipelineMetrics(
+            target_samples=cfg.targets.total_samples,
+        )
+        context.metrics = pipeline_metrics
+        t0 = time.monotonic()
+
         _print_progress("[4/6] Preparing generation...", verbose=cfg.verbose)
 
         linker = _build_linker(cfg, source, profile=profile)
-        generator = _build_generator(
-            cfg,
-            linker=linker,
-            rollout_client_factory=self.rollout_client_factory,
-        )
+        generator = _build_generator(cfg, linker=linker)
         guard_filter = DeterministicGuardsFilter(cfg.filtering.deterministic_guards)
         filter_stage_names, filter_chain = _build_filter_chain(
             cfg,
             source=source,
+            rollout_client_factory=self.rollout_client_factory,
         )
         context["filter_chain"] = list(filter_stage_names)
         transformer = _build_transformer(cfg)
         formatter = TrainEvalFormatter(output_cfg=cfg.output, split_cfg=cfg.split)
 
         # --- Micro-batch work queue (generate → filter → transform) ---
+        _batch_size_display = cfg.micro_batch.batch_size or "auto"
         _print_progress(
-            f"[5/6] Starting work queue (batch_size={cfg.micro_batch.batch_size})...",
+            f"[5/6] Starting work queue (batch_size={_batch_size_display})...",
             verbose=cfg.verbose,
         )
         all_passed, all_rejected, total_regens, raw_items = self._run_work_queue(
@@ -1497,6 +1582,24 @@ class CgftPipeline:
         if journey_stats:
             context["journey_stats"] = journey_stats
             result["stats"]["journey"] = journey_stats
+
+        pipeline_metrics.wall_time_seconds = time.monotonic() - t0
+        pipeline_metrics.total_generated = len(raw_items)
+        pipeline_metrics.total_accepted = len(all_passed)
+        pipeline_metrics.total_rejected = len(all_rejected)
+        pipeline_metrics.total_regenerations = total_regens
+        if pipeline_metrics.total_generated > 0:
+            pipeline_metrics.overall_acceptance_rate = (
+                pipeline_metrics.total_accepted / pipeline_metrics.total_generated
+            )
+        if pipeline_metrics.target_samples > 0:
+            pipeline_metrics.fill_rate = (
+                pipeline_metrics.total_accepted / pipeline_metrics.target_samples
+            )
+        result["stats"]["pipeline_metrics"] = pipeline_metrics.to_dict()
+        result["stats"]["prepare_context_seconds"] = context.get(
+            "prepare_context_seconds", 0.0,
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -1513,6 +1616,7 @@ class CgftPipeline:
         filter_chain: list[EvaluatorFilter],
         transformer: QuestionTransformer,
         context: CgftContext,
+        incremental_dedup: IncrementalDeduplicator | None = None,
     ) -> tuple[list[GeneratedQA], list[GeneratedQA], list[GeneratedQA], int]:
         """Run stages 5-7 on a single micro-batch.
 
@@ -1520,15 +1624,29 @@ class CgftPipeline:
             (passed, rejected, raw_items, regens_count)
         """
         cfg = self.cfg
+        metrics = context.metrics
 
         # Stage 5: Generate QA candidates.
-        raw_items = generator.generate(tasks, context)
+        if metrics is not None:
+            with stage_timer(metrics, "generation", len(tasks)):
+                raw_items = generator.generate(tasks, context)
+        else:
+            raw_items = generator.generate(tasks, context)
         _annotate_generated_items(raw_items)
 
         # Stage 6: Filter + regeneration loop.
         final_passed: list[GeneratedQA] = []
         final_rejected: list[GeneratedQA] = []
-        active_items = list(raw_items)
+
+        # Early dedup: remove near-duplicates before expensive filtering.
+        if incremental_dedup is not None:
+            active_items, early_dups = incremental_dedup.check_batch(
+                raw_items,
+            )
+            if early_dups:
+                final_rejected.extend(early_dups)
+        else:
+            active_items = list(raw_items)
         total_regens = 0
 
         for round_idx in range(cfg.refinement.max_rounds + 1):
@@ -1537,12 +1655,39 @@ class CgftPipeline:
             for item in active_items:
                 item.filter_verdict = None
 
-            active_items = guard_filter.evaluate(active_items, context)
+            if metrics is not None:
+                with stage_timer(metrics, "deterministic_guards", len(active_items)) as guard_stage:
+                    active_items = guard_filter.evaluate(active_items, context)
+                    guard_stage.items_out_passed += sum(1 for i in active_items if i.is_passed)
+                    guard_stage.items_out_rejected += sum(
+                        1 for i in active_items if i.is_rejected
+                    )
+                    guard_stage.items_out_needs_refinement += sum(
+                        1 for i in active_items if i.needs_refinement
+                    )
+            else:
+                active_items = guard_filter.evaluate(active_items, context)
 
             for _stage_name, stage_filter in zip(filter_stage_names, filter_chain):
-                active_items = stage_filter.evaluate(active_items, context)
+                if metrics is not None:
+                    with stage_timer(metrics, _stage_name, len(active_items)) as sm:
+                        active_items = stage_filter.evaluate(active_items, context)
+                        sm.items_out_passed += sum(
+                            1 for i in active_items if i.is_passed
+                        )
+                        sm.items_out_rejected += sum(
+                            1 for i in active_items if i.is_rejected
+                        )
+                        sm.items_out_needs_refinement += sum(
+                            1 for i in active_items if i.needs_refinement
+                        )
+                else:
+                    active_items = stage_filter.evaluate(active_items, context)
+                extract_filter_scores(active_items, _stage_name)
 
             passed = [item for item in active_items if item.is_passed]
+            for item in passed:
+                item.qa["eval_scores"] = compute_eval_scores(item, cfg.scoring)
             needs_refinement = [item for item in active_items if item.needs_refinement]
             rejected = [item for item in active_items if item.is_rejected]
             _record_filter_events(passed, event_type="filter_passed")
@@ -1566,11 +1711,19 @@ class CgftPipeline:
                 active_items = []
                 break
 
-            refined_items, regen_failures = _regenerate_with_generator(
-                needs_refinement,
-                generator=generator,
-                context=context,
-            )
+            if metrics is not None:
+                with stage_timer(metrics, "regeneration", len(needs_refinement)):
+                    refined_items, regen_failures = _regenerate_with_generator(
+                        needs_refinement,
+                        generator=generator,
+                        context=context,
+                    )
+            else:
+                refined_items, regen_failures = _regenerate_with_generator(
+                    needs_refinement,
+                    generator=generator,
+                    context=context,
+                )
             if regen_failures:
                 final_rejected.extend(
                     _mark_rejected(
@@ -1636,7 +1789,15 @@ class CgftPipeline:
 
         cfg = self.cfg
         target = cfg.targets.total_samples
+
+        # Auto-compute batch_size and max_parallel_batches when set to 0.
         batch_size = cfg.micro_batch.batch_size
+        if batch_size <= 0:
+            batch_size, _ = compute_batch_heuristics(target)
+        max_parallel_cfg = cfg.micro_batch.max_parallel_batches
+        if max_parallel_cfg <= 0:
+            _, max_parallel_cfg = compute_batch_heuristics(target)
+
         max_iterations = cfg.micro_batch.max_iterations
 
         # Compute target counts for type, mode, hop distributions.
@@ -1695,6 +1856,14 @@ class CgftPipeline:
         total_regens = 0
         consecutive_empty = 0
 
+        # Early dedup: catch near-duplicates before the expensive filter chain.
+        incremental_dedup = IncrementalDeduplicator(
+            similarity_threshold=cfg.dedup.similarity_threshold,
+            ngram_size=cfg.dedup.ngram_size,
+        )
+        if all_passed:
+            incremental_dedup.register_accepted(all_passed)
+
         pbar = _tqdm(
             total=target,
             initial=len(all_passed),
@@ -1702,7 +1871,7 @@ class CgftPipeline:
             unit="samples",
         )
 
-        max_parallel = cfg.micro_batch.max_parallel_batches
+        max_parallel = max_parallel_cfg
 
         if max_parallel <= 1:
             # Sequential processing.
@@ -1730,6 +1899,7 @@ class CgftPipeline:
                     filter_chain=filter_chain,
                     transformer=transformer,
                     context=context,
+                    incremental_dedup=incremental_dedup,
                 )
 
                 accepted, quota_rejected = _accept_items_under_type_quota(
@@ -1758,6 +1928,7 @@ class CgftPipeline:
                 )
 
                 all_passed.extend(accepted)
+                incremental_dedup.register_accepted(accepted)
                 all_rejected.extend(batch_rejected)
                 all_raw.extend(raw)
                 total_regens += regens
@@ -1783,6 +1954,28 @@ class CgftPipeline:
                     f" {regens} regenerated",
                     verbose=cfg.verbose,
                 )
+
+                pipeline_metrics = context.metrics
+                if pipeline_metrics is not None:
+                    cum_gen = len(all_raw)
+                    cum_acc = len(all_passed)
+                    batch_m = BatchMetrics(
+                        batch_index=batch_idx - 1,
+                        generated_count=len(raw),
+                        accepted_count=len(accepted),
+                        rejected_count=len(batch_rejected),
+                        regeneration_count=regens,
+                        acceptance_rate=(len(accepted) / len(raw) if raw else 0.0),
+                        cumulative_acceptance_rate=(cum_acc / cum_gen if cum_gen > 0 else 0.0),
+                        cumulative_fill_rate=(cum_acc / target if target > 0 else 0.0),
+                    )
+                    pipeline_metrics.batch_history.append(batch_m)
+
+                    if should_early_stop(pipeline_metrics.batch_history):
+                        logger.warning(
+                            "Acceptance rate below threshold for recent batches, stopping early"
+                        )
+                        break
         else:
             # Parallel processing with ThreadPoolExecutor.
             import copy
@@ -1807,10 +2000,11 @@ class CgftPipeline:
                     filter_chain=filter_chain,
                     transformer=transformer,
                     context=batch_context,
+                    incremental_dedup=incremental_dedup,
                 )
 
             with ThreadPoolExecutor(max_workers=max_parallel) as pool:
-                futures: dict[Any, int] = {}
+                futures: dict[Any, tuple[int, CgftContext]] = {}
 
                 def _submit_next() -> None:
                     nonlocal batch_idx, iteration_count
@@ -1831,8 +2025,10 @@ class CgftPipeline:
                             break
                         batch_context = copy.copy(context)
                         batch_context.state = dict(context.state)
+                        if context.metrics is not None:
+                            batch_context.metrics = PipelineMetrics()
                         fut = pool.submit(_run_one_batch, tasks, batch_context)
-                        futures[fut] = batch_idx
+                        futures[fut] = (batch_idx, batch_context)
                         batch_idx += 1
                         iteration_count += 1
 
@@ -1849,7 +2045,7 @@ class CgftPipeline:
                         )
                         done = list(done_set)
 
-                    def _collect_result(fut: Any, b_idx: int) -> None:
+                    def _collect_result(fut: Any, b_idx: int, batch_ctx: CgftContext) -> None:
                         nonlocal consecutive_empty, total_regens
                         passed, rejected, raw, regens = fut.result()
 
@@ -1876,6 +2072,7 @@ class CgftPipeline:
                             )
 
                             all_passed.extend(accepted)
+                            incremental_dedup.register_accepted(accepted)
                             all_rejected.extend(batch_rejected)
                             all_raw.extend(raw)
                             total_regens += regens
@@ -1891,6 +2088,26 @@ class CgftPipeline:
                                 iteration_count=iteration_count,
                             )
 
+                            p_metrics = context.metrics
+                            batch_metrics_obj = batch_ctx.metrics
+                            if p_metrics is not None and batch_metrics_obj is not None:
+                                p_metrics.merge_stage_metrics(batch_metrics_obj)
+                                c_gen = len(all_raw)
+                                c_acc = len(all_passed)
+                                batch_m = BatchMetrics(
+                                    batch_index=b_idx,
+                                    generated_count=len(raw),
+                                    accepted_count=len(accepted),
+                                    rejected_count=len(batch_rejected),
+                                    regeneration_count=regens,
+                                    acceptance_rate=(len(accepted) / len(raw) if raw else 0.0),
+                                    cumulative_acceptance_rate=(
+                                        c_acc / c_gen if c_gen > 0 else 0.0
+                                    ),
+                                    cumulative_fill_rate=(c_acc / target if target > 0 else 0.0),
+                                )
+                                p_metrics.batch_history.append(batch_m)
+
                         _print_progress(
                             f"  Batch {b_idx + 1}: {len(raw)} generated"
                             f" → {len(accepted)} accepted,"
@@ -1900,19 +2117,28 @@ class CgftPipeline:
                         )
 
                     for fut in done:
-                        b_idx = futures.pop(fut)
-                        _collect_result(fut, b_idx)
+                        b_idx, batch_ctx = futures.pop(fut)
+                        _collect_result(fut, b_idx, batch_ctx)
 
                     with lock:
                         _should_stop = consecutive_empty >= 5
+                        if (
+                            not _should_stop
+                            and context.metrics is not None
+                            and should_early_stop(context.metrics.batch_history)
+                        ):
+                            _should_stop = True
 
                     if _should_stop:
                         # Drain remaining in-flight futures.
-                        for fut, b_idx in list(futures.items()):
+                        for fut, (b_idx, batch_ctx) in list(futures.items()):
                             fut.result()  # wait
-                            _collect_result(fut, b_idx)
+                            _collect_result(fut, b_idx, batch_ctx)
                         futures.clear()
-                        logger.warning("No items accepted in 5 consecutive batches, stopping early")
+                        logger.warning(
+                            "Acceptance rate below threshold or no items "
+                            "accepted in consecutive batches, stopping early"
+                        )
                         break
 
                     with lock:
