@@ -333,10 +333,10 @@ class TestCheckpointManager:
 class TestMicroBatchConfig:
     def test_defaults(self) -> None:
         cfg = MicroBatchConfig()
-        assert cfg.batch_size == 100
+        assert cfg.batch_size == 0  # 0 = auto-computed
         assert cfg.resume is True
         assert cfg.max_iterations == 50
-        assert cfg.max_parallel_batches == 1
+        assert cfg.max_parallel_batches == 0  # 0 = auto-computed
 
     def test_on_pipeline_config(self) -> None:
         cfg = CgftPipelineConfig(

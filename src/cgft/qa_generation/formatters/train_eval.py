@@ -74,6 +74,14 @@ class TrainEvalFormatter:
             difficulty = item.filter_verdict.metadata.get("difficulty_score")
             if difficulty is not None:
                 row["difficulty_score"] = difficulty
+        # Include eval_scores if populated by the scoring system.
+        eval_scores = item.qa.get("eval_scores")
+        if eval_scores:
+            row["eval_scores"] = eval_scores
+        # Include linking hints for confidence analysis.
+        linking_hints = item.generation_metadata.get("linking_hints")
+        if linking_hints:
+            row["linking_hints"] = linking_hints
         # Include unanswerable-pipeline fields when present.
         answerability = item.qa.get("answerability")
         if answerability is not None:
