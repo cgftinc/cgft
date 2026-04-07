@@ -267,14 +267,7 @@ def _build_generator(
     cfg: CgftPipelineConfig,
     *,
     linker: ChunkLinker,
-    rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> QuestionGenerator:
-    if cfg.generation.mode == "llm_env":
-        raise ValueError(
-            "generation.mode='llm_env' has been removed. "
-            "Use 'llm_direct' generation with a separate RL environment step instead."
-        )
-
     generation_cfg = cfg.generation.llm_direct
     generation_client = _build_openai_client(
         api_key=generation_cfg.api_key,
@@ -1458,11 +1451,7 @@ class CgftPipeline:
         _print_progress("[4/6] Preparing generation...", verbose=cfg.verbose)
 
         linker = _build_linker(cfg, source, profile=profile)
-        generator = _build_generator(
-            cfg,
-            linker=linker,
-            rollout_client_factory=self.rollout_client_factory,
-        )
+        generator = _build_generator(cfg, linker=linker)
         guard_filter = DeterministicGuardsFilter(cfg.filtering.deterministic_guards)
         filter_stage_names, filter_chain = _build_filter_chain(
             cfg,
