@@ -21,7 +21,7 @@ class TraceCredentials:
     api_key: str
 
     def __repr__(self) -> str:
-        redacted = self.api_key[:4] + "****" if len(self.api_key) > 4 else "****"
+        redacted = self.api_key[:2] + "****" if len(self.api_key) > 2 else "****"
         return f"{self.__class__.__name__}(api_key={redacted})"
 
     def to_headers(self) -> dict[str, str]:
@@ -38,7 +38,10 @@ class BraintrustCredentials(TraceCredentials):
 
 @dataclass(repr=False)
 class LangfuseCredentials(TraceCredentials):
-    """Langfuse credentials with SSRF-validated host."""
+    """Langfuse credentials with SSRF-validated host.
+
+    Langfuse uses Basic auth (base64(public_key:secret_key)), not Bearer.
+    """
 
     secret_key: str = ""
     host: str = "https://cloud.langfuse.com"
@@ -46,9 +49,16 @@ class LangfuseCredentials(TraceCredentials):
     def __post_init__(self) -> None:
         validate_provider_url(self.host)
 
+    def to_headers(self) -> dict[str, str]:
+        """Langfuse uses Basic auth: base64(public_key:secret_key)."""
+        import base64
+
+        token = base64.b64encode(f"{self.api_key}:{self.secret_key}".encode()).decode()
+        return {"Authorization": f"Basic {token}"}
+
     def __repr__(self) -> str:
-        rpk = self.api_key[:4] + "****" if len(self.api_key) > 4 else "****"
-        rsk = self.secret_key[:4] + "****" if len(self.secret_key) > 4 else "****"
+        rpk = self.api_key[:2] + "****" if len(self.api_key) > 2 else "****"
+        rsk = self.secret_key[:2] + "****" if len(self.secret_key) > 2 else "****"
         return f"LangfuseCredentials(api_key={rpk}, secret_key={rsk})"
 
 

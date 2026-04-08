@@ -19,7 +19,7 @@ from cgft.traces.adapter import (
 class TestTraceCredentials:
     def test_repr_redacts_key(self):
         creds = TraceCredentials(api_key="sk-1234567890abcdef")
-        assert "sk-1****" in repr(creds)
+        assert "sk****" in repr(creds)
         assert "1234567890" not in repr(creds)
 
     def test_repr_short_key(self):
@@ -38,10 +38,21 @@ class TestLangfuseCredentials:
             secret_key="sk-lf-67890",
         )
         r = repr(creds)
-        assert "pk-l****" in r
-        assert "sk-l****" in r
+        assert "pk****" in r
+        assert "sk****" in r
         assert "12345" not in r
         assert "67890" not in r
+
+    def test_basic_auth_headers(self):
+        import base64
+
+        creds = LangfuseCredentials(
+            api_key="pk-test",
+            secret_key="sk-test",
+        )
+        headers = creds.to_headers()
+        expected = base64.b64encode(b"pk-test:sk-test").decode()
+        assert headers == {"Authorization": f"Basic {expected}"}
 
     def test_validates_host_on_construction(self):
         with pytest.raises(ValueError, match="HTTPS"):
