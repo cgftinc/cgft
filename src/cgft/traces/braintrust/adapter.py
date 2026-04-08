@@ -124,7 +124,8 @@ class BraintrustTraceAdapter:
                 time.sleep(wait)
                 continue
             break
-        assert resp is not None
+        if resp is None:
+            raise RuntimeError(f"No response after {max_retries} retries: {url}")
         return resp
 
 

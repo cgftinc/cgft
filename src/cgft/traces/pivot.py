@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 # Types
 # ---------------------------------------------------------------------------
 
+_VALID_CATEGORIES = {"pivot", "downstream", "trivial"}
+
 
 @dataclass
 class PivotRating:
@@ -39,6 +41,10 @@ class PivotRating:
     importance_score: float  # 0.0–1.0
     category: Literal["pivot", "downstream", "trivial"]
     reasoning: str
+
+    def __post_init__(self) -> None:
+        if self.category not in _VALID_CATEGORIES:
+            self.category = "downstream"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -255,15 +261,29 @@ async def _rate_single_turn(
                 text = re.sub(r"\s*```$", "", text)
                 data = json.loads(text)
 
+                # Validate category
+                cat = data.get("category", "downstream")
+                if cat not in _VALID_CATEGORIES:
+                    cat = "downstream"
+
                 return PivotRating(
                     trace_id=ex.trace_id,
                     turn_index=ex.turn_index,
                     importance_score=max(0.0, min(1.0, float(data["importance_score"]))),
-                    category=data.get("category", "trivial"),
+                    category=cat,
                     reasoning=data.get("reasoning", ""),
                 )
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                # Parse/validation errors — don't retry, return fallback
+                return PivotRating(
+                    trace_id=ex.trace_id,
+                    turn_index=ex.turn_index,
+                    importance_score=0.5,
+                    category="downstream",
+                    reasoning=f"LLM response parse error: {e}",
+                )
             except Exception as e:
-                is_rate_limit = "429" in str(e) or "rate_limit" in str(e).lower()
+                # Transient/rate-limit errors — retry with jitter
                 if attempt == 4:
                     logger.warning(
                         "Pivot rating failed for trace=%s turn=%d: %s",
@@ -278,11 +298,11 @@ async def _rate_single_turn(
                         category="downstream",
                         reasoning=f"LLM rating failed: {e}",
                     )
-                # Longer backoff for rate limits
-                wait = (2**attempt) * (3 if is_rate_limit else 1)
-                await asyncio.sleep(wait)
+                is_rate_limit = "429" in str(e) or "rate_limit" in str(e).lower()
+                base_wait = (2**attempt) * (3 if is_rate_limit else 1)
+                jitter = base_wait * (0.5 + random.random())
+                await asyncio.sleep(jitter)
 
-    # unreachable, but satisfy type checker
     raise RuntimeError("unreachable")
 
 
@@ -340,6 +360,43 @@ def apply_pivot_filter(
 ) -> PivotFilterResult:
     """Filter training examples to high-signal pivot turns.
 
+    Sync wrapper around ``apply_pivot_filter_async``.  Creates a new event
+    loop to avoid monkey-patching the global loop.  If you are already in
+    an async context, call ``apply_pivot_filter_async`` directly.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            apply_pivot_filter_async(
+                examples,
+                traces,
+                llm_client=llm_client,
+                model=model,
+                threshold=threshold,
+                anchor_fraction=anchor_fraction,
+                ratings=ratings,
+                seed=seed,
+                max_concurrency=max_concurrency,
+            )
+        )
+    finally:
+        loop.close()
+
+
+async def apply_pivot_filter_async(
+    examples: list[TrainingExample],
+    traces: list[NormalizedTrace],
+    *,
+    llm_client: Any = None,
+    model: str = "gpt-5.4-nano",
+    threshold: float = 0.6,
+    anchor_fraction: float = 0.1,
+    ratings: list[PivotRating] | None = None,
+    seed: int = 42,
+    max_concurrency: int = 3,
+) -> PivotFilterResult:
+    """Filter training examples to high-signal pivot turns (async version).
+
     Two-phase approach:
     1. Heuristic fast path tags obviously trivial turns (no LLM cost)
     2. LLM counterfactual analysis rates remaining turns
@@ -349,11 +406,10 @@ def apply_pivot_filter(
         traces: the ``NormalizedTrace`` objects (needed for full-trace context)
         llm_client: AsyncOpenAI-compatible client. Required if ``ratings``
             is not provided.
-        model: LLM model for counterfactual analysis (default gpt-4o-mini)
+        model: LLM model for counterfactual analysis
         threshold: importance score cutoff (default 0.6)
         anchor_fraction: fraction of below-threshold turns to keep (default 0.1)
         ratings: pre-computed ratings — skips LLM if provided.
-            Useful for cached re-runs or threshold tuning.
         seed: random seed for anchor sampling reproducibility
         max_concurrency: max concurrent LLM requests
 
@@ -368,7 +424,9 @@ def apply_pivot_filter(
     else:
         if llm_client is None:
             raise ValueError("Either llm_client or ratings must be provided")
-        all_ratings = _compute_ratings(examples, traces, llm_client, model, max_concurrency)
+        all_ratings = await _compute_ratings_async(
+            examples, traces, llm_client, model, max_concurrency
+        )
 
     # Build lookup: (trace_id, turn_index) → PivotRating
     rating_map: dict[tuple[str, int], PivotRating] = {
@@ -411,7 +469,7 @@ def apply_pivot_filter(
     return PivotFilterResult(kept=kept, dropped=dropped, ratings=all_ratings)
 
 
-def _compute_ratings(
+async def _compute_ratings_async(
     examples: list[TrainingExample],
     traces: list[NormalizedTrace],
     llm_client: Any,
@@ -442,14 +500,9 @@ def _compute_ratings(
         len(llm_examples),
     )
 
-    # Run LLM rating
     if llm_examples:
-        import nest_asyncio  # type: ignore[import-untyped]
-
-        nest_asyncio.apply()
-        loop = asyncio.get_event_loop()
-        llm_ratings = loop.run_until_complete(
-            _rate_all_turns(llm_client, model, llm_examples, traces, max_concurrency)
+        llm_ratings = await _rate_all_turns(
+            llm_client, model, llm_examples, traces, max_concurrency
         )
     else:
         llm_ratings = []

@@ -281,10 +281,13 @@ def apply_heuristic_filters(
     dropped: list[tuple[TrainingExample, str]] = []
 
     for ex in examples:
-        if len(ex.ground_truth) < min_completion_chars:
+        # Check actual message content, not the rendered string (which
+        # includes [ASSISTANT] prefixes and tool_call formatting).
+        actual_content = ex.completion_messages[0].content if ex.completion_messages else ""
+        if len(actual_content) < min_completion_chars:
             dropped.append((ex, "too_short"))
             continue
-        if drop_auth_lookups and _AUTH_PATTERNS.search(ex.ground_truth):
+        if drop_auth_lookups and _AUTH_PATTERNS.search(actual_content):
             dropped.append((ex, "auth_lookup"))
             continue
         kept.append(ex)
