@@ -148,14 +148,16 @@ class TestCountTraces:
         mock_resp.json.return_value = {"data": [{"total": 142}]}
         mock_resp.raise_for_status = MagicMock()
 
-        with patch("httpx.post", return_value=mock_resp) as mock_post:
+        with patch("httpx.request", return_value=mock_resp) as mock_req:
             count = adapter.count_traces(creds, "proj-123")
 
         assert count == 142
-        mock_post.assert_called_once()
-        call_kwargs = mock_post.call_args
-        assert "/btql" in call_kwargs.args[0]
-        body = call_kwargs.kwargs["json"]
+        mock_req.assert_called_once()
+        call_args = mock_req.call_args
+        # httpx.request(method, url, ...)
+        assert call_args.args[0] == "POST"
+        assert "/btql" in call_args.args[1]
+        body = call_args.kwargs["json"]
         assert "project_logs('proj-123')" in body["query"]
         assert body["fmt"] == "json"
 
@@ -167,7 +169,7 @@ class TestCountTraces:
         mock_resp.json.return_value = [{"total": 55}]
         mock_resp.raise_for_status = MagicMock()
 
-        with patch("httpx.post", return_value=mock_resp):
+        with patch("httpx.request", return_value=mock_resp):
             count = adapter.count_traces(creds, "proj-456")
 
         assert count == 55
@@ -180,7 +182,7 @@ class TestCountTraces:
         mock_resp.json.return_value = {"data": []}
         mock_resp.raise_for_status = MagicMock()
 
-        with patch("httpx.post", return_value=mock_resp):
+        with patch("httpx.request", return_value=mock_resp):
             count = adapter.count_traces(creds, "proj-789")
 
         assert count == 0
