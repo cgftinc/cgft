@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any
-
-import httpx
 
 from cgft.traces.adapter import (
     NormalizedTrace,
@@ -13,8 +10,10 @@ from cgft.traces.adapter import (
     TraceProject,
 )
 from cgft.traces.braintrust.message_extraction import extract_messages, extract_scores
+from cgft.traces.http import request_with_retry
 
 _BASE_URL = "https://api.braintrust.dev/v1"
+_BTQL_URL = "https://api.braintrust.dev/btql"
 _MAX_TRACES_PER_FETCH = 1000
 
 
@@ -24,7 +23,9 @@ class BraintrustTraceAdapter:
     def connect(self, credentials: TraceCredentials) -> dict[str, Any]:
         """Validate the API key by listing projects."""
         headers = credentials.to_headers()
-        resp = httpx.get(f"{_BASE_URL}/project", headers=headers, timeout=15)
+        resp = request_with_retry(
+            "GET", f"{_BASE_URL}/project", headers=headers, timeout=15
+        )
         resp.raise_for_status()
         data = resp.json()
         objects = data.get("objects", []) if isinstance(data, dict) else []
@@ -33,7 +34,9 @@ class BraintrustTraceAdapter:
     def list_projects(self, credentials: TraceCredentials) -> list[TraceProject]:
         """List projects visible to the API key."""
         headers = credentials.to_headers()
-        resp = httpx.get(f"{_BASE_URL}/project", headers=headers, timeout=15)
+        resp = request_with_retry(
+            "GET", f"{_BASE_URL}/project", headers=headers, timeout=15
+        )
         resp.raise_for_status()
         data = resp.json()
         objects = data.get("objects", data) if isinstance(data, dict) else data
@@ -56,8 +59,9 @@ class BraintrustTraceAdapter:
             f"SELECT count(*) AS total FROM project_logs('{project_id}') "
             f"WHERE span_id = root_span_id"
         )
-        resp = httpx.post(
-            f"{_BASE_URL.replace('/v1', '')}/btql",
+        resp = request_with_retry(
+            "POST",
+            _BTQL_URL,
             headers=headers,
             json={"query": query, "fmt": "json"},
             timeout=15,
@@ -81,9 +85,7 @@ class BraintrustTraceAdapter:
         """Fetch spans from Braintrust, group by root_span_id, and normalise.
 
         Paginates automatically using cursor-based pagination until all
-        spans are fetched (or *limit* traces are reached).  Uses POST
-        ``/v1/project_logs/{project_id}/fetch`` with JSON body.  Retries
-        with exponential backoff on 429.
+        spans are fetched (or *limit* traces are reached).
 
         Returns ``(traces, next_cursor)``.
         """
@@ -98,10 +100,11 @@ class BraintrustTraceAdapter:
             if page_cursor is not None:
                 body["cursor"] = page_cursor
 
-            resp = self._post_with_retry(
+            resp = request_with_retry(
+                "POST",
                 f"{_BASE_URL}/project_logs/{project_id}/fetch",
                 headers=headers,
-                body=body,
+                json=body,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -130,28 +133,6 @@ class BraintrustTraceAdapter:
                 break
 
         return traces, page_cursor
-
-    @staticmethod
-    def _post_with_retry(
-        url: str,
-        headers: dict[str, str],
-        body: dict[str, Any],
-        *,
-        max_retries: int = 5,
-        timeout: float = 60,
-    ) -> httpx.Response:
-        """POST with exponential backoff on 429."""
-        resp: httpx.Response | None = None
-        for attempt in range(max_retries):
-            resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
-            if resp.status_code == 429:
-                wait = 2**attempt
-                time.sleep(wait)
-                continue
-            break
-        if resp is None:
-            raise RuntimeError(f"No response after {max_retries} retries: {url}")
-        return resp
 
 
 def _group_into_traces(
