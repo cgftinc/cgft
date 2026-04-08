@@ -66,6 +66,20 @@ Output is a `QADataset` of `QADataPoint` objects, serializable to JSONL or JSON.
 2. Zips environment class + local module dependencies and uploads
 3. Launches training job on the CGFT platform, returns `experiment_id`
 
+**`traces/`** — Agentic trace import and processing via the `TraceAdapter` Protocol:
+- `BraintrustTraceAdapter` — fetches traces from Braintrust, groups spans by `root_span_id`, extracts messages via 3-strategy heuristic
+- `LangfuseTraceAdapter` — (planned) Langfuse trace import with Basic auth
+- Each adapter produces `NormalizedTrace` objects: provider-agnostic, OpenAI-style `{role, content, tool_calls}` messages
+
+Processing pipeline (all provider-agnostic, operates on `NormalizedTrace`):
+1. `detect_system_prompt()` / `detect_tools()` — auto-detect from traces
+2. `build_training_examples()` — window messages into prompt/completion pairs (cumulative context)
+3. `apply_heuristic_filters()` — drop short/trivial turns (returns `FilterResult` with reasons)
+4. `apply_pivot_filter()` — PivotRL-based LLM counterfactual analysis to keep only decision-critical turns
+5. `split_dataset()` — shuffled train/eval split with min 16 samples guard
+
+Adding a new provider: create `traces/<provider>/adapter.py` implementing `connect`, `list_projects`, `fetch_traces`, add to `traces/registry.py`.
+
 **`multi_model/`** — Utilities for calling multiple LLM providers and comparing pricing/responses.
 
 ### Key Data Types
@@ -74,12 +88,16 @@ Output is a `QADataset` of `QADataPoint` objects, serializable to JSONL or JSON.
 - `QADataPoint` / `QADataset` / `ReferenceChunk` (`qa_generation/models.py`)
 - `ChunkSource` Protocol (`corpus/source.py`) — implemented by both corpus backends
 - `SearchEnv` (`envs/search_env.py`) — base RL environment; extend this for custom environments
+- `TraceAdapter` Protocol (`traces/adapter.py`) — implemented by trace provider backends
+- `NormalizedTrace` / `TraceMessage` / `ToolCall` (`traces/adapter.py`) — canonical trace data model
+- `TrainingExample` / `PivotRating` (`traces/processing.py`, `traces/pivot.py`) — pipeline output types
 
 ### External Integrations
 
 - **CGFT Platform** — training job management and blob storage
 - **Corpora API** — document storage and BM25 search
 - **Turbopuffer** — vector database
+- **Braintrust** — agentic trace import (`api.braintrust.dev`)
 - **OpenAI API** — LLM for QA generation (primary)
 - **benchmax** — RL training framework (`BaseEnv`, `ToolDefinition`, `StandardizedExample`)
 
