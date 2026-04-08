@@ -1,6 +1,9 @@
 """Tests for BraintrustTraceAdapter span grouping and normalisation."""
 
-from cgft.traces.braintrust.adapter import _group_into_traces, _normalize_trace
+from unittest.mock import MagicMock, patch
+
+from cgft.traces.adapter import TraceCredentials
+from cgft.traces.braintrust.adapter import BraintrustTraceAdapter, _group_into_traces, _normalize_trace
 
 
 class TestGroupIntoTraces:
@@ -133,3 +136,51 @@ class TestNormalizeTrace:
         assert trace.scores == {}
         assert trace.metadata == {}
         assert trace.timestamp is None
+
+
+class TestCountTraces:
+    def test_count_traces_parses_btql_response(self):
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key="test-key")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"total": 142}]}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.post", return_value=mock_resp) as mock_post:
+            count = adapter.count_traces(creds, "proj-123")
+
+        assert count == 142
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args
+        assert "/btql" in call_kwargs.args[0]
+        body = call_kwargs.kwargs["json"]
+        assert "project_logs('proj-123')" in body["query"]
+        assert body["fmt"] == "json"
+
+    def test_count_traces_handles_array_response(self):
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key="test-key")
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [{"total": 55}]
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.post", return_value=mock_resp):
+            count = adapter.count_traces(creds, "proj-456")
+
+        assert count == 55
+
+    def test_count_traces_returns_zero_on_empty(self):
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key="test-key")
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.post", return_value=mock_resp):
+            count = adapter.count_traces(creds, "proj-789")
+
+        assert count == 0
