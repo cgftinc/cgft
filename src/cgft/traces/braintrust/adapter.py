@@ -45,6 +45,31 @@ class BraintrustTraceAdapter:
             if isinstance(p, dict) and "id" in p
         ]
 
+    def count_traces(
+        self,
+        credentials: TraceCredentials,
+        project_id: str,
+    ) -> int:
+        """Return total root-span count for a project using BTQL."""
+        headers = {**credentials.to_headers(), "Content-Type": "application/json"}
+        query = (
+            f"SELECT count(*) AS total FROM project_logs('{project_id}') "
+            f"WHERE span_id = root_span_id"
+        )
+        resp = httpx.post(
+            f"{_BASE_URL.replace('/v1', '')}/btql",
+            headers=headers,
+            json={"query": query, "fmt": "json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # BTQL returns { data: [...] } or just an array
+        rows = data.get("data", data) if isinstance(data, dict) else data
+        if rows and isinstance(rows, list) and isinstance(rows[0], dict):
+            return int(rows[0].get("total", 0))
+        return 0
+
     def fetch_traces(
         self,
         credentials: TraceCredentials,

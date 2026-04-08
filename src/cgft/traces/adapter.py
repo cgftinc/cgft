@@ -243,6 +243,14 @@ class TraceAdapter(Protocol):
         """List available projects/workspaces."""
         ...
 
+    def count_traces(
+        self,
+        credentials: TraceCredentials,
+        project_id: str,
+    ) -> int:
+        """Return the total number of traces for a project."""
+        ...
+
     def fetch_traces(
         self,
         credentials: TraceCredentials,
