@@ -2,7 +2,7 @@
 
 import json
 
-from cgft.checkpoint import CheckpointBase
+from cgft.utils.checkpoint import CheckpointBase
 
 
 class TestCheckpointBase:

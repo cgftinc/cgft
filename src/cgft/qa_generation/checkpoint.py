@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cgft.checkpoint import CheckpointBase
+from cgft.utils.checkpoint import CheckpointBase
 from cgft.qa_generation.generated_qa import FilterVerdict, GeneratedQA
 
 logger = logging.getLogger(__name__)

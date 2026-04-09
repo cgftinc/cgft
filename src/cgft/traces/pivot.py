@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from cgft.checkpoint import CheckpointBase
+from cgft.utils.checkpoint import CheckpointBase
 from cgft.traces.adapter import NormalizedTrace, TraceMessage
 from cgft.traces.processing import MIN_TRAIN_SAMPLES, TrainingExample
 
