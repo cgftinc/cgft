@@ -44,6 +44,9 @@ class StubChunkSource:
             "next_chunk_preview": "(No next chunk)",
         }
 
+    def get_chunk_count(self) -> int:
+        return 1
+
     def get_top_level_chunks(self) -> list[Chunk]:
         return [self._CHUNK]
 
@@ -153,6 +156,11 @@ class TestStubProtocolConformance:
         result = _stub.get_top_level_chunks()
         assert isinstance(result, list)
         assert all(isinstance(c, Chunk) for c in result)
+
+    def test_get_chunk_count_returns_int(self):
+        result = _stub.get_chunk_count()
+        assert isinstance(result, int)
+        assert result >= 0
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +337,11 @@ class TestPineconeProtocolConformance:
         result = _pc_source.embed_query("test")
         assert isinstance(result, list)
         assert all(isinstance(v, float) for v in result)
+
+    def test_get_chunk_count_returns_int(self):
+        result = _pc_source.get_chunk_count()
+        assert isinstance(result, int)
+        assert result >= 0
 
     def test_get_top_level_returns_chunks(self):
         result = _pc_source.get_top_level_chunks()
