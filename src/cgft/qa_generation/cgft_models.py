@@ -13,12 +13,6 @@ import yaml
 
 from cgft.qa_generation.retrieval_query import QueryRewriteConfig
 from cgft.qa_generation.scoring import ScoringConfig
-from cgft.qa_generation.style_controls import (
-    QUERY_STYLE_EXPERT,
-    QUERY_STYLE_KEYWORD,
-    QUERY_STYLE_NATURAL,
-    normalize_style_distribution,
-)
 
 CORPUS_SYSTEM_PROMPT = (
     "You are a technical analyst specializing in document corpus analysis.\n"
@@ -340,32 +334,7 @@ class GenerationConfig:
 
 @dataclass
 class TransformationConfig:
-    """Post-generation question transformation controls."""
-
-    # LLM settings
-    model: str = ""
-    api_key: str = ""
-    base_url: str = ""
-    system_prompt: str = ""
-    user_template: str = ""
-
-    # Noise level for style-appropriate mutations
-    noise_level: str = "light"  # "none", "light", "moderate"
-
-    # Style distribution for rewrites
-    style_distribution: dict[str, float] = field(
-        default_factory=lambda: {
-            QUERY_STYLE_KEYWORD: 0.33,
-            QUERY_STYLE_NATURAL: 0.34,
-            QUERY_STYLE_EXPERT: 0.33,
-        }
-    )
-
-    # Validation settings
-    validation_enabled: bool = True
-    validation_model: str = ""
-
-    preserve_original_in_metadata: bool = True
+    """Post-generation transformation controls (style annotation only)."""
 
 
 @dataclass
@@ -562,16 +531,6 @@ class CgftPipelineConfig:
             self.generation.llm_direct.api_key = shared_llm_key
         if not self.generation.llm_direct.base_url:
             self.generation.llm_direct.base_url = shared_llm_base_url
-
-        if not self.transformation.api_key:
-            self.transformation.api_key = shared_llm_key
-        if not self.transformation.base_url:
-            self.transformation.base_url = shared_llm_base_url
-        if not self.transformation.model:
-            self.transformation.model = self.generation.llm_direct.model
-        self.transformation.style_distribution = normalize_style_distribution(
-            self.transformation.style_distribution
-        )
 
         if not self.corpus_context.api_key:
             self.corpus_context.api_key = shared_llm_key
@@ -921,26 +880,7 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         ),
     )
 
-    transformation_raw = raw.get("transformation", {}) or {}
-    transformation = TransformationConfig(
-        model=str(transformation_raw.get("model", "")).strip(),
-        api_key=str(transformation_raw.get("api_key", "")).strip(),
-        base_url=str(transformation_raw.get("base_url", "")).strip(),
-        system_prompt=str(transformation_raw.get("system_prompt", "")).strip(),
-        user_template=str(transformation_raw.get("user_template", "")).strip(),
-        noise_level=str(transformation_raw.get("noise_level", "light")).strip() or "light",
-        style_distribution=normalize_style_distribution(
-            transformation_raw.get(
-                "style_distribution",
-                TransformationConfig().style_distribution,
-            )
-        ),
-        validation_enabled=bool(transformation_raw.get("validation_enabled", True)),
-        validation_model=str(transformation_raw.get("validation_model", "")).strip(),
-        preserve_original_in_metadata=bool(
-            transformation_raw.get("preserve_original_in_metadata", True)
-        ),
-    )
+    transformation = TransformationConfig()
 
     filtering_raw = raw.get("filtering", {}) or {}
     guards_raw = filtering_raw.get("deterministic_guards", {}) or {}
