@@ -790,6 +790,9 @@ class TestCheckOutcomeBalance:
         balance = check_outcome_balance(examples)
         assert balance.unknown_count == 5
         assert balance.failure_fraction == 0.0
+        assert balance.is_balanced is True
+        assert balance.message is not None
+        assert "not applicable" in balance.message
 
     def test_custom_threshold(self):
         examples = [self._make_scored_example(0.8)] * 8 + [self._make_scored_example(0.3)] * 2
@@ -858,22 +861,12 @@ class TestApplyFilters:
         with pytest.raises(ValueError, match="Unknown filter"):
             apply_filters([], [("nonexistent", {})])
 
-    def test_dataset_level_runs_after_per_example(self):
-        # Even if dedup is listed first, it should run after heuristic
-        examples = [
-            TrainingExample(
-                prompt_messages=[_msg("user", "Q")],
-                completion_messages=[_msg("assistant", "short")],
-                prompt="Q", ground_truth="short", trace_id="t0", turn_index=0,
-            ),
-        ] + self._make_examples(5)
-
-        result = apply_filters(examples, [
-            ("dedup", {}),
-            ("heuristic", {"min_completion_chars": 50}),
-        ])
-        # heuristic runs first (per-example), then dedup (dataset-level)
-        assert "heuristic" in result.summary
+    def test_rejects_bad_ordering(self):
+        with pytest.raises(ValueError, match="Per-example filter.*after dataset-level"):
+            apply_filters([], [
+                ("dedup", {}),
+                ("heuristic", {"min_completion_chars": 50}),
+            ])
 
 
 class TestValidIdentifierRegex:

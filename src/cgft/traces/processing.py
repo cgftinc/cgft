@@ -10,10 +10,9 @@ import json
 import logging
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
-
-logger = logging.getLogger(__name__)
+from typing import Any
 
 from cgft.traces.adapter import (
     DetectedSystemPrompt,
@@ -22,6 +21,8 @@ from cgft.traces.adapter import (
     NormalizedTrace,
     TraceMessage,
 )
+
+logger = logging.getLogger(__name__)
 
 MIN_TRAIN_SAMPLES = 16
 
@@ -592,15 +593,22 @@ def check_outcome_balance(
 
     scored = success + failure
     fraction = failure / scored if scored else 0.0
-    is_balanced = fraction >= min_failure_fraction
 
     message = None
-    if not is_balanced and scored > 0:
+    if scored == 0:
+        is_balanced = True
+        message = (
+            f"No examples have '{score_name}' scores — balance check not applicable."
+        )
+    elif fraction < min_failure_fraction:
+        is_balanced = False
         message = (
             f"Only {fraction:.1%} failure traces (need >= {min_failure_fraction:.0%}). "
             f"GRPO needs reward variance — consider collecting more failure cases "
             f"or downsampling successes."
         )
+    else:
+        is_balanced = True
 
     return OutcomeBalance(
         total=len(examples),
@@ -626,11 +634,14 @@ def apply_filters(
 ) -> FilterResult:
     """Run named filters in sequence, accumulate all drops.
 
-    Each step is ``(filter_name, kwargs_dict)``.  Per-example filters run
-    first, then dataset-level filters, regardless of input order.
+    Each step is ``(filter_name, kwargs_dict)``.  Dataset-level filters
+    (e.g. ``"dedup"``) must come after all per-example filters.
 
     Supported filters: ``"heuristic"``, ``"tool_relay"``, ``"tool_calls"``,
     ``"dedup"``.
+
+    Raises ``ValueError`` if a per-example filter is listed after a
+    dataset-level filter or if a filter name is unknown.
     """
     registry: dict[str, Callable[..., FilterResult]] = {
         "heuristic": apply_heuristic_filters,
@@ -639,20 +650,25 @@ def apply_filters(
         "dedup": deduplicate_completions,
     }
 
-    # Partition into per-example and dataset-level, preserving relative order
-    per_example_steps = [(n, kw) for n, kw in steps if n not in _DATASET_LEVEL_FILTERS]
-    dataset_steps = [(n, kw) for n, kw in steps if n in _DATASET_LEVEL_FILTERS]
-    ordered = per_example_steps + dataset_steps
+    # Validate ordering: per-example filters must precede dataset-level
+    seen_dataset = False
+    for name, _ in steps:
+        if name not in registry:
+            available = ", ".join(sorted(registry))
+            raise ValueError(f"Unknown filter {name!r}. Available: {available}")
+        if name in _DATASET_LEVEL_FILTERS:
+            seen_dataset = True
+        elif seen_dataset:
+            raise ValueError(
+                f"Per-example filter {name!r} listed after dataset-level filter. "
+                f"Reorder so per-example filters run first."
+            )
 
     all_dropped: list[tuple[TrainingExample, DropReason]] = []
     current = list(examples)
 
-    for name, kwargs in ordered:
-        fn = registry.get(name)
-        if fn is None:
-            available = ", ".join(sorted(registry))
-            raise ValueError(f"Unknown filter {name!r}. Available: {available}")
-        result = fn(current, **kwargs)
+    for name, kwargs in steps:
+        result = registry[name](current, **kwargs)
         all_dropped.extend(result.dropped)
         current = result.kept
 
