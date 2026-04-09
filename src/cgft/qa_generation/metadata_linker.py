@@ -40,7 +40,8 @@ class MetadataLinkerConfig:
     min_chunk_chars: int = 400
     filter_same_file: bool = True
     min_coherence: float = 0.15
-    max_secondary_similarity: float = 0.8
+    max_secondary_similarity: float = 0.55
+    max_primary_similarity: float = 0.55
     retry_confidence: float = 0.5
     header_keys: tuple[str, ...] = ("h2", "h3", "section_header", "title", "h1")
 
@@ -196,6 +197,8 @@ class MetadataChunkLinker:
                 else 0.0
             )
             if overrides.min_coherence > 0 and jaccard < overrides.min_coherence:
+                continue
+            if self.config.max_primary_similarity > 0 and jaccard > self.config.max_primary_similarity:  # noqa: E501
                 continue
             scored.append((chunk, search_score, jaccard))
 

@@ -85,8 +85,29 @@ _DEFAULT_TEMPLATE = (
     "- Ensure the answer is correct, specific, and uniquely determined by the question and provided evidence.\n"
     "- Prefer task-oriented documentation use-cases over internal implementation trivia.\n"
     "- Avoid forced cross-topic stitching that is unlikely for a single user intent.\n"
-    "- Reduce lexical shortcut risk by paraphrasing direct chunk phrasing and adding compositional constraints.\n"
-    "[[if previous_failure_type]]- If previous_failure_type=too_easy, keep answer facts stable and make the question harder.\n[[endif]]"
+    "- RETRIEVAL DIFFICULTY — CRITICAL:\n"
+    "  1. OBFUSCATE THE REASONING PATH: Your question must NOT reveal which chunks or topics are needed.\n"  # noqa: E501
+    "     Frame it as a SCENARIO or PROBLEM the user is trying to solve.\n"
+    "     The search agent should have to reason about what to search for.\n"
+    "     BAD: 'What is PostHog's session recording feature and how does it integrate with feature flags?'\n"  # noqa: E501
+    "     → Reveals both chunks. A keyword search trivially finds both.\n"
+    "     GOOD: 'When debugging why a feature rollout isn't behaving as expected for certain users,\n"  # noqa: E501
+    "     what built-in tool shows you exactly what those users experienced?'\n"
+    "     → Requires reasoning to connect feature flags and session recording. The connection is implicit.\n"  # noqa: E501
+    "  2. PARAPHRASE CHUNK LANGUAGE: Replace key terms from source chunks with synonyms or descriptions.\n"  # noqa: E501
+    "     If a human could find the answer by searching for 3+ words from your question, rewrite it.\n"  # noqa: E501
+    "  If your question names specific features, APIs, or concepts from multiple chunks,\n"
+    "  you've made it too easy. Describe the PROBLEM, not the SOLUTION SPACE.\n"
+    "  3. ANSWER GROUNDING: While the QUESTION should be obfuscated, the ANSWER must stay\n"
+    "     closely grounded in the exact language of the source chunks. Use the same terms,\n"
+    "     phrases, and specifics from the chunks in your answer. Do NOT paraphrase the answer.\n"
+    "[[if previous_failure_type]]- If previous_failure_type=too_easy:\n"
+    "  Your previous question was rejected because a search agent could find the answer too easily.\n"  # noqa: E501
+    "  The question reveals which chunks are needed.\n"
+    "  REWRITE as a SCENARIO: describe what the user is trying to achieve or what problem they're facing.\n"  # noqa: E501
+    "  Don't name the features or concepts directly.\n"
+    "  Previous failed question: {failed_question}\n"
+    "  Hint: Instead of naming the topics, describe their EFFECTS or USE CASES.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer using current chunk evidence only.\n[[endif]]"
     "- Output exactly one question and one answer.\n"
     "- In chunks_used, list the indices of chunks you referenced (0=primary, 1+=secondary).\n"
@@ -120,16 +141,21 @@ _LOOKUP_TEMPLATE = (
     "[[if regeneration_prompt]]Feedback:\n{regeneration_prompt}\n\n[[endif]]"
     "Requirements:\n"
     "- The question must be answerable from the primary chunk alone.\n"
-    "- Frame the question as a real user would ask it — describe the goal or problem, "
-    "not the solution. Users don't search for 'posthog.init() session_recording config'; "
-    "they search for 'how to record user sessions in my app'.\n"
-    "- Paraphrase and use synonyms — do NOT copy key terms verbatim from the chunk. "
-    "The question should be hard to retrieve via naive keyword matching.\n"
+    "- RETRIEVAL DIFFICULTY REQUIREMENT:\n"
+    "  Frame the question as a user trying to accomplish something or solve a problem.\n"
+    "  Do NOT use key terms from the chunk — describe the goal, not the mechanism.\n"
+    "  BAD: 'How do I set up a dynamic exclusion in Tableau?'\n"
+    "  GOOD: 'How can I automatically hide future time periods in a dashboard based on the selected date grouping?'\n"  # noqa: E501
     "- The answer should be specific and grounded in chunk evidence.\n"
     "- Use only chunk evidence; do not use outside knowledge.\n"
     "- Prefer task-oriented use-cases over internal implementation trivia.\n"
-    "[[if previous_failure_type]]- If previous_failure_type=too_easy, rephrase to reduce "
-    "lexical overlap with the chunk while preserving the same answer.\n[[endif]]"
+    "[[if previous_failure_type]]- If previous_failure_type=too_easy:\n"
+    "  Your previous question was rejected because a search agent could find the answer too easily.\n"  # noqa: E501
+    "  The question reveals which chunks are needed.\n"
+    "  REWRITE as a SCENARIO: describe what the user is trying to achieve or what problem they're facing.\n"  # noqa: E501
+    "  Don't name the features or concepts directly.\n"
+    "  Previous failed question: {failed_question}\n"
+    "  Hint: Instead of naming the topics, describe their EFFECTS or USE CASES.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer "
     "using current chunk evidence only.\n[[endif]]"
     "- Output exactly one question and one answer.\n"

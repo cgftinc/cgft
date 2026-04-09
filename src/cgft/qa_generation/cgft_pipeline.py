@@ -276,6 +276,7 @@ def _build_metadata_linker(
             filter_same_file=mcfg.filter_same_file,
             min_coherence=mcfg.min_coherence,
             max_secondary_similarity=mcfg.max_secondary_similarity,
+            max_primary_similarity=mcfg.max_primary_similarity,
             retry_confidence=mcfg.retry_confidence,
             header_keys=mcfg.header_keys,
         ),
@@ -1210,6 +1211,8 @@ def _generate_entity_extraction_patterns(
             temperature=0.0,
         )
         raw = completion.choices[0].message.content or ""
+        # Strip control characters that break JSON parsing
+        raw = re.sub(r"[\x00-\x1f]", " ", raw)
         data = json.loads(raw)
 
         valid_patterns: dict[str, str] = {}

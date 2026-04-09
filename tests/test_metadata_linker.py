@@ -162,7 +162,12 @@ class TestMetadataChunkLinker:
         linker = MetadataChunkLinker(
             source,
             profile,
-            config=MetadataLinkerConfig(max_secondaries=2, min_chunk_chars=10, min_coherence=0.0),
+            config=MetadataLinkerConfig(
+                max_secondaries=2,
+                min_chunk_chars=10,
+                min_coherence=0.0,
+                max_secondary_similarity=1.0,  # disable diversity filter; test is about max_secondaries
+            ),
         )
         bundle = linker.link(primary, target_hop_count=4)
         assert len(bundle.secondary_chunks) == 2
@@ -1010,6 +1015,90 @@ class TestReasoningModeAwareLinking:
 
         # Should not crash; just uses factual behavior
         assert bundle.structural_hints["reasoning_mode"] == "temporal"
+
+
+class TestSecondaryDiversityThreshold:
+    def test_linker_rejects_high_overlap_secondary(self):
+        """Two candidates with Jaccard > 0.55 to each other → only one selected."""
+        primary = FakeChunk(
+            content="PostgreSQL handles ACID transactions and row-level locking.",
+            metadata=(("file", "pg.md"), ("h2", "Transactions")),
+            hash="primary",
+        )
+        # These two candidates share most tokens (Jaccard >> 0.55).
+        candidate_a = FakeChunk(
+            content="Redis cache session timeout expiration configuration layer setup.",
+            metadata=(("file", "a.md"),),
+            hash="candidate_a",
+        )
+        candidate_b = FakeChunk(
+            content="Redis cache session timeout expiration configuration layer management.",
+            metadata=(("file", "b.md"),),
+            hash="candidate_b",
+        )
+        results = _make_search_results([candidate_a, candidate_b])
+        source = _make_source(results)
+        profile = _make_profile()
+
+        linker = MetadataChunkLinker(
+            source,
+            profile,
+            config=MetadataLinkerConfig(
+                min_chunk_chars=10,
+                min_coherence=0.0,
+                max_primary_similarity=1.0,  # disable primary ceiling for this test
+                max_secondary_similarity=0.55,
+                max_secondaries=2,
+            ),
+        )
+        bundle = linker.link(primary, target_hop_count=3)
+
+        # Only one of the two near-duplicate secondaries should be selected.
+        assert len(bundle.secondary_chunks) == 1
+
+    def test_linker_rejects_high_primary_overlap(self):
+        """Candidate with Jaccard > 0.55 to primary → skipped."""
+        # Primary and the "too similar" candidate share most tokens.
+        primary = FakeChunk(
+            content=(
+                "Redis supports TTL-based expiration for cache keys timeout configuration setup."
+            ),
+            metadata=(("file", "redis.md"), ("h2", "Cache Config")),
+            hash="primary",
+        )
+        # This candidate has very high overlap with primary → should be filtered.
+        too_similar = FakeChunk(
+            content=(
+                "Redis supports TTL-based expiration for cache timeout configuration setup layer."
+            ),
+            metadata=(("file", "other.md"),),
+            hash="too_similar",
+        )
+        # This candidate has lower overlap → should pass.
+        acceptable = FakeChunk(
+            content="Memcached uses slab allocation for memory management across nodes.",
+            metadata=(("file", "memcached.md"),),
+            hash="acceptable",
+        )
+        results = _make_search_results([too_similar, acceptable])
+        source = _make_source(results)
+        profile = _make_profile()
+
+        linker = MetadataChunkLinker(
+            source,
+            profile,
+            config=MetadataLinkerConfig(
+                min_chunk_chars=10,
+                min_coherence=0.0,
+                max_primary_similarity=0.55,
+                max_secondaries=2,
+            ),
+        )
+        bundle = linker.link(primary, target_hop_count=3)
+
+        hashes = [c.hash for c in bundle.secondary_chunks]
+        assert "too_similar" not in hashes
+        assert "acceptable" in hashes
 
 
 class TestTokenSetJaccard:

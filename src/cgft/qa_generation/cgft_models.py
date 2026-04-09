@@ -286,7 +286,8 @@ class MetadataLinkerCfg:
     min_chunk_chars: int = 400
     filter_same_file: bool = True
     min_coherence: float = 0.15
-    max_secondary_similarity: float = 0.8
+    max_secondary_similarity: float = 0.55
+    max_primary_similarity: float = 0.55
     retry_confidence: float = 0.5
     header_keys: tuple[str, ...] = ("h2", "h3", "section_header", "title", "h1")
 
