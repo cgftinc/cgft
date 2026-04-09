@@ -180,7 +180,9 @@ class HopCountValidityFilter:
                 stats["skipped_single_hop"] = stats.get("skipped_single_hop", 0) + 1
                 continue
 
-            ref_chunks = item.qa.get("reference_chunks", [])
+            ref_chunks = (
+                item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", [])
+            )
             if len(ref_chunks) <= 1:
                 stats["skipped_single_hop"] = stats.get("skipped_single_hop", 0) + 1
                 continue
