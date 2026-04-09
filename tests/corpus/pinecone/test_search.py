@@ -54,12 +54,13 @@ def _make_search(embed_fn=None) -> PineconeSearch:
 
 
 class TestSearch:
-    def test_returns_strings(self):
+    def test_returns_dicts(self):
         ps = _make_search()
         results = ps.search("query")
         assert isinstance(results, list)
-        assert all(isinstance(r, str) for r in results)
-        assert results == ["result one", "result two"]
+        assert all(isinstance(r, dict) for r in results)
+        assert results[0]["content"] == "result one"
+        assert results[1]["content"] == "result two"
 
     def test_mode_lexical_raises(self):
         ps = _make_search()

@@ -68,8 +68,8 @@ class PineconeSearch:
         query: str,
         mode: str = "auto",
         top_k: int = 10,
-    ) -> list[str]:
-        """Search and return content strings."""
+    ) -> list[dict[str, Any]]:
+        """Search and return structured results."""
         if mode not in ("auto", "vector"):
             raise ValueError(
                 f"PineconeSearch only supports 'vector' mode, got '{mode}'. "
@@ -78,7 +78,7 @@ class PineconeSearch:
         client = self._get_client()
         vec = client.embed_fn([query])[0]
         result = client.query(vector=vec, top_k=top_k)
-        return [client.match_content(m) for m in (result.matches or [])]
+        return [client.match_to_raw(m) for m in (result.matches or [])]
 
     def embed(self, text: str) -> list[float] | None:
         """Return embedding vector for *text*."""

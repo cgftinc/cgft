@@ -1,7 +1,6 @@
 """SearchClient protocol — pickle-safe search interface for RL environments.
 
-No Pydantic, no Chunk objects. Just strings in, strings out.
-Designed to survive cloudpickle roundtrips for remote training.
+No Pydantic, no Chunk objects. Designed to survive cloudpickle roundtrips for remote training.
 """
 
 from __future__ import annotations
@@ -26,8 +25,8 @@ class SearchClient(Protocol):
         query: str,
         mode: str = "auto",
         top_k: int = 10,
-    ) -> list[str]:
-        """Search and return content strings.
+    ) -> list[dict[str, Any]]:
+        """Search and return structured results.
 
         Args:
             query: Text query string.
@@ -36,7 +35,8 @@ class SearchClient(Protocol):
             top_k: Maximum number of results.
 
         Returns:
-            List of content strings, ordered by relevance.
+            List of dicts with keys ``content``, ``source``, ``metadata``,
+            and ``score``, ordered by relevance.
         """
         ...
 
@@ -52,9 +52,6 @@ class SearchClient(Protocol):
         ``["lexical", "vector", "hybrid"]``).
         """
         ...
-
-    # search_with_metadata is optional — not part of the Protocol.
-    # Implementations that support it define it; SearchEnv checks via hasattr.
 
     def get_params(self) -> dict[str, Any]:
         """Return serializable connection parameters.
