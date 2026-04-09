@@ -72,8 +72,8 @@ class TpufSearch:
         query: str,
         mode: str = "auto",
         top_k: int = 10,
-    ) -> list[str]:
-        """Search and return content strings."""
+    ) -> list[dict[str, Any]]:
+        """Search and return structured results."""
         ns = self._get_client()
         modes = self.available_modes
         content_fields = self._content_attr or ["content"]
@@ -92,71 +92,6 @@ class TpufSearch:
                 f"Available modes: {modes}. "
                 f"{'Provide embed_fn for vector/hybrid.' if mode in ('vector', 'hybrid') else ''}"
             )
-
-        if mode == "lexical":
-            rank_by = [content_fields[0], "BM25", query]
-            result = ns.query(rank_by=rank_by, top_k=top_k, include_attributes=True)
-            return [self._row_content(row) for row in (result.rows or [])]
-
-        if mode == "vector":
-            vec = self._embed_fn([query])[0]
-            rank_by = [self._vector_attr, "ANN", vec]
-            result = ns.query(
-                rank_by=rank_by,
-                top_k=top_k,
-                include_attributes=True,
-                distance_metric=self._distance_metric,
-            )
-            return [self._row_content(row) for row in (result.rows or [])]
-
-        # hybrid: client-side RRF
-        vec = self._embed_fn([query])[0]
-        lex_rank = [content_fields[0], "BM25", query]
-        vec_rank = [self._vector_attr, "ANN", vec]
-        oversample_k = min(top_k * 2, 10000)
-
-        lex_result = ns.query(rank_by=lex_rank, top_k=oversample_k, include_attributes=True)
-        vec_result = ns.query(
-            rank_by=vec_rank,
-            top_k=oversample_k,
-            include_attributes=True,
-            distance_metric=self._distance_metric,
-        )
-
-        # RRF fusion
-        k = 60.0
-        fused: dict[Any, dict[str, Any]] = {}
-        for rank, row in enumerate(lex_result.rows or []):
-            fused.setdefault(row.id, {"row": row, "score": 0.0})
-            fused[row.id]["score"] += 1.0 / (k + rank)
-        for rank, row in enumerate(vec_result.rows or []):
-            fused.setdefault(row.id, {"row": row, "score": 0.0})
-            fused[row.id]["score"] += 1.0 / (k + rank)
-
-        ranked = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
-        return [self._row_content(e["row"]) for e in ranked[:top_k]]
-
-    def search_with_metadata(
-        self,
-        query: str,
-        mode: str = "auto",
-        top_k: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Search and return structured results with metadata."""
-        ns = self._get_client()
-        modes = self.available_modes
-        content_fields = self._content_attr or ["content"]
-
-        if mode == "auto":
-            if "hybrid" in modes:
-                mode = "hybrid"
-            elif "vector" in modes:
-                mode = "vector"
-            else:
-                mode = "lexical"
-
-        if mode not in modes:
-            raise ValueError(f"TpufSearch: mode '{mode}' not available. Available: {modes}.")
 
         if mode == "lexical":
             rank_by = [content_fields[0], "BM25", query]

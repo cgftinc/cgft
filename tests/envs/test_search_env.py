@@ -29,7 +29,15 @@ class StubSearch:
         self._results = results if results is not None else ["result one", "result two"]
 
     def search(self, query, mode="auto", top_k=10):
-        return self._results[:top_k]
+        return [
+            {
+                "content": r,
+                "source": f"doc_{i}",
+                "metadata": {"file": f"doc_{i}", "section": f"section_{i}"},
+                "score": 10.0 - i,
+            }
+            for i, r in enumerate(self._results[:top_k])
+        ]
 
     def embed(self, text):
         return [0.1, 0.2, 0.3]
@@ -40,21 +48,6 @@ class StubSearch:
 
     def get_params(self):
         return {"backend": "stub"}
-
-
-class StubSearchWithMetadata(StubSearch):
-    """SearchClient that supports search_with_metadata."""
-
-    def search_with_metadata(self, query, mode="auto", top_k=10):
-        return [
-            {
-                "content": content,
-                "source": f"doc_{i}",
-                "metadata": {"file": f"doc_{i}", "section": f"section_{i}"},
-                "score": 10.0 - i,
-            }
-            for i, content in enumerate(self._results[:top_k])
-        ]
 
 
 def _make_env(**overrides):
@@ -137,7 +130,7 @@ class TestSearchTool:
         assert result == "No results found."
 
     def test_metadata_search_includes_source_labels(self):
-        env = _make_env(search=StubSearchWithMetadata(results=["foo", "bar"]))
+        env = _make_env(search=StubSearch(results=["foo", "bar"]))
         result = asyncio.run(env._search_tool(query="test"))
         assert "[source: doc_0]" in result
         assert "Metadata:" in result
@@ -148,7 +141,7 @@ class TestSearchTool:
         class TrackingSearch(StubSearch):
             def search(self, query, mode="auto", top_k=10):
                 calls.append({"query": query, "mode": mode, "top_k": top_k})
-                return ["result"]
+                return [{"content": "result", "source": "", "metadata": {}, "score": 1.0}]
 
         env = _make_env(search=TrackingSearch())
         asyncio.run(env._search_tool(query="test query", limit=5))

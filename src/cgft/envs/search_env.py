@@ -155,9 +155,6 @@ class SearchEnv(BaseEnv):
         else:
             self._default_mode = "lexical"
 
-        # Check if backend supports metadata-rich search.
-        self._has_metadata_search = hasattr(search, "search_with_metadata")
-
         # Build tool schema.
         search_props: dict[str, Any] = {
             "query": {
@@ -295,18 +292,12 @@ class SearchEnv(BaseEnv):
 
         effective_mode = mode or self._default_mode
         try:
-            if self._has_metadata_search:
-                results = self._search.search_with_metadata(
-                    query=query, mode=effective_mode, top_k=limit
-                )
-                return self._format_metadata_results(results)
-            else:
-                results = self._search.search(query=query, mode=effective_mode, top_k=limit)
-                return self._format_simple_results(results)
+            results = self._search.search(query=query, mode=effective_mode, top_k=limit)
+            return self._format_results(results)
         except Exception:
             return f"Error:\n{traceback.format_exc()}"
 
-    def _format_metadata_results(self, results: list[dict[str, Any]]) -> str:
+    def _format_results(self, results: list[dict[str, Any]]) -> str:
         """Format search results with source labels and metadata."""
         if not results:
             return "No results found."
@@ -325,7 +316,6 @@ class SearchEnv(BaseEnv):
 
             parts = [header]
             if metadata:
-                # Show relevant metadata fields (exclude internal keys)
                 display_md = {
                     k: v
                     for k, v in metadata.items()
@@ -341,13 +331,6 @@ class SearchEnv(BaseEnv):
 
         output = "\n".join(lines)
         return self._truncate_tool_output(output)
-
-    def _format_simple_results(self, results: list[str]) -> str:
-        """Format search results as simple numbered list."""
-        if not results:
-            return "No results found."
-        lines = [f"{i}.\n   Content: {content}" for i, content in enumerate(results, 1)]
-        return self._truncate_tool_output("\n".join(lines))
 
     @staticmethod
     def _truncate_tool_output(

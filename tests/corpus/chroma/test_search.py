@@ -53,12 +53,13 @@ def _make_search(modes=None, embed_fn=None) -> ChromaSearch:
 
 
 class TestSearch:
-    def test_returns_strings(self):
+    def test_returns_dicts(self):
         cs = _make_search()
         results = cs.search("query")
         assert isinstance(results, list)
-        assert all(isinstance(r, str) for r in results)
-        assert results == ["result one", "result two"]
+        assert all(isinstance(r, dict) for r in results)
+        assert results[0]["content"] == "result one"
+        assert results[1]["content"] == "result two"
 
     def test_mode_auto_picks_vector_when_only_vector(self):
         cs = _make_search(modes={"vector"})
@@ -72,7 +73,7 @@ class TestSearch:
             {"id": "1", "content": "hybrid result", "metadata": {}, "score": 0.9},
         ]
         results = cs.search("query", mode="auto")
-        assert results == ["hybrid result"]
+        assert results[0]["content"] == "hybrid result"
 
     def test_mode_auto_picks_lexical_over_vector(self):
         cs = _make_search(modes={"vector", "lexical"})
@@ -81,7 +82,7 @@ class TestSearch:
             {"id": "1", "content": "lexical result", "metadata": {}, "score": 0.9},
         ]
         results = cs.search("query", mode="auto")
-        assert results == ["lexical result"]
+        assert results[0]["content"] == "lexical result"
 
     def test_invalid_mode_raises(self):
         cs = _make_search(modes={"vector"})
