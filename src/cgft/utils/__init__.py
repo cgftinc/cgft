@@ -1,4 +1,5 @@
 """Utility functions for synthetic data preparation."""
+
 import sys
 
 
