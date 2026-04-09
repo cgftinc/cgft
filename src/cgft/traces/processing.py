@@ -6,10 +6,14 @@ Operates on ``NormalizedTrace`` / ``TraceMessage`` objects produced by any
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 from cgft.traces.adapter import (
     DetectedSystemPrompt,
@@ -23,10 +27,6 @@ MIN_TRAIN_SAMPLES = 16
 
 VALID_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
-_AUTH_PATTERNS = re.compile(
-    r"\b(authenticate|login|sign[_\s]?in|bearer|oauth|refresh[_\s]?token)\b",
-    re.IGNORECASE,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -251,48 +251,412 @@ def build_training_examples(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class DropReason:
+    """Structured drop reason for filtered examples."""
+
+    filter: str  # stage: "heuristic", "tool_relay", "dedup", "tool_calls"
+    reason: str  # specific: "too_short", "relay", "duplicate", "excluded"
+    detail: str | None = None  # optional: cluster id, tool name, etc.
+
+    def __str__(self) -> str:
+        if self.detail:
+            return f"{self.filter}:{self.reason}:{self.detail}"
+        return f"{self.filter}:{self.reason}"
+
+
 @dataclass
 class FilterResult:
-    """Result of applying heuristic filters."""
+    """Result of applying filters."""
 
     kept: list[TrainingExample]
-    dropped: list[tuple[TrainingExample, str]]
+    dropped: list[tuple[TrainingExample, DropReason]]
 
     @property
     def summary(self) -> dict[str, int]:
-        """Count of drops per reason."""
-        return dict(Counter(reason for _, reason in self.dropped))
+        """Counts per filter stage."""
+        counts: dict[str, int] = {}
+        for _, reason in self.dropped:
+            counts[reason.filter] = counts.get(reason.filter, 0) + 1
+        return counts
+
+    @property
+    def summary_detail(self) -> dict[str, int]:
+        """Counts per filter:reason pair."""
+        counts: dict[str, int] = {}
+        for _, reason in self.dropped:
+            key = f"{reason.filter}:{reason.reason}"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
 
 def apply_heuristic_filters(
     examples: list[TrainingExample],
     *,
     min_completion_chars: int = 50,
-    drop_auth_lookups: bool = False,
 ) -> FilterResult:
     """Filter examples using deterministic heuristics.
 
     Returns ``FilterResult`` with both kept and dropped examples (with
     reasons) so the wizard can show what was filtered and why.
-
-    ``drop_auth_lookups`` defaults to ``False`` — users must opt in.
     """
     kept: list[TrainingExample] = []
-    dropped: list[tuple[TrainingExample, str]] = []
+    dropped: list[tuple[TrainingExample, DropReason]] = []
 
     for ex in examples:
-        # Check actual message content, not the rendered string (which
-        # includes [ASSISTANT] prefixes and tool_call formatting).
         actual_content = ex.completion_messages[0].content if ex.completion_messages else ""
         if len(actual_content) < min_completion_chars:
-            dropped.append((ex, "too_short"))
-            continue
-        if drop_auth_lookups and _AUTH_PATTERNS.search(actual_content):
-            dropped.append((ex, "auth_lookup"))
+            dropped.append((ex, DropReason("heuristic", "too_short")))
             continue
         kept.append(ex)
 
     return FilterResult(kept=kept, dropped=dropped)
+
+
+def filter_by_tool_calls(
+    examples: list[TrainingExample],
+    exclude_tools: list[str],
+) -> FilterResult:
+    """Filter out examples whose completion consists solely of excluded tool calls.
+
+    An example is dropped when every tool call in the completion matches
+    ``exclude_tools`` and the assistant's text content is minimal (< 50
+    chars).  Examples with substantive text or non-excluded tool calls are
+    kept.
+
+    Use ``detect_tools()`` to discover available tool names first, then
+    pass the ones you want to exclude.
+    """
+    exclude_set = set(exclude_tools)
+    kept: list[TrainingExample] = []
+    dropped: list[tuple[TrainingExample, DropReason]] = []
+
+    for ex in examples:
+        tool_names: list[str] = []
+        for msg in ex.completion_messages:
+            if msg.tool_calls:
+                tool_names.extend(tc.name for tc in msg.tool_calls)
+
+        if not tool_names:
+            kept.append(ex)
+            continue
+
+        all_excluded = all(name in exclude_set for name in tool_names)
+        text_content = ex.completion_messages[0].content if ex.completion_messages else ""
+        if all_excluded and len(text_content) < 50:
+            dropped.append(
+                (ex, DropReason("tool_calls", "excluded", tool_names[0]))
+            )
+            continue
+        kept.append(ex)
+
+    return FilterResult(kept=kept, dropped=dropped)
+
+
+# ---------------------------------------------------------------------------
+# Tool result relay filter
+# ---------------------------------------------------------------------------
+
+_STOP_WORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "has", "have", "had", "been",
+    "i", "you", "we", "it", "they", "that", "this",
+    "for", "to", "of", "and", "or", "but", "in", "on", "with",
+})
+
+
+def _extract_text_from_value(value: Any) -> list[str]:
+    """Recursively extract leaf string/number values from a JSON structure."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (int, float)):
+        return [str(value)]
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            parts.extend(_extract_text_from_value(item))
+        return parts
+    if isinstance(value, dict):
+        parts = []
+        for v in value.values():
+            parts.extend(_extract_text_from_value(v))
+        return parts
+    return []
+
+
+def _tokenize_for_overlap(text: str) -> set[str]:
+    """Lowercase, split on whitespace, remove stop words."""
+    return {w for w in text.lower().split() if w not in _STOP_WORDS and len(w) > 1}
+
+
+def _extract_tool_result_tokens(content: str) -> set[str]:
+    """Extract tokens from a tool result, handling JSON payloads."""
+    try:
+        parsed = json.loads(content)
+        text_parts = _extract_text_from_value(parsed)
+        return _tokenize_for_overlap(" ".join(text_parts))
+    except (json.JSONDecodeError, TypeError):
+        return _tokenize_for_overlap(content)
+
+
+def filter_tool_result_relay(
+    examples: list[TrainingExample],
+    *,
+    overlap_threshold: float = 0.5,
+) -> FilterResult:
+    """Filter out turns that mostly relay a preceding tool result.
+
+    An example is dropped when the assistant's text completion has high
+    token overlap with any preceding tool result and the completion
+    contains no tool calls of its own.
+    """
+    kept: list[TrainingExample] = []
+    dropped: list[tuple[TrainingExample, DropReason]] = []
+
+    for ex in examples:
+        # Skip if completion has tool calls (it's making a new decision)
+        has_tool_calls = any(
+            msg.tool_calls for msg in ex.completion_messages
+        )
+        if has_tool_calls:
+            kept.append(ex)
+            continue
+
+        # Collect all tool result messages from prompt
+        tool_token_sets: list[set[str]] = []
+        for msg in ex.prompt_messages:
+            if msg.role == "tool" and msg.content:
+                tool_token_sets.append(_extract_tool_result_tokens(msg.content))
+
+        if not tool_token_sets:
+            kept.append(ex)
+            continue
+
+        # Tokenize completion
+        completion_text = ex.completion_messages[0].content if ex.completion_messages else ""
+        completion_tokens = _tokenize_for_overlap(completion_text)
+
+        if not completion_tokens:
+            kept.append(ex)
+            continue
+
+        # Max overlap against any single tool result
+        max_overlap = max(
+            len(completion_tokens & tool_tokens) / len(completion_tokens)
+            for tool_tokens in tool_token_sets
+            if tool_tokens
+        ) if any(tool_token_sets) else 0.0
+
+        if max_overlap > overlap_threshold:
+            dropped.append((ex, DropReason("tool_relay", "relay")))
+        else:
+            kept.append(ex)
+
+    return FilterResult(kept=kept, dropped=dropped)
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+_ENTITY_PATTERNS = [
+    (re.compile(r"\b[A-Z]{2,}\d+\b"), "<ID>"),
+    (re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"), "<DATE>"),
+    (re.compile(r"\$[\d,.]+"), "<PRICE>"),
+    (re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"), "<EMAIL>"),
+    (re.compile(r"\b\d{3,}\b"), "<NUM>"),
+]
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Normalize completion text for dedup comparison."""
+    text = text.lower()
+    for pattern, replacement in _ENTITY_PATTERNS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _trigram_jaccard(a: str, b: str) -> float:
+    """Character trigram Jaccard similarity."""
+    if len(a) < 3 or len(b) < 3:
+        return 1.0 if a == b else 0.0
+    ta = {a[i : i + 3] for i in range(len(a) - 2)}
+    tb = {b[i : i + 3] for i in range(len(b) - 2)}
+    intersection = len(ta & tb)
+    union = len(ta | tb)
+    return intersection / union if union else 0.0
+
+
+def deduplicate_completions(
+    examples: list[TrainingExample],
+    *,
+    similarity_threshold: float = 0.85,
+    max_per_cluster: int = 3,
+) -> FilterResult:
+    """Remove near-duplicate completions via trigram Jaccard clustering.
+
+    Canonical sort by ``(trace_id, turn_index)`` ensures deterministic
+    results regardless of input order.
+    """
+    # Canonical sort for determinism
+    sorted_examples = sorted(examples, key=lambda ex: (ex.trace_id, ex.turn_index))
+
+    # Normalize completions
+    normalized: list[tuple[int, str]] = []
+    for i, ex in enumerate(sorted_examples):
+        text = ex.completion_messages[0].content if ex.completion_messages else ""
+        normalized.append((i, _normalize_for_dedup(text)))
+
+    # Greedy clustering
+    clusters: list[list[int]] = []
+    cluster_reps: list[str] = []  # normalized text of cluster representative
+
+    for idx, norm in normalized:
+        placed = False
+        for ci, rep in enumerate(cluster_reps):
+            if _trigram_jaccard(norm, rep) > similarity_threshold:
+                clusters[ci].append(idx)
+                placed = True
+                break
+        if not placed:
+            clusters.append([idx])
+            cluster_reps.append(norm)
+
+    # Keep max_per_cluster from each cluster
+    keep_indices: set[int] = set()
+    cluster_map: dict[int, int] = {}  # example index → cluster id
+    for ci, cluster in enumerate(clusters):
+        for i, idx in enumerate(cluster):
+            if i < max_per_cluster:
+                keep_indices.add(idx)
+            else:
+                cluster_map[idx] = ci
+
+    kept: list[TrainingExample] = []
+    dropped: list[tuple[TrainingExample, DropReason]] = []
+    for i, ex in enumerate(sorted_examples):
+        if i in keep_indices:
+            kept.append(ex)
+        else:
+            dropped.append(
+                (ex, DropReason("dedup", "duplicate", f"cluster_{cluster_map[i]}"))
+            )
+
+    return FilterResult(kept=kept, dropped=dropped)
+
+
+# ---------------------------------------------------------------------------
+# Outcome balance diagnostic
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OutcomeBalance:
+    """Dataset outcome balance diagnostic."""
+
+    total: int
+    success_count: int
+    failure_count: int
+    unknown_count: int
+    failure_fraction: float
+    is_balanced: bool
+    message: str | None
+
+
+def check_outcome_balance(
+    examples: list[TrainingExample],
+    *,
+    score_name: str = "task_success",
+    success_threshold: float = 0.5,
+    min_failure_fraction: float = 0.15,
+) -> OutcomeBalance:
+    """Check success/failure balance for GRPO training.
+
+    An example is a success if ``scores[score_name] >= success_threshold``,
+    failure if below.  Examples missing the score are ``unknown``.
+
+    This is advisory — it does NOT filter.
+    """
+    success = 0
+    failure = 0
+    unknown = 0
+
+    for ex in examples:
+        score = ex.scores.get(score_name)
+        if score is None:
+            unknown += 1
+        elif score >= success_threshold:
+            success += 1
+        else:
+            failure += 1
+
+    scored = success + failure
+    fraction = failure / scored if scored else 0.0
+    is_balanced = fraction >= min_failure_fraction
+
+    message = None
+    if not is_balanced and scored > 0:
+        message = (
+            f"Only {fraction:.1%} failure traces (need >= {min_failure_fraction:.0%}). "
+            f"GRPO needs reward variance — consider collecting more failure cases "
+            f"or downsampling successes."
+        )
+
+    return OutcomeBalance(
+        total=len(examples),
+        success_count=success,
+        failure_count=failure,
+        unknown_count=unknown,
+        failure_fraction=fraction,
+        is_balanced=is_balanced,
+        message=message,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Filter composition
+# ---------------------------------------------------------------------------
+
+_DATASET_LEVEL_FILTERS = {"dedup"}
+
+
+def apply_filters(
+    examples: list[TrainingExample],
+    steps: list[tuple[str, dict[str, Any]]],
+) -> FilterResult:
+    """Run named filters in sequence, accumulate all drops.
+
+    Each step is ``(filter_name, kwargs_dict)``.  Per-example filters run
+    first, then dataset-level filters, regardless of input order.
+
+    Supported filters: ``"heuristic"``, ``"tool_relay"``, ``"tool_calls"``,
+    ``"dedup"``.
+    """
+    registry: dict[str, Callable[..., FilterResult]] = {
+        "heuristic": apply_heuristic_filters,
+        "tool_relay": filter_tool_result_relay,
+        "tool_calls": filter_by_tool_calls,
+        "dedup": deduplicate_completions,
+    }
+
+    # Partition into per-example and dataset-level, preserving relative order
+    per_example_steps = [(n, kw) for n, kw in steps if n not in _DATASET_LEVEL_FILTERS]
+    dataset_steps = [(n, kw) for n, kw in steps if n in _DATASET_LEVEL_FILTERS]
+    ordered = per_example_steps + dataset_steps
+
+    all_dropped: list[tuple[TrainingExample, DropReason]] = []
+    current = list(examples)
+
+    for name, kwargs in ordered:
+        fn = registry.get(name)
+        if fn is None:
+            available = ", ".join(sorted(registry))
+            raise ValueError(f"Unknown filter {name!r}. Available: {available}")
+        result = fn(current, **kwargs)
+        all_dropped.extend(result.dropped)
+        current = result.kept
+
+    return FilterResult(kept=current, dropped=all_dropped)
 
 
 def apply_score_filter(
