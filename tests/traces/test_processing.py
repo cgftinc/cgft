@@ -10,13 +10,20 @@ from cgft.traces.adapter import (
 from cgft.traces.processing import (
     MIN_TRAIN_SAMPLES,
     VALID_IDENTIFIER_RE,
+    DropReason,
     FilterResult,
+    OutcomeBalance,
     TrainingExample,
+    apply_filters,
     apply_heuristic_filters,
     apply_score_filter,
     build_training_examples,
+    check_outcome_balance,
+    deduplicate_completions,
     detect_system_prompt,
     detect_tools,
+    filter_by_tool_calls,
+    filter_tool_result_relay,
     split_dataset,
 )
 
@@ -340,18 +347,7 @@ class TestHeuristicFilters:
         result = apply_heuristic_filters(examples, min_completion_chars=50)
         assert len(result.kept) == 1
         assert len(result.dropped) == 1
-        assert result.dropped[0][1] == "too_short"
-
-    def test_auth_filter_off_by_default(self):
-        examples = [self._make_example("Please authenticate with OAuth bearer token to proceed.")]
-        result = apply_heuristic_filters(examples)
-        assert len(result.kept) == 1  # not dropped
-
-    def test_auth_filter_when_enabled(self):
-        examples = [self._make_example("Please authenticate with OAuth bearer token to proceed.")]
-        result = apply_heuristic_filters(examples, drop_auth_lookups=True)
-        assert len(result.kept) == 0
-        assert result.dropped[0][1] == "auth_lookup"
+        assert result.dropped[0][1].reason == "too_short"
 
     def test_summary(self):
         examples = [
@@ -360,7 +356,113 @@ class TestHeuristicFilters:
             self._make_example("A" * 100),
         ]
         result = apply_heuristic_filters(examples, min_completion_chars=50)
-        assert result.summary == {"too_short": 2}
+        assert result.summary == {"heuristic": 2}
+
+
+class TestFilterByToolCalls:
+    def _make_tool_example(
+        self, tool_name: str, content: str = ""
+    ) -> TrainingExample:
+        return TrainingExample(
+            prompt_messages=[_msg("user", "Q")],
+            completion_messages=[
+                TraceMessage(
+                    role="assistant",
+                    content=content,
+                    tool_calls=[ToolCall(name=tool_name, arguments="{}")],
+                )
+            ],
+            prompt="[USER] Q",
+            ground_truth=f"tool_call: {tool_name}",
+            trace_id="t1",
+            turn_index=0,
+        )
+
+    def _make_text_example(self, content: str) -> TrainingExample:
+        return TrainingExample(
+            prompt_messages=[_msg("user", "Q")],
+            completion_messages=[_msg("assistant", content)],
+            prompt="[USER] Q",
+            ground_truth=content,
+            trace_id="t1",
+            turn_index=0,
+        )
+
+    def test_drops_excluded_tool_calls(self):
+        examples = [
+            self._make_tool_example("get_user_details"),
+            self._make_tool_example("process_refund"),
+        ]
+        result = filter_by_tool_calls(examples, ["get_user_details"])
+        assert len(result.kept) == 1
+        assert len(result.dropped) == 1
+        assert result.dropped[0][1].detail == "get_user_details"
+
+    def test_keeps_non_excluded_tools(self):
+        examples = [self._make_tool_example("process_refund")]
+        result = filter_by_tool_calls(examples, ["get_user_details"])
+        assert len(result.kept) == 1
+        assert len(result.dropped) == 0
+
+    def test_keeps_examples_without_tool_calls(self):
+        examples = [self._make_text_example("Here is a detailed response " * 5)]
+        result = filter_by_tool_calls(examples, ["get_user_details"])
+        assert len(result.kept) == 1
+
+    def test_keeps_excluded_tool_with_substantive_text(self):
+        examples = [self._make_tool_example("get_user_details", "A" * 100)]
+        result = filter_by_tool_calls(examples, ["get_user_details"])
+        assert len(result.kept) == 1
+
+    def test_empty_exclude_list_keeps_all(self):
+        examples = [
+            self._make_tool_example("get_user_details"),
+            self._make_tool_example("process_refund"),
+        ]
+        result = filter_by_tool_calls(examples, [])
+        assert len(result.kept) == 2
+
+    def test_multiple_tools_all_excluded(self):
+        ex = TrainingExample(
+            prompt_messages=[_msg("user", "Q")],
+            completion_messages=[
+                TraceMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(name="get_user", arguments="{}"),
+                        ToolCall(name="get_order", arguments="{}"),
+                    ],
+                )
+            ],
+            prompt="[USER] Q",
+            ground_truth="tools",
+            trace_id="t1",
+            turn_index=0,
+        )
+        result = filter_by_tool_calls([ex], ["get_user", "get_order"])
+        assert len(result.dropped) == 1
+
+    def test_multiple_tools_partially_excluded(self):
+        ex = TrainingExample(
+            prompt_messages=[_msg("user", "Q")],
+            completion_messages=[
+                TraceMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(name="get_user", arguments="{}"),
+                        ToolCall(name="process_refund", arguments="{}"),
+                    ],
+                )
+            ],
+            prompt="[USER] Q",
+            ground_truth="tools",
+            trace_id="t1",
+            turn_index=0,
+        )
+        result = filter_by_tool_calls([ex], ["get_user"])
+        assert len(result.kept) == 1
 
 
 class TestScoreFilter:
@@ -475,6 +577,296 @@ class TestSplitDataset:
         assert "init_rollout_args" in row
         assert "trace_id" in row["init_rollout_args"]
         assert "turn_index" in row["init_rollout_args"]
+
+
+# ---------------------------------------------------------------------------
+# Tool result relay filter
+# ---------------------------------------------------------------------------
+
+
+class TestFilterToolResultRelay:
+    def _make_relay_example(
+        self,
+        tool_result: str,
+        completion: str,
+        has_tool_calls: bool = False,
+    ) -> TrainingExample:
+        completion_msg = TraceMessage(
+            role="assistant",
+            content=completion,
+            tool_calls=[ToolCall(name="next_step", arguments="{}")] if has_tool_calls else None,
+        )
+        return TrainingExample(
+            prompt_messages=[
+                _msg("user", "Check my order"),
+                TraceMessage(role="tool", content=tool_result, name="get_order"),
+            ],
+            completion_messages=[completion_msg],
+            prompt="[USER] Check my order",
+            ground_truth=completion,
+            trace_id="t1",
+            turn_index=1,
+        )
+
+    def test_detects_relay(self):
+        ex = self._make_relay_example(
+            "Order ORD-123 shipped March 15 expected delivery April 10",
+            "Order ORD-123 shipped March 15 expected delivery April 10 confirmed",
+        )
+        result = filter_tool_result_relay([ex])
+        assert len(result.dropped) == 1
+        assert result.dropped[0][1].filter == "tool_relay"
+
+    def test_keeps_non_relay(self):
+        ex = self._make_relay_example(
+            "Order ORD-123 shipped on March 15",
+            "I see your order is on its way. Would you like me to set up a delivery notification?",
+        )
+        result = filter_tool_result_relay([ex])
+        assert len(result.kept) == 1
+
+    def test_keeps_when_no_tool_result(self):
+        ex = TrainingExample(
+            prompt_messages=[_msg("user", "Hello")],
+            completion_messages=[_msg("assistant", "Hi there, how can I help?")],
+            prompt="[USER] Hello",
+            ground_truth="Hi there",
+            trace_id="t1",
+            turn_index=0,
+        )
+        result = filter_tool_result_relay([ex])
+        assert len(result.kept) == 1
+
+    def test_keeps_completion_with_tool_calls(self):
+        ex = self._make_relay_example(
+            "Order ORD-123 shipped",
+            "Order ORD-123 shipped",
+            has_tool_calls=True,
+        )
+        result = filter_tool_result_relay([ex])
+        assert len(result.kept) == 1
+
+    def test_handles_json_tool_result(self):
+        ex = self._make_relay_example(
+            '{"order_id": "ORD-123", "status": "shipped", "date": "March 15"}',
+            "ORD-123 shipped March 15",
+        )
+        result = filter_tool_result_relay([ex])
+        assert len(result.dropped) == 1
+
+    def test_threshold_boundary(self):
+        ex = self._make_relay_example(
+            "alpha bravo charlie delta echo foxtrot",
+            "alpha bravo charlie completely different content here more words",
+        )
+        # With threshold 0.9, low overlap should be kept
+        result = filter_tool_result_relay([ex], overlap_threshold=0.9)
+        assert len(result.kept) == 1
+
+    def test_max_overlap_across_multiple_tool_results(self):
+        ex = TrainingExample(
+            prompt_messages=[
+                _msg("user", "Check both"),
+                TraceMessage(role="tool", content="Result alpha bravo charlie", name="tool_a"),
+                TraceMessage(role="tool", content="Completely different data here", name="tool_b"),
+            ],
+            completion_messages=[_msg("assistant", "alpha bravo charlie delta")],
+            prompt="prompt",
+            ground_truth="gt",
+            trace_id="t1",
+            turn_index=1,
+        )
+        result = filter_tool_result_relay([ex])
+        assert len(result.dropped) == 1  # matches tool_a
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+
+class TestDeduplicateCompletions:
+    def _make_example(self, content: str, trace_id: str = "t1", turn: int = 0) -> TrainingExample:
+        return TrainingExample(
+            prompt_messages=[_msg("user", "Q")],
+            completion_messages=[_msg("assistant", content)],
+            prompt="Q",
+            ground_truth=content,
+            trace_id=trace_id,
+            turn_index=turn,
+        )
+
+    def test_exact_duplicates_clustered(self):
+        examples = [
+            self._make_example("Your order has been shipped", f"t{i}", 0)
+            for i in range(10)
+        ]
+        result = deduplicate_completions(examples, max_per_cluster=3)
+        assert len(result.kept) == 3
+        assert len(result.dropped) == 7
+
+    def test_near_duplicates_caught(self):
+        examples = [
+            self._make_example("Your order number 12345 has been shipped successfully today", "t1", 0),
+            self._make_example("Your order number 67890 has been shipped successfully today", "t2", 0),
+            self._make_example("Your order number 11111 has been shipped successfully today", "t3", 0),
+            self._make_example("Your order number 22222 has been shipped successfully today", "t4", 0),
+        ]
+        result = deduplicate_completions(examples, max_per_cluster=2)
+        assert len(result.kept) == 2
+        assert len(result.dropped) == 2
+
+    def test_unique_completions_kept(self):
+        examples = [
+            self._make_example("I will process your refund immediately", "t1", 0),
+            self._make_example("Let me check your account settings for you", "t2", 0),
+            self._make_example("The exchange has been initiated successfully", "t3", 0),
+        ]
+        result = deduplicate_completions(examples)
+        assert len(result.kept) == 3
+
+    def test_deterministic_regardless_of_input_order(self):
+        examples = [
+            self._make_example("Same response here", f"t{i}", 0)
+            for i in range(5)
+        ]
+        import random
+        shuffled = list(examples)
+        random.Random(99).shuffle(shuffled)
+        r1 = deduplicate_completions(examples, max_per_cluster=2)
+        r2 = deduplicate_completions(shuffled, max_per_cluster=2)
+        kept_ids_1 = {(e.trace_id, e.turn_index) for e in r1.kept}
+        kept_ids_2 = {(e.trace_id, e.turn_index) for e in r2.kept}
+        assert kept_ids_1 == kept_ids_2
+
+    def test_drop_reason_has_cluster_id(self):
+        examples = [
+            self._make_example("Same thing", f"t{i}", 0)
+            for i in range(5)
+        ]
+        result = deduplicate_completions(examples, max_per_cluster=1)
+        for _, reason in result.dropped:
+            assert reason.filter == "dedup"
+            assert reason.reason == "duplicate"
+            assert reason.detail is not None
+            assert reason.detail.startswith("cluster_")
+
+
+# ---------------------------------------------------------------------------
+# Outcome balance
+# ---------------------------------------------------------------------------
+
+
+class TestCheckOutcomeBalance:
+    def _make_scored_example(self, score: float | None) -> TrainingExample:
+        scores = {"task_success": score} if score is not None else {}
+        return TrainingExample(
+            prompt_messages=[_msg("user", "Q")],
+            completion_messages=[_msg("assistant", "A")],
+            prompt="Q",
+            ground_truth="A",
+            trace_id="t1",
+            turn_index=0,
+            scores=scores,
+        )
+
+    def test_balanced_dataset(self):
+        examples = [self._make_scored_example(1.0)] * 7 + [self._make_scored_example(0.0)] * 3
+        balance = check_outcome_balance(examples)
+        assert balance.is_balanced
+        assert balance.message is None
+        assert balance.success_count == 7
+        assert balance.failure_count == 3
+
+    def test_imbalanced_dataset(self):
+        examples = [self._make_scored_example(1.0)] * 19 + [self._make_scored_example(0.0)] * 1
+        balance = check_outcome_balance(examples)
+        assert not balance.is_balanced
+        assert balance.message is not None
+        assert "5.0%" in balance.message
+
+    def test_missing_scores(self):
+        examples = [self._make_scored_example(None)] * 5
+        balance = check_outcome_balance(examples)
+        assert balance.unknown_count == 5
+        assert balance.failure_fraction == 0.0
+        assert balance.is_balanced is True
+        assert balance.message is not None
+        assert "not applicable" in balance.message
+
+    def test_custom_threshold(self):
+        examples = [self._make_scored_example(0.8)] * 8 + [self._make_scored_example(0.3)] * 2
+        balance = check_outcome_balance(examples, success_threshold=0.5)
+        assert balance.success_count == 8
+        assert balance.failure_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Filter composition
+# ---------------------------------------------------------------------------
+
+
+class TestApplyFilters:
+    def _make_examples(self, n: int, content_len: int = 100) -> list[TrainingExample]:
+        return [
+            TrainingExample(
+                prompt_messages=[_msg("user", f"Q{i}")],
+                completion_messages=[_msg("assistant", f"A{i}" + "x" * content_len)],
+                prompt=f"Q{i}",
+                ground_truth=f"A{i}",
+                trace_id=f"t{i}",
+                turn_index=0,
+            )
+            for i in range(n)
+        ]
+
+    def test_accumulates_drops(self):
+        examples = [
+            TrainingExample(
+                prompt_messages=[_msg("user", "Q")],
+                completion_messages=[_msg("assistant", "OK")],  # too short
+                prompt="Q", ground_truth="OK", trace_id="t0", turn_index=0,
+            ),
+        ] + self._make_examples(5)
+
+        result = apply_filters(examples, [("heuristic", {"min_completion_chars": 50})])
+        assert len(result.dropped) == 1
+        assert result.summary == {"heuristic": 1}
+
+    def test_multiple_stages(self):
+        examples = [
+            TrainingExample(
+                prompt_messages=[_msg("user", "Q")],
+                completion_messages=[_msg("assistant", "OK")],  # 2 chars, dropped by heuristic
+                prompt="Q", ground_truth="OK", trace_id="t0", turn_index=0,
+            ),
+            TrainingExample(
+                prompt_messages=[_msg("user", "Q")],
+                completion_messages=[
+                    TraceMessage(role="assistant", content="Looking up user",  # 15 chars, survives heuristic(10)
+                                 tool_calls=[ToolCall(name="get_user", arguments="{}")])
+                ],
+                prompt="Q", ground_truth="tool", trace_id="t1", turn_index=0,
+            ),
+        ] + self._make_examples(3, content_len=100)
+
+        result = apply_filters(examples, [
+            ("heuristic", {"min_completion_chars": 10}),
+            ("tool_calls", {"exclude_tools": ["get_user"]}),
+        ])
+        assert result.summary == {"heuristic": 1, "tool_calls": 1}
+        assert len(result.kept) == 3
+
+    def test_unknown_filter_raises(self):
+        with pytest.raises(ValueError, match="Unknown filter"):
+            apply_filters([], [("nonexistent", {})])
+
+    def test_rejects_bad_ordering(self):
+        with pytest.raises(ValueError, match="Per-example filter.*after dataset-level"):
+            apply_filters([], [
+                ("dedup", {}),
+                ("heuristic", {"min_completion_chars": 50}),
+            ])
 
 
 class TestValidIdentifierRegex:
