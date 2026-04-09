@@ -199,6 +199,10 @@ class TpufChunkSource:
     # Sampling
     # ------------------------------------------------------------------
 
+    def get_chunk_count(self) -> int:
+        """Return the total number of chunks in the namespace."""
+        return self._client.get_max_id() or 0
+
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
         """Return n randomly sampled chunks, optionally filtered by minimum length.
 

@@ -278,6 +278,10 @@ class ChromaChunkSource:
     # Sampling
     # ------------------------------------------------------------------
 
+    def get_chunk_count(self) -> int:
+        """Return the total number of chunks in the collection."""
+        return self._chroma.get_total_count()
+
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
         """Return n randomly sampled chunks, optionally filtered by length."""
         total = self._chroma.get_total_count()

@@ -234,6 +234,12 @@ class PineconeChunkSource:
     # Sampling
     # ------------------------------------------------------------------
 
+    def get_chunk_count(self) -> int:
+        """Return the total number of vectors in the index."""
+        index = self._client._get_index()
+        stats = index.describe_index_stats()
+        return int(stats.total_vector_count or 0)
+
     def sample_chunks(self, n: int, min_chars: int = 0) -> list[Chunk]:
         """Return n randomly sampled chunks, optionally filtered by
         minimum length.

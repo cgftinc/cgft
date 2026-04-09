@@ -72,6 +72,8 @@ _DEFAULT_TEMPLATE = (
     "Example queries:\n{corpus_queries}\n\n"
     "Primary chunk:\n{primary_chunk}\n\n"
     "Secondary chunks:\n{secondary_chunks}\n\n"
+    "[[if evidence_chain]]How these chunks connect (from linking analysis):\n"
+    "{evidence_chain}\n\n[[endif]]"
     "[[if failed_question]]Failed question:\n{failed_question}\n\n[[endif]]"
     "[[if failed_answer]]Failed answer:\n{failed_answer}\n\n[[endif]]"
     "[[if regeneration_prompt]]Feedback:\n{regeneration_prompt}\n\n[[endif]]"
@@ -451,6 +453,11 @@ class DirectLLMGenerator:
                     else f"[0] {anchor.primary_chunk!s}"
                 ),
                 "secondary_chunks": _format_secondary_chunks(anchor),
+                "evidence_chain": (
+                    anchor.structural_hints.get("evidence_chain", "")
+                    if hasattr(anchor, "structural_hints")
+                    else ""
+                ),
             }
             prompt = _render_template_safe(template, variables)
             system_prompt = _render_template_safe(self.cfg.system_prompt, variables)

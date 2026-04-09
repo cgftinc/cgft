@@ -25,7 +25,6 @@ from tqdm.auto import tqdm as _tqdm
 
 from cgft.corpus.corpora.source import CorporaChunkSource
 from cgft.qa_generation.auto_tune import (
-    CorpusStats,
     auto_tune,
     compute_batch_heuristics,
     emit_corpus_warnings,
@@ -41,11 +40,16 @@ from cgft.qa_generation.cgft_models import (
 )
 from cgft.qa_generation.corpus_profile import (
     CorpusProfile,
+    _get_doc_id,
     build_entity_patterns_from_extraction,
+    compute_chunk_suitability,
     compute_entity_document_frequency,
+    compute_header_prevalence,
+    compute_metadata_census,
     compute_token_document_frequency,
     detect_search_capabilities,
     diverse_profile_sample,
+    select_diverse,
 )
 from cgft.qa_generation.filters import (
     DeterministicGuardsFilter,
@@ -101,6 +105,64 @@ Return JSON only:
   "query_templates": ["{{entity}} setup", "configure {{entity}}", "{{entity}} guide"],
   "confidence": "high"
 }}"""
+
+_ENTITY_CONSOLIDATION_SYSTEM_PROMPT = (
+    "You are an expert at organizing and consolidating entity lists extracted from a document corpus."  # noqa: E501
+)
+
+_ENTITY_CONSOLIDATION_USER_TEMPLATE = """\
+You are organizing entity candidates extracted from a corpus.
+
+Corpus description: {corpus_description}
+{language_note}
+The following candidates were extracted from the corpus text using statistical methods \
+(TF-IDF, capitalized phrases, frequent n-grams).
+
+<candidates>
+{candidates_text}
+</candidates>
+
+<sample_chunks>
+{chunk_samples}
+</sample_chunks>
+
+Tasks:
+1. Merge only exact duplicates and clear near-duplicates (singular/plural, hyphenation variants) \
+into canonical forms. Always prefer the form that appears most frequently.
+2. Classify each into one of three categories:
+   - entity_names: named things (products, tools, APIs, teams, people, organizations)
+   - code_patterns: code references — provide a regex pattern for each
+   - domain_terms: domain concepts, processes, methodologies, technical terms
+3. Rank by domain importance (most central to the corpus first).
+4. Add up to 15 important entities you notice in the sample chunks that the candidates missed.
+
+Do NOT remove candidates for being "low quality" or "generic". All candidates were statistically \
+extracted and will be filtered downstream by document frequency. Your only job is to merge \
+duplicates, classify, and augment.
+
+Return a JSON object:
+{{
+  "entity_names": ["Entity1", "Entity2", ...],
+  "code_patterns": {{"category": "regex_pattern", ...}},
+  "domain_terms": ["term1", "term2", ...],
+  "query_templates": ["search query template 1", ...],
+  "confidence": "high" | "medium" | "low"
+}}
+
+Important: Use the EXACT text forms from the candidates list. Do not rephrase or conceptualize them."""  # noqa: E501
+
+
+def _format_heuristic_candidates(candidates: list) -> str:
+    """Format heuristic entity candidates grouped by type for the consolidation prompt."""
+    by_type: dict[str, list[str]] = {"entity": [], "domain_term": [], "code_pattern": []}
+    for c in candidates:
+        by_type.get(c.type, by_type["domain_term"]).append(c.name)
+    parts = []
+    for label, names in by_type.items():
+        if names:
+            parts.append(f"{label}s ({len(names)}):\n" + "\n".join(f"  - {n}" for n in names))
+    return "\n\n".join(parts)
+
 
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
 _GROUNDING_FILTER_STAGE = "grounding_llm"
@@ -381,6 +443,7 @@ def _mark_rejected(items: list[GeneratedQA], *, reason: str, reason_code: str) -
 def _serialize_qa_with_filter_details(item: GeneratedQA) -> dict[str, Any]:
     row = dict(item.qa)
     row["journey_events"] = list(item.journey_events)
+    row["generation_metadata"] = dict(item.generation_metadata)
     verdict = item.filter_verdict
     if verdict is None:
         return row
@@ -1084,16 +1147,24 @@ def _generate_entity_extraction_patterns(
     cfg: CgftPipelineConfig,
     source: Any,
     context: CgftContext,
+    heuristic_candidates: list | None = None,
 ) -> EntityExtractionConfig | None:
-    """Generate entity extraction patterns from corpus samples via LLM."""
+    """Generate entity extraction patterns from corpus samples via LLM.
+
+    When ``heuristic_candidates`` are provided (Phase 1a output), the LLM consolidates
+    them rather than discovering entities from scratch.  This produces higher-fidelity
+    entity names because the candidates are guaranteed to appear in the corpus text.
+    Falls back to the discovery prompt when no candidates are supplied.
+    """
     profile_cfg = cfg.corpus_context
     samples: list[Any] = []
 
     corpus_pool: list[Any] = context.get("corpus_pool", []) or []
     if corpus_pool:
         rng = context.rng
-        n = min(8, len(corpus_pool))
-        samples = rng.sample(corpus_pool, n)
+        use_consolidation = bool(heuristic_candidates)
+        n = min(15 if use_consolidation else 50, len(corpus_pool))
+        samples = select_diverse(corpus_pool, n, rng=rng, stratify_key=_get_doc_id)
 
     if not samples:
         return None
@@ -1101,7 +1172,26 @@ def _generate_entity_extraction_patterns(
     chunk_samples_text = "\n\n---\n\n".join(
         chunk.chunk_str() if hasattr(chunk, "chunk_str") else str(chunk) for chunk in samples
     )
-    user_prompt = _ENTITY_EXTRACTION_USER_TEMPLATE.format(chunk_samples=chunk_samples_text)
+
+    if heuristic_candidates:
+        candidates_text = _format_heuristic_candidates(heuristic_candidates)
+        corpus_description = context.get("corpus_description", "")
+        corpus_language = str(context.get("corpus_language", "") or "").strip()
+        language_note = (
+            f"\nLanguage: {corpus_language}. Candidates and chunks are in "
+            f"{corpus_language} — evaluate them in that language.\n"
+            if corpus_language else ""
+        )
+        user_prompt = _ENTITY_CONSOLIDATION_USER_TEMPLATE.format(
+            corpus_description=corpus_description,
+            candidates_text=candidates_text,
+            chunk_samples=chunk_samples_text,
+            language_note=language_note,
+        )
+        system_prompt = _ENTITY_CONSOLIDATION_SYSTEM_PROMPT
+    else:
+        user_prompt = _ENTITY_EXTRACTION_USER_TEMPLATE.format(chunk_samples=chunk_samples_text)
+        system_prompt = _ENTITY_EXTRACTION_SYSTEM_PROMPT
 
     try:
         entity_llm_cfg = profile_cfg.entity_extraction_llm
@@ -1113,7 +1203,7 @@ def _generate_entity_extraction_patterns(
             client=client,
             model=entity_llm_cfg.model,
             messages=[
-                {"role": "system", "content": _ENTITY_EXTRACTION_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
@@ -1184,21 +1274,34 @@ def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftCon
             logger.exception("Failed to fetch top-level chunks for corpus profiling.")
             top_level_chunks = []
 
+    corpus_pool: list[Any] = context.get("corpus_pool", []) or []
+
     sampled_top_level = []
     if top_level_chunks and profile_cfg.num_top_level_samples > 0:
         sample_count = min(profile_cfg.num_top_level_samples, len(top_level_chunks))
-        sampled_top_level = context.rng.sample(top_level_chunks, sample_count)
+        sampled_top_level = select_diverse(
+            top_level_chunks, sample_count, rng=context.rng, stratify_key=_get_doc_id
+        )
 
     sampled_random = []
     if profile_cfg.num_random_samples > 0:
-        try:
-            sampled_random = source.sample_chunks(
+        pool_for_random = corpus_pool or []
+        if pool_for_random:
+            sampled_random = select_diverse(
+                pool_for_random,
                 profile_cfg.num_random_samples,
-                min_chars=profile_cfg.min_chunk_chars,
+                rng=context.rng,
+                stratify_key=_get_doc_id,
             )
-        except Exception:
-            logger.exception("Failed to fetch random chunks for corpus profiling.")
-            sampled_random = []
+        else:
+            try:
+                sampled_random = source.sample_chunks(
+                    profile_cfg.num_random_samples,
+                    min_chars=profile_cfg.min_chunk_chars,
+                )
+            except Exception:
+                logger.exception("Failed to fetch random chunks for corpus profiling.")
+                sampled_random = []
 
     variables = {
         "user_context": (
@@ -1304,33 +1407,29 @@ class CgftPipeline:
         context = CgftContext(config=cfg, source=source, rng=rng)
 
         _print_progress("[1/6] Loading chunks from corpus...", verbose=cfg.verbose)
-        seed_chunks = source.sample_chunks(
-            cfg.targets.total_samples, min_chars=cfg.corpus.min_chunk_chars
-        )
-        if not seed_chunks and getattr(source, "collection", None) is not None:
-            seed_chunks = list(source.collection)[: cfg.targets.total_samples]
-        if not seed_chunks:
-            raise RuntimeError("No eligible chunks were found for CgftPipeline generation.")
-        _print_progress(
-            f"[1/6] Loaded {len(seed_chunks)} seed chunks from corpus", verbose=cfg.verbose
-        )
+        try:
+            chunk_count = source.get_chunk_count()
+        except AttributeError:
+            chunk_count = cfg.targets.total_samples * 10
 
-        # Build diverse profile sample for stages 2-3 (NOT for linker selection).
-        pool_size = max(200, len(seed_chunks))
         profile_sample = diverse_profile_sample(
             source,
-            sample_size=pool_size,
+            corpus_size=chunk_count,
             min_chars=cfg.corpus.min_chunk_chars,
             rng=rng,
         )
         if not profile_sample:
-            profile_sample = list(seed_chunks)
+            raise RuntimeError("No eligible chunks were found for CgftPipeline generation.")
+        _print_progress(
+            f"[1/6] Loaded {len(profile_sample)} profile chunks from corpus", verbose=cfg.verbose
+        )
+        header_prevalence = compute_header_prevalence(profile_sample)
+        logger.debug(
+            "Header prevalence: %.2f (pool size %d)", header_prevalence, len(profile_sample)
+        )
 
-        # Keep corpus_pool in context for backward compatibility.
-        corpus_pool = profile_sample
-        context["seed_chunk_lookup"] = {chunk.hash: chunk for chunk in seed_chunks}
+        context["seed_chunk_lookup"] = {chunk.hash: chunk for chunk in profile_sample}
         context["corpus_pool"] = profile_sample
-        context["seed_chunks"] = seed_chunks
         context["corpus_language"] = str(cfg.corpus_context.language or "").strip()
         # Detect search capabilities from source.
         search_modes, best_search_mode = detect_search_capabilities(source)
@@ -1340,8 +1439,21 @@ class CgftPipeline:
         _print_progress("[2/6] Built corpus profile", verbose=cfg.verbose)
 
         if cfg.corpus_context.generate_entity_patterns:
-            _print_progress("[3/6] Generating entity patterns...", verbose=cfg.verbose)
-            extraction = _generate_entity_extraction_patterns(cfg, source, context)
+            _print_progress("[3/6] Extracting entity patterns...", verbose=cfg.verbose)
+
+            # Phase 1a: Heuristic extraction (deterministic, zero LLM cost)
+            from cgft.qa_generation.corpus_profile import extract_heuristic_entities
+
+            heuristic_entities = extract_heuristic_entities(profile_sample)
+            logger.info(
+                "Phase 1a heuristic extraction: %d candidates",
+                len(heuristic_entities),
+            )
+
+            # Phase 2: LLM consolidation (consolidates heuristic candidates)
+            extraction = _generate_entity_extraction_patterns(
+                cfg, source, context, heuristic_candidates=heuristic_entities,
+            )
             if extraction is not None:
                 cfg.corpus_context.entity_extraction = extraction
                 logger.info(
@@ -1398,14 +1510,21 @@ class CgftPipeline:
         context.profile = profile
 
         # --- Corpus-aware auto-tuning and warnings ---
-        corpus_stats = CorpusStats.from_source(source)
-        context["corpus_stats"] = corpus_stats
+        _entity_names = profile.get_entity_names(discriminative_only=False)
+        census = compute_metadata_census(profile_sample, _entity_names, chunk_count)
+        profile.census = census
+        for _chunk in profile_sample:
+            _hash = getattr(_chunk, "hash", str(id(_chunk)))
+            profile.chunk_suitability_scores[_hash] = compute_chunk_suitability(
+                _chunk, census, profile
+            )
+        context["census"] = census
 
-        warnings = emit_corpus_warnings(corpus_stats, cfg)
+        warnings = emit_corpus_warnings(census, profile, cfg)
         for w in warnings:
             logger.warning(w)
 
-        tuned = auto_tune(corpus_stats, cfg)
+        tuned = auto_tune(census, profile, cfg)
         if tuned:
             if "total_samples" in tuned:
                 original = cfg.targets.total_samples
@@ -1414,7 +1533,7 @@ class CgftPipeline:
                     "Auto-tune: total_samples %d -> %d (corpus has %d chunks)",
                     original,
                     tuned["total_samples"],
-                    corpus_stats.chunk_count,
+                    census.chunk_count,
                 )
             if "primary_type_distribution" in tuned:
                 cfg.targets.primary_type_distribution = tuned["primary_type_distribution"]
@@ -1427,6 +1546,12 @@ class CgftPipeline:
                 logger.info(
                     "Auto-tune: hop_distribution -> %s",
                     tuned["hop_distribution"],
+                )
+            if "reasoning_mode_distribution" in tuned:
+                cfg.targets.reasoning_mode_distribution = tuned["reasoning_mode_distribution"]
+                logger.info(
+                    "Auto-tune: reasoning_mode_distribution -> %s",
+                    tuned["reasoning_mode_distribution"],
                 )
 
         return context
@@ -1598,7 +1723,8 @@ class CgftPipeline:
             )
         result["stats"]["pipeline_metrics"] = pipeline_metrics.to_dict()
         result["stats"]["prepare_context_seconds"] = context.get(
-            "prepare_context_seconds", 0.0,
+            "prepare_context_seconds",
+            0.0,
         )
         return result
 
@@ -1659,9 +1785,7 @@ class CgftPipeline:
                 with stage_timer(metrics, "deterministic_guards", len(active_items)) as guard_stage:
                     active_items = guard_filter.evaluate(active_items, context)
                     guard_stage.items_out_passed += sum(1 for i in active_items if i.is_passed)
-                    guard_stage.items_out_rejected += sum(
-                        1 for i in active_items if i.is_rejected
-                    )
+                    guard_stage.items_out_rejected += sum(1 for i in active_items if i.is_rejected)
                     guard_stage.items_out_needs_refinement += sum(
                         1 for i in active_items if i.needs_refinement
                     )
@@ -1672,12 +1796,8 @@ class CgftPipeline:
                 if metrics is not None:
                     with stage_timer(metrics, _stage_name, len(active_items)) as sm:
                         active_items = stage_filter.evaluate(active_items, context)
-                        sm.items_out_passed += sum(
-                            1 for i in active_items if i.is_passed
-                        )
-                        sm.items_out_rejected += sum(
-                            1 for i in active_items if i.is_rejected
-                        )
+                        sm.items_out_passed += sum(1 for i in active_items if i.is_passed)
+                        sm.items_out_rejected += sum(1 for i in active_items if i.is_rejected)
                         sm.items_out_needs_refinement += sum(
                             1 for i in active_items if i.needs_refinement
                         )
@@ -1789,6 +1909,7 @@ class CgftPipeline:
 
         cfg = self.cfg
         target = cfg.targets.total_samples
+        profile = context.profile
 
         # Auto-compute batch_size and max_parallel_batches when set to 0.
         batch_size = cfg.micro_batch.batch_size
@@ -1887,6 +2008,7 @@ class CgftPipeline:
                     source=source,
                     cfg=cfg,
                     iteration_count=iteration_count,
+                    profile=profile,
                 )
                 if not tasks or iteration_count >= max_iterations:
                     break
@@ -2020,6 +2142,7 @@ class CgftPipeline:
                             source=source,
                             cfg=cfg,
                             iteration_count=iteration_count,
+                            profile=profile,
                         )
                         if not tasks:
                             break
@@ -2156,6 +2279,79 @@ class CgftPipeline:
         return all_passed, all_rejected, total_regens, all_raw
 
 
+def _filter_and_sample_seeds(
+    source: Any,
+    n: int,
+    min_chars: int,
+    profile: CorpusProfile | None,
+    rng: random.Random,
+) -> list[Any]:
+    """Sample seeds from the full corpus, filtering out bottom-quartile chunks.
+
+    Scores chunks on-the-fly (using cached scores when available) and
+    excludes those below the p25 threshold. Falls back to unfiltered
+    sampling when profile is unavailable or the eligible pool is too small.
+    """
+    if profile is None or not profile.chunk_suitability_scores or profile.census is None:
+        return source.sample_chunks(n, min_chars=min_chars) or []
+
+    # Adaptive threshold: bottom 25% of profile pool scores
+    scores = sorted(profile.chunk_suitability_scores.values())
+    threshold = scores[len(scores) // 4] if len(scores) >= 4 else 0.0
+
+    collection = getattr(source, "collection", None)
+    if collection is not None:
+        # In-memory: score all chunks on-the-fly, filter by threshold
+        candidates = [c for c in collection.chunks if len(c.content) >= min_chars]
+        eligible = [
+            c for c in candidates
+            if (
+                profile.chunk_suitability_scores.get(c.hash)
+                or compute_chunk_suitability(c, profile.census, profile)
+            )
+            > threshold
+        ]
+        if len(eligible) < n:
+            return rng.sample(candidates, min(n, len(candidates))) if candidates else []
+        return rng.sample(eligible, n)
+
+    # API backend: fetch all chunks once, score, and cache eligible pool
+    if not hasattr(profile, "_api_eligible_cache"):
+        chunk_count = 0
+        try:
+            chunk_count = source.get_chunk_count()
+        except (AttributeError, Exception):
+            pass
+        if chunk_count > 0:
+            logger.info(
+                "Fetching all %d chunks from API backend for scoring...",
+                chunk_count,
+            )
+            all_chunks = source.sample_chunks(chunk_count, min_chars=min_chars)
+        else:
+            all_chunks = source.sample_chunks(n * 2, min_chars=min_chars)
+
+        if not all_chunks:
+            return []
+
+        eligible = [
+            c for c in all_chunks
+            if compute_chunk_suitability(c, profile.census, profile) > threshold
+        ]
+        profile._api_eligible_cache = eligible if eligible else all_chunks
+        logger.info(
+            "Cached %d eligible chunks (of %d total, threshold=%.3f)",
+            len(profile._api_eligible_cache),
+            len(all_chunks),
+            threshold,
+        )
+
+    cached = profile._api_eligible_cache
+    if not cached:
+        return source.sample_chunks(n, min_chars=min_chars) or []
+    return rng.sample(cached, min(n, len(cached)))
+
+
 def compute_next_batch(
     *,
     target_type_counts: dict[str, int],
@@ -2168,6 +2364,7 @@ def compute_next_batch(
     source: Any,
     cfg: CgftPipelineConfig,
     iteration_count: int,
+    profile: CorpusProfile | None = None,
 ) -> list[GenerationTask]:
     """Compute the next batch of generation tasks based on remaining quotas."""
     from cgft.qa_generation.cgft_models import allocate_largest_remainder_generic
@@ -2233,7 +2430,9 @@ def compute_next_batch(
 
     # Sample fresh seed chunks.
     total_tasks = n_lookup + n_multi_hop
-    new_seeds = source.sample_chunks(total_tasks, min_chars=cfg.corpus.min_chunk_chars)
+    new_seeds = _filter_and_sample_seeds(
+        source, total_tasks, cfg.corpus.min_chunk_chars, profile, rng
+    )
     if not new_seeds:
         seed_ids = [f"fallback_{i}" for i in range(total_tasks)]
     else:
