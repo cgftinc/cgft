@@ -271,6 +271,7 @@ class TrainerClient:
         train_dataset_path: str,
         eval_dataset_path: str,
         name: str | None = None,
+        max_turns: int | None = None,
     ) -> str:
         """Launch a new experiment from a job template.
         Args:
@@ -280,23 +281,27 @@ class TrainerClient:
             train_dataset_path: Path to the training dataset
             eval_dataset_path: Path to the evaluation dataset
             name: Optional name for the experiment
+            max_turns: Optional max conversation turns for training rollouts
         Returns:
             The experiment ID.
         Raises:
             AuthenticationError: If API key is invalid
             JobLaunchError: If experiment launch fails
         """
+        args: dict[str, Any] = {
+            "env_cls_path": env_cls_path,
+            "env_metadata_path": env_metadata_path,
+            "train_dataset_path": train_dataset_path,
+            "eval_dataset_path": eval_dataset_path,
+        }
+        if max_turns is not None:
+            args["max_turns"] = max_turns
         response = self._http_client.post(
             "/api/experiments/launch",
             json={
                 "type": experiment_type,
                 "name": name,
-                "args": {
-                    "env_cls_path": env_cls_path,
-                    "env_metadata_path": env_metadata_path,
-                    "train_dataset_path": train_dataset_path,
-                    "eval_dataset_path": eval_dataset_path,
-                },
+                "args": args,
             },
         )
         self._handle_response_errors(response)
@@ -305,7 +310,7 @@ class TrainerClient:
 
 ROLLOUT_SERVER_URL = "https://autobots.cgft.io"
 
-_VALIDATION_MODEL = "grok-4-fast-reasoning"
+_VALIDATION_MODEL = "gpt-5.4-nano"
 _VALIDATION_LLM_BASE_URL = "https://llm.cgft.io/v1"
 
 # ANSI colours
@@ -737,6 +742,8 @@ class RolloutClient:
         *,
         env_cls_bytes: bytes | None = None,
         env_metadata_bytes: bytes | None = None,
+        llm_model: str = _VALIDATION_MODEL,
+        max_turns: int = 4,
     ) -> bool:
         """Run rollouts on the first *n* examples and report pass/fail.
 
@@ -758,7 +765,7 @@ class RolloutClient:
         self._build_env(env_cls_path, env_metadata_path, env_cls_bytes, env_metadata_bytes)
 
         sample = examples[:n]
-        print(_hdr(f"── Remote validation: {len(sample)} example(s) on {_VALIDATION_MODEL} ──"))
+        print(_hdr(f"── Remote validation: {len(sample)} example(s) on {llm_model} ──"))
 
         all_ok = True
         for i, example in enumerate(sample):
@@ -771,7 +778,8 @@ class RolloutClient:
                     env_cls_bytes=env_cls_bytes,
                     env_metadata_bytes=env_metadata_bytes,
                     example_index=i,
-                    llm_model="gpt-5.4-nano",
+                    llm_model=llm_model,
+                    max_turns=max_turns,
                 )
                 if not final.get("success"):
                     all_ok = False
