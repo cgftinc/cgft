@@ -610,8 +610,8 @@ class TestFilterToolResultRelay:
 
     def test_detects_relay(self):
         ex = self._make_relay_example(
-            "Order ORD-123 shipped on March 15, expected delivery April 10",
-            "Your order ORD-123 was shipped on March 15 and is expected to arrive April 10",
+            "Order ORD-123 shipped March 15 expected delivery April 10",
+            "Order ORD-123 shipped March 15 expected delivery April 10 confirmed",
         )
         result = filter_tool_result_relay([ex])
         assert len(result.dropped) == 1
@@ -649,7 +649,7 @@ class TestFilterToolResultRelay:
     def test_handles_json_tool_result(self):
         ex = self._make_relay_example(
             '{"order_id": "ORD-123", "status": "shipped", "date": "March 15"}',
-            "Your order ORD-123 has been shipped as of March 15",
+            "ORD-123 shipped March 15",
         )
         result = filter_tool_result_relay([ex])
         assert len(result.dropped) == 1

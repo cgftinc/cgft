@@ -358,11 +358,6 @@ def filter_by_tool_calls(
 # Tool result relay filter
 # ---------------------------------------------------------------------------
 
-_STOP_WORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "has", "have", "had", "been",
-    "i", "you", "we", "it", "they", "that", "this",
-    "for", "to", "of", "and", "or", "but", "in", "on", "with",
-})
 
 
 def _extract_text_from_value(value: Any) -> list[str]:
@@ -385,8 +380,8 @@ def _extract_text_from_value(value: Any) -> list[str]:
 
 
 def _tokenize_for_overlap(text: str) -> set[str]:
-    """Lowercase, split on whitespace, remove stop words."""
-    return {w for w in text.lower().split() if w not in _STOP_WORDS and len(w) > 1}
+    """Lowercase, split on whitespace, drop single-char tokens."""
+    return {w for w in text.lower().split() if len(w) > 1}
 
 
 def _extract_tool_result_tokens(content: str) -> set[str]:
@@ -402,7 +397,7 @@ def _extract_tool_result_tokens(content: str) -> set[str]:
 def filter_tool_result_relay(
     examples: list[TrainingExample],
     *,
-    overlap_threshold: float = 0.5,
+    overlap_threshold: float = 0.6,
 ) -> FilterResult:
     """Filter out turns that mostly relay a preceding tool result.
 
@@ -460,11 +455,8 @@ def filter_tool_result_relay(
 # ---------------------------------------------------------------------------
 
 _ENTITY_PATTERNS = [
-    (re.compile(r"\b[A-Z]{2,}\d+\b"), "<ID>"),
-    (re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"), "<DATE>"),
-    (re.compile(r"\$[\d,.]+"), "<PRICE>"),
-    (re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"), "<EMAIL>"),
-    (re.compile(r"\b\d{3,}\b"), "<NUM>"),
+    (re.compile(r"\S+@\S+"), "<EMAIL>"),
+    (re.compile(r"\b\d+\b"), "<N>"),
 ]
 
 
