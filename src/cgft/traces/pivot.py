@@ -15,9 +15,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from cgft.traces.adapter import NormalizedTrace, TraceMessage
@@ -86,6 +89,87 @@ class PivotFilterResult:
             "dropped": len(self.dropped),
             "retention_rate": len(self.kept) / total if total else 0,
         }
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint
+# ---------------------------------------------------------------------------
+
+
+class PivotCheckpointManager:
+    """Incremental checkpoint for LLM pivot ratings.
+
+    Appends ratings to a JSONL file as they complete.  On resume, loads
+    cached ratings and skips already-rated turns.  Only the ``model``
+    invalidates the cache — changing ``threshold`` or upstream filters
+    reuses cached ratings.
+    """
+
+    def __init__(self, checkpoint_dir: Path, model: str) -> None:
+        self.checkpoint_dir = checkpoint_dir
+        self.model = model
+
+    @property
+    def ratings_path(self) -> Path:
+        return self.checkpoint_dir / "pivot_ratings.jsonl"
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.checkpoint_dir / "manifest.json"
+
+    def resume(self) -> dict[tuple[str, int], PivotRating]:
+        """Load cached LLM ratings.  Returns empty dict if none or model changed."""
+        if not self.manifest_path.exists():
+            return {}
+
+        with self.manifest_path.open("r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+
+        if manifest.get("model") != self.model:
+            logger.warning(
+                "Pivot checkpoint model mismatch (cached=%s, current=%s) — clearing",
+                manifest.get("model"),
+                self.model,
+            )
+            self.cleanup()
+            return {}
+
+        if not self.ratings_path.exists():
+            return {}
+
+        cached: dict[tuple[str, int], PivotRating] = {}
+        with self.ratings_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    r = PivotRating.from_dict(json.loads(line))
+                    cached[(r.trace_id, r.turn_index)] = r
+
+        logger.info("Pivot checkpoint: loaded %d cached ratings", len(cached))
+        return cached
+
+    def save_batch(self, ratings: list[PivotRating]) -> None:
+        """Append a batch of ratings to the checkpoint JSONL."""
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        with self.ratings_path.open("a", encoding="utf-8") as fh:
+            for r in ratings:
+                fh.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
+
+        # Update manifest atomically
+        manifest = {"model": self.model}
+        tmp = self.manifest_path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, ensure_ascii=False)
+        os.replace(tmp, self.manifest_path)
+
+    def cleanup(self) -> None:
+        """Remove checkpoint directory."""
+        import shutil
+
+        if self.checkpoint_dir.exists():
+            shutil.rmtree(self.checkpoint_dir)
+            logger.info("Cleaned up pivot checkpoints at %s", self.checkpoint_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +401,11 @@ async def _rate_all_turns(
     examples: list[TrainingExample],
     traces: list[NormalizedTrace],
     max_concurrency: int,
+    *,
+    checkpoint: PivotCheckpointManager | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    completed_offset: int = 0,
+    total_llm: int | None = None,
 ) -> list[PivotRating]:
     """Rate all non-heuristic-trivial turns via LLM, in batches."""
     trace_map = {t.id: t for t in traces}
@@ -329,19 +418,23 @@ async def _rate_all_turns(
         if trace is not None:
             work.append((ex, trace))
 
-    total = len(work)
-    print(f"  Pivot rating: 0/{total} turns to rate via LLM", flush=True)
+    total = total_llm if total_llm is not None else len(work)
 
     # Process in batches of max_concurrency for visible progress
     results: list[PivotRating] = []
     batch_size = max_concurrency
-    for i in range(0, total, batch_size):
+    for i in range(0, len(work), batch_size):
         batch = work[i : i + batch_size]
         batch_results = await asyncio.gather(
             *[_rate_single_turn(client, model, trace, ex, semaphore) for ex, trace in batch]
         )
         results.extend(batch_results)
-        print(f"  Pivot rating: {len(results)}/{total} turns rated", flush=True)
+
+        if checkpoint is not None:
+            checkpoint.save_batch(list(batch_results))
+
+        if progress_callback is not None:
+            progress_callback(completed_offset + len(results), total)
 
     return results
 
@@ -357,6 +450,8 @@ def apply_pivot_filter(
     ratings: list[PivotRating] | None = None,
     seed: int = 42,
     max_concurrency: int = 3,
+    checkpoint_dir: Path | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> PivotFilterResult:
     """Filter training examples to high-signal pivot turns.
 
@@ -377,6 +472,8 @@ def apply_pivot_filter(
                 ratings=ratings,
                 seed=seed,
                 max_concurrency=max_concurrency,
+                checkpoint_dir=checkpoint_dir,
+                progress_callback=progress_callback,
             )
         )
     finally:
@@ -394,6 +491,8 @@ async def apply_pivot_filter_async(
     ratings: list[PivotRating] | None = None,
     seed: int = 42,
     max_concurrency: int = 3,
+    checkpoint_dir: Path | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> PivotFilterResult:
     """Filter training examples to high-signal pivot turns (async version).
 
@@ -412,6 +511,11 @@ async def apply_pivot_filter_async(
         ratings: pre-computed ratings — skips LLM if provided.
         seed: random seed for anchor sampling reproducibility
         max_concurrency: max concurrent LLM requests
+        checkpoint_dir: directory for incremental LLM rating checkpoints.
+            Cached ratings are reused across runs; only ``model`` changes
+            invalidate the cache.
+        progress_callback: called with ``(completed, total)`` after each
+            LLM batch.
 
     Returns:
         ``PivotFilterResult`` with kept, dropped, and all ratings.
@@ -425,7 +529,9 @@ async def apply_pivot_filter_async(
         if llm_client is None:
             raise ValueError("Either llm_client or ratings must be provided")
         all_ratings = await _compute_ratings_async(
-            examples, traces, llm_client, model, max_concurrency
+            examples, traces, llm_client, model, max_concurrency,
+            checkpoint_dir=checkpoint_dir,
+            progress_callback=progress_callback,
         )
 
     # Build lookup: (trace_id, turn_index) → PivotRating
@@ -475,8 +581,17 @@ async def _compute_ratings_async(
     llm_client: Any,
     model: str,
     max_concurrency: int,
+    *,
+    checkpoint_dir: Path | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[PivotRating]:
-    """Compute pivot ratings: heuristic fast path + LLM for the rest."""
+    """Compute pivot ratings: heuristic fast path + LLM for the rest.
+
+    Always recomputes heuristic ratings (instant).  LLM ratings are
+    loaded from checkpoint if available, and only uncached turns are
+    sent to the LLM.
+    """
+    # Phase 1: heuristic fast path (always recomputed)
     heuristic_ratings: list[PivotRating] = []
     llm_examples: list[TrainingExample] = []
 
@@ -495,16 +610,59 @@ async def _compute_ratings_async(
             llm_examples.append(ex)
 
     logger.info(
-        "Pivot filtering: %d heuristic trivial, %d sent to LLM",
+        "Pivot filtering: %d heuristic trivial, %d need LLM",
         len(heuristic_ratings),
         len(llm_examples),
     )
 
-    if llm_examples:
-        llm_ratings = await _rate_all_turns(
-            llm_client, model, llm_examples, traces, max_concurrency
+    # Phase 2: load cached LLM ratings, diff to find uncached
+    checkpoint = None
+    cached_ratings: dict[tuple[str, int], PivotRating] = {}
+
+    if checkpoint_dir is not None:
+        checkpoint = PivotCheckpointManager(checkpoint_dir, model)
+        cached_ratings = checkpoint.resume()
+
+    uncached = [
+        ex for ex in llm_examples
+        if (ex.trace_id, ex.turn_index) not in cached_ratings
+    ]
+
+    if cached_ratings:
+        logger.info(
+            "Pivot checkpoint: %d cached, %d uncached (of %d LLM examples)",
+            len(llm_examples) - len(uncached),
+            len(uncached),
+            len(llm_examples),
+        )
+
+    # Total for progress = all LLM examples (cached count as already done)
+    total_llm = len(llm_examples)
+    completed_offset = total_llm - len(uncached)
+
+    # Report initial progress (cached items)
+    if progress_callback is not None and completed_offset > 0:
+        progress_callback(completed_offset, total_llm)
+
+    # Phase 3: rate uncached turns via LLM
+    if uncached:
+        new_ratings = await _rate_all_turns(
+            llm_client, model, uncached, traces, max_concurrency,
+            checkpoint=checkpoint,
+            progress_callback=progress_callback,
+            completed_offset=completed_offset,
+            total_llm=total_llm,
         )
     else:
-        llm_ratings = []
+        new_ratings = []
 
-    return heuristic_ratings + list(llm_ratings)
+    # Merge: cached + new LLM ratings
+    all_llm_ratings: list[PivotRating] = []
+    new_map = {(r.trace_id, r.turn_index): r for r in new_ratings}
+    for ex in llm_examples:
+        key = (ex.trace_id, ex.turn_index)
+        rating = cached_ratings.get(key) or new_map.get(key)
+        if rating is not None:
+            all_llm_ratings.append(rating)
+
+    return heuristic_ratings + all_llm_ratings

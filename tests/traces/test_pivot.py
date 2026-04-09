@@ -1,9 +1,12 @@
 """Tests for pivot filtering."""
 
+import json
+
 import pytest
 
 from cgft.traces.adapter import NormalizedTrace, ToolCall, TraceMessage
 from cgft.traces.pivot import (
+    PivotCheckpointManager,
     PivotFilterResult,
     PivotRating,
     _build_outcome_summary,
@@ -361,3 +364,101 @@ class TestApplyPivotFilter:
 
         assert len(result.kept) == 20
         assert all(ex.trace_id == "trace_a" for ex in result.kept)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint
+# ---------------------------------------------------------------------------
+
+
+class TestPivotCheckpointManager:
+    def test_save_and_resume(self, tmp_path):
+        cp = PivotCheckpointManager(tmp_path / "ckpt", model="gpt-5.4-nano")
+        ratings = [
+            PivotRating("t1", 0, 0.9, "pivot", "important"),
+            PivotRating("t1", 1, 0.2, "trivial", "routine"),
+        ]
+        cp.save_batch(ratings)
+
+        loaded = cp.resume()
+        assert len(loaded) == 2
+        assert loaded[("t1", 0)].importance_score == 0.9
+        assert loaded[("t1", 1)].category == "trivial"
+
+    def test_resume_empty(self, tmp_path):
+        cp = PivotCheckpointManager(tmp_path / "ckpt", model="gpt-5.4-nano")
+        assert cp.resume() == {}
+
+    def test_model_change_invalidates(self, tmp_path):
+        ckpt_dir = tmp_path / "ckpt"
+        cp1 = PivotCheckpointManager(ckpt_dir, model="gpt-5.4-nano")
+        cp1.save_batch([PivotRating("t1", 0, 0.9, "pivot", "test")])
+
+        cp2 = PivotCheckpointManager(ckpt_dir, model="gpt-4o-mini")
+        loaded = cp2.resume()
+        assert loaded == {}
+        assert not ckpt_dir.exists()  # cleaned up
+
+    def test_incremental_append(self, tmp_path):
+        cp = PivotCheckpointManager(tmp_path / "ckpt", model="gpt-5.4-nano")
+        cp.save_batch([PivotRating("t1", 0, 0.9, "pivot", "batch1")])
+        cp.save_batch([PivotRating("t1", 1, 0.3, "downstream", "batch2")])
+
+        loaded = cp.resume()
+        assert len(loaded) == 2
+
+    def test_cleanup(self, tmp_path):
+        ckpt_dir = tmp_path / "ckpt"
+        cp = PivotCheckpointManager(ckpt_dir, model="gpt-5.4-nano")
+        cp.save_batch([PivotRating("t1", 0, 0.9, "pivot", "test")])
+        assert ckpt_dir.exists()
+
+        cp.cleanup()
+        assert not ckpt_dir.exists()
+
+    def test_manifest_is_atomic(self, tmp_path):
+        cp = PivotCheckpointManager(tmp_path / "ckpt", model="gpt-5.4-nano")
+        cp.save_batch([PivotRating("t1", 0, 0.9, "pivot", "test")])
+
+        with cp.manifest_path.open() as f:
+            manifest = json.load(f)
+        assert manifest["model"] == "gpt-5.4-nano"
+        # No .tmp file left behind
+        assert not cp.manifest_path.with_suffix(".tmp").exists()
+
+    def test_jsonl_format(self, tmp_path):
+        cp = PivotCheckpointManager(tmp_path / "ckpt", model="gpt-5.4-nano")
+        cp.save_batch([
+            PivotRating("t1", 0, 0.9, "pivot", "test1"),
+            PivotRating("t2", 1, 0.3, "trivial", "test2"),
+        ])
+
+        lines = cp.ratings_path.read_text().strip().split("\n")
+        assert len(lines) == 2
+        row = json.loads(lines[0])
+        assert row["trace_id"] == "t1"
+        assert row["importance_score"] == 0.9
+
+
+class TestProgressCallback:
+    def test_callback_receives_progress(self):
+        """Verify apply_pivot_filter calls progress_callback with pre-computed ratings."""
+        examples = [
+            _example(turn_index=i, trace_id=f"t{i}", completion_content="A" * 100)
+            for i in range(20)
+        ]
+        traces = [_trace(trace_id=f"t{i}") for i in range(20)]
+        ratings = [
+            PivotRating(f"t{i}", i, 0.9, "pivot", "test") for i in range(20)
+        ]
+
+        # With pre-computed ratings, no LLM calls happen and no progress
+        # callback is invoked (ratings skip the LLM path entirely).
+        calls: list[tuple[int, int]] = []
+        result = apply_pivot_filter(
+            examples, traces, ratings=ratings, threshold=0.6,
+            progress_callback=lambda done, total: calls.append((done, total)),
+        )
+        assert len(result.kept) == 20
+        # Pre-computed ratings bypass the callback (no LLM work to report)
+        assert calls == []
