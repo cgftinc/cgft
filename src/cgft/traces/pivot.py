@@ -15,15 +15,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import random
 import re
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from cgft.checkpoint import CheckpointBase
 from cgft.traces.adapter import NormalizedTrace, TraceMessage
 from cgft.traces.processing import MIN_TRAIN_SAMPLES, TrainingExample
 
@@ -97,7 +96,7 @@ class PivotFilterResult:
 # ---------------------------------------------------------------------------
 
 
-class PivotCheckpointManager:
+class PivotCheckpointManager(CheckpointBase):
     """Incremental checkpoint for LLM pivot ratings.
 
     Appends ratings to a JSONL file as they complete.  On resume, loads
@@ -106,25 +105,17 @@ class PivotCheckpointManager:
     reuses cached ratings.
     """
 
+    _RATINGS_FILE = "pivot_ratings.jsonl"
+
     def __init__(self, checkpoint_dir: Path, model: str) -> None:
-        self.checkpoint_dir = checkpoint_dir
+        super().__init__(checkpoint_dir)
         self.model = model
-
-    @property
-    def ratings_path(self) -> Path:
-        return self.checkpoint_dir / "pivot_ratings.jsonl"
-
-    @property
-    def manifest_path(self) -> Path:
-        return self.checkpoint_dir / "manifest.json"
 
     def resume(self) -> dict[tuple[str, int], PivotRating]:
         """Load cached LLM ratings.  Returns empty dict if none or model changed."""
-        if not self.manifest_path.exists():
+        manifest = self.load_manifest()
+        if manifest is None:
             return {}
-
-        with self.manifest_path.open("r", encoding="utf-8") as fh:
-            manifest = json.load(fh)
 
         if manifest.get("model") != self.model:
             logger.warning(
@@ -135,47 +126,21 @@ class PivotCheckpointManager:
             self.cleanup()
             return {}
 
-        if not self.ratings_path.exists():
-            return {}
-
         cached: dict[tuple[str, int], PivotRating] = {}
-        with self.ratings_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = PivotRating.from_dict(json.loads(line))
-                    cached[(r.trace_id, r.turn_index)] = r
-                except (json.JSONDecodeError, KeyError):
-                    logger.warning("Skipping corrupted checkpoint line")
-                    break  # truncated last line from crash, stop here
+        for row in self.load_jsonl(self._RATINGS_FILE):
+            try:
+                r = PivotRating.from_dict(row)
+                cached[(r.trace_id, r.turn_index)] = r
+            except KeyError:
+                break
 
         logger.info("Pivot checkpoint: loaded %d cached ratings", len(cached))
         return cached
 
     def save_batch(self, ratings: list[PivotRating]) -> None:
         """Append a batch of ratings to the checkpoint JSONL."""
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        with self.ratings_path.open("a", encoding="utf-8") as fh:
-            for r in ratings:
-                fh.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-
-        # Update manifest atomically
-        manifest = {"model": self.model}
-        tmp = self.manifest_path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, ensure_ascii=False)
-        os.replace(tmp, self.manifest_path)
-
-    def cleanup(self) -> None:
-        """Remove checkpoint directory."""
-        if self.checkpoint_dir.exists():
-            shutil.rmtree(self.checkpoint_dir)
-            logger.info("Cleaned up pivot checkpoints at %s", self.checkpoint_dir)
+        self.append_jsonl(self._RATINGS_FILE, [r.to_dict() for r in ratings])
+        self.save_manifest({"model": self.model})
 
 
 # ---------------------------------------------------------------------------

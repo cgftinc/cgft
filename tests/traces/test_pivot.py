@@ -406,7 +406,7 @@ class TestPivotCheckpointManager:
             PivotRating("t1", 1, 0.3, "trivial", "good"),
         ])
         # Simulate crash: append truncated line
-        with cp.ratings_path.open("a") as fh:
+        with (cp.checkpoint_dir / cp._RATINGS_FILE).open("a") as fh:
             fh.write('{"trace_id": "t1", "turn_index": 2, "importance_sc')
 
         loaded = cp.resume()
@@ -449,7 +449,7 @@ class TestPivotCheckpointManager:
             PivotRating("t2", 1, 0.3, "trivial", "test2"),
         ])
 
-        lines = cp.ratings_path.read_text().strip().split("\n")
+        lines = (cp.checkpoint_dir / cp._RATINGS_FILE).read_text().strip().split("\n")
         assert len(lines) == 2
         row = json.loads(lines[0])
         assert row["trace_id"] == "t1"

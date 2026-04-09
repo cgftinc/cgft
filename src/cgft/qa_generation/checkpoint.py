@@ -5,12 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cgft.checkpoint import CheckpointBase
 from cgft.qa_generation.generated_qa import FilterVerdict, GeneratedQA
 
 logger = logging.getLogger(__name__)
@@ -166,42 +165,33 @@ class ResumeState:
 
 
 
-class CheckpointManager:
+class CheckpointManager(CheckpointBase):
     """Manages checkpoint I/O for micro-batch pipeline processing."""
 
+    _PASSED_FILE = "checkpoint_passed.jsonl"
+
     def __init__(self, checkpoint_dir: Path, config_hash: str) -> None:
-        self.checkpoint_dir = checkpoint_dir
+        super().__init__(checkpoint_dir)
         self.config_hash = config_hash
         self._manifest: Manifest | None = None
 
     @property
-    def manifest_path(self) -> Path:
-        return self.checkpoint_dir / "manifest.json"
-
-    @property
     def passed_path(self) -> Path:
-        return self.checkpoint_dir / "checkpoint_passed.jsonl"
+        return self.checkpoint_dir / self._PASSED_FILE
 
-    def _ensure_dir(self) -> None:
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    def load_manifest(self) -> Manifest | None:
-        if not self.manifest_path.exists():
+    def load_qa_manifest(self) -> Manifest | None:
+        raw = self.load_manifest()
+        if raw is None:
             return None
-        with self.manifest_path.open("r", encoding="utf-8") as fh:
-            return Manifest.from_dict(json.load(fh))
+        return Manifest.from_dict(raw)
 
-    def save_manifest(self, manifest: Manifest) -> None:
-        self._ensure_dir()
-        tmp = self.manifest_path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(manifest.to_dict(), fh, ensure_ascii=False)
-        os.replace(tmp, self.manifest_path)
+    def save_qa_manifest(self, manifest: Manifest) -> None:
+        self.save_manifest(manifest.to_dict())
         self._manifest = manifest
 
     def resume_state(self) -> ResumeState:
         """Load checkpoint state for resuming. Returns empty state if none."""
-        manifest = self.load_manifest()
+        manifest = self.load_qa_manifest()
         if manifest is None:
             return ResumeState()
 
@@ -215,13 +205,9 @@ class CheckpointManager:
             self.cleanup()
             return ResumeState()
 
-        passed_items: list[GeneratedQA] = []
-        if self.passed_path.exists():
-            with self.passed_path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        passed_items.append(deserialize_generated_qa(json.loads(line)))
+        passed_items: list[GeneratedQA] = [
+            deserialize_generated_qa(row) for row in self.load_jsonl(self._PASSED_FILE)
+        ]
 
         # Re-derive distribution counts from JSONL as source of truth.
         by_type: dict[str, int] = {}
@@ -288,21 +274,18 @@ class CheckpointManager:
         iteration_count: int = 0,
     ) -> None:
         """Checkpoint a completed batch. Appends passed to cumulative JSONL."""
-        self._ensure_dir()
-
         # Append passed items to cumulative file.
-        with self.passed_path.open("a", encoding="utf-8") as fh:
-            for item in passed:
-                fh.write(json.dumps(serialize_generated_qa(item), ensure_ascii=False) + "\n")
+        self.append_jsonl(
+            self._PASSED_FILE,
+            [serialize_generated_qa(item) for item in passed],
+        )
 
         # Write per-batch rejected for diagnostics.
-        rejected_path = self.checkpoint_dir / f"batch_{batch_idx:04d}_rejected.jsonl"
-        with rejected_path.open("w", encoding="utf-8") as fh:
-            for item in rejected:
-                fh.write(json.dumps(serialize_generated_qa(item), ensure_ascii=False) + "\n")
+        rejected_file = f"batch_{batch_idx:04d}_rejected.jsonl"
+        self.append_jsonl(rejected_file, [serialize_generated_qa(item) for item in rejected])
 
         # Update manifest.
-        manifest = self.load_manifest() or Manifest(config_hash=self.config_hash)
+        manifest = self.load_qa_manifest() or Manifest(config_hash=self.config_hash)
         manifest.completed_batch_count = max(manifest.completed_batch_count, batch_idx + 1)
         manifest.total_passed += len(passed)
         manifest.total_rejected += len(rejected)
@@ -313,10 +296,4 @@ class CheckpointManager:
             manifest.accepted_by_reasoning_mode = dict(accepted_by_reasoning_mode)
         if accepted_by_hop_count is not None:
             manifest.accepted_by_hop_count = dict(accepted_by_hop_count)
-        self.save_manifest(manifest)
-
-    def cleanup(self) -> None:
-        """Remove checkpoint directory."""
-        if self.checkpoint_dir.exists():
-            shutil.rmtree(self.checkpoint_dir)
-            logger.info("Cleaned up checkpoints at %s", self.checkpoint_dir)
+        self.save_qa_manifest(manifest)
