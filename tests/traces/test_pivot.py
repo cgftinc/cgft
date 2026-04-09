@@ -399,6 +399,22 @@ class TestPivotCheckpointManager:
         assert loaded == {}
         assert not ckpt_dir.exists()  # cleaned up
 
+    def test_truncated_jsonl_recovery(self, tmp_path):
+        cp = PivotCheckpointManager(tmp_path / "ckpt", model="gpt-5.4-nano")
+        cp.save_batch([
+            PivotRating("t1", 0, 0.9, "pivot", "good"),
+            PivotRating("t1", 1, 0.3, "trivial", "good"),
+        ])
+        # Simulate crash: append truncated line
+        with cp.ratings_path.open("a") as fh:
+            fh.write('{"trace_id": "t1", "turn_index": 2, "importance_sc')
+
+        loaded = cp.resume()
+        # Should recover the 2 good lines, skip the truncated one
+        assert len(loaded) == 2
+        assert ("t1", 0) in loaded
+        assert ("t1", 1) in loaded
+
     def test_incremental_append(self, tmp_path):
         cp = PivotCheckpointManager(tmp_path / "ckpt", model="gpt-5.4-nano")
         cp.save_batch([PivotRating("t1", 0, 0.9, "pivot", "batch1")])

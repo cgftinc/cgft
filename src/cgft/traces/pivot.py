@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import re
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,9 +142,14 @@ class PivotCheckpointManager:
         with self.ratings_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     r = PivotRating.from_dict(json.loads(line))
                     cached[(r.trace_id, r.turn_index)] = r
+                except (json.JSONDecodeError, KeyError):
+                    logger.warning("Skipping corrupted checkpoint line")
+                    break  # truncated last line from crash, stop here
 
         logger.info("Pivot checkpoint: loaded %d cached ratings", len(cached))
         return cached
@@ -155,6 +161,8 @@ class PivotCheckpointManager:
         with self.ratings_path.open("a", encoding="utf-8") as fh:
             for r in ratings:
                 fh.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
         # Update manifest atomically
         manifest = {"model": self.model}
@@ -165,8 +173,6 @@ class PivotCheckpointManager:
 
     def cleanup(self) -> None:
         """Remove checkpoint directory."""
-        import shutil
-
         if self.checkpoint_dir.exists():
             shutil.rmtree(self.checkpoint_dir)
             logger.info("Cleaned up pivot checkpoints at %s", self.checkpoint_dir)
