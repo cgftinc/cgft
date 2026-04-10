@@ -309,6 +309,112 @@ class TestExtractScores:
         assert scores == {"good": 0.9}
 
 
+class TestDuplicateToolResponseDedup:
+    """Regression: subsequent tool spans whose output is already in the best
+    LLM child's input messages should not be appended again."""
+
+    def test_trailing_tool_span_already_consumed_by_llm_input(self):
+        """When the best LLM child's input already contains a tool response,
+        a later tool span with the same content should be skipped."""
+        trace = {
+            "input": {"messages": [{"role": "user", "content": "Modify my order"}]},
+            "children": [
+                {
+                    "span_attributes": {"type": "llm"},
+                    "created": "2024-01-01T00:00:01Z",
+                    "input": {
+                        "messages": [
+                            {"role": "user", "content": "Modify my order"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "modify_order",
+                                            "arguments": '{"id": "W123"}',
+                                        },
+                                        "id": "tc1",
+                                    }
+                                ],
+                            },
+                            {
+                                "role": "tool",
+                                "content": '{"status": "modified"}',
+                                "tool_call_id": "tc1",
+                                "name": "modify_order",
+                            },
+                        ]
+                    },
+                    "output": {
+                        "role": "assistant",
+                        "content": "Your order has been modified.",
+                    },
+                },
+                # This tool span has the same content as what's already
+                # in the LLM child's input — should be skipped
+                {
+                    "span_attributes": {"type": "tool"},
+                    "created": "2024-01-01T00:00:01Z",
+                    "name": "modify_order",
+                    "input": {},
+                    "output": '{"status": "modified"}',
+                    "span_id": "tc1",
+                },
+            ],
+        }
+        msgs = extract_messages(trace)
+        tool_msgs = [m for m in msgs if m.role == "tool"]
+        # Should only have ONE tool message — the one from the LLM's input
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0].content == '{"status": "modified"}'
+
+        # Last message should be the assistant's final answer, not a tool response
+        assert msgs[-1].role == "assistant"
+        assert msgs[-1].content == "Your order has been modified."
+
+    def test_genuinely_new_tool_response_still_appended(self):
+        """A subsequent tool span with NEW content (not in the best LLM
+        child's input) should still be appended."""
+        trace = {
+            "input": {"messages": [{"role": "user", "content": "Do two things"}]},
+            "children": [
+                {
+                    "span_attributes": {"type": "llm"},
+                    "created": "2024-01-01T00:00:01Z",
+                    "input": {
+                        "messages": [
+                            {"role": "user", "content": "Do two things"},
+                        ]
+                    },
+                    "output": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "function": {"name": "step1", "arguments": "{}"},
+                                "id": "tc1",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "span_attributes": {"type": "tool"},
+                    "created": "2024-01-01T00:00:02Z",
+                    "name": "step1",
+                    "input": {},
+                    "output": "step1 result — new content",
+                    "span_id": "tc1",
+                },
+            ],
+        }
+        msgs = extract_messages(trace)
+        tool_msgs = [m for m in msgs if m.role == "tool"]
+        # This tool content is NOT in the LLM's input, so it should be appended
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0].content == "step1 result — new content"
+
+
 class TestEdgeCases:
     def test_empty_trace(self):
         msgs = extract_messages({})
