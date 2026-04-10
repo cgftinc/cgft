@@ -243,7 +243,6 @@ def train(
     show_summary: bool = True,
     # Rollout / training configuration
     validation_model: str | None = None,
-    max_turns: int | None = None,
     dry_run: bool = False,
 ) -> str | dict[str, Any]:
     """Train a model - the simplest interface for launching training jobs.
@@ -274,8 +273,6 @@ def train(
         validate_env_remotely: Whether to validate environment in a remote rollout server. (default: True)
         show_summary: Whether to print progress information (default: True)
         validation_model: LLM model for remote validation rollouts (default: server default)
-        max_turns: Max conversation turns for remote validation and training
-            (default: server default)
         dry_run: Validate everything but don't launch the training job. (default: False)
 
     Returns:
@@ -363,8 +360,6 @@ def train(
         validate_kwargs: dict[str, Any] = {}
         if validation_model is not None:
             validate_kwargs["llm_model"] = validation_model
-        if max_turns is not None:
-            validate_kwargs["max_turns"] = max_turns
         passed = rollout_client.validate_examples(
             examples=eval_dataset,
             env_cls_path=env_blob_path,
@@ -401,7 +396,6 @@ def train(
         train_dataset_path=train_blob_path,
         eval_dataset_path=eval_blob_path,
         name=experiment_name,
-        max_turns=max_turns,
     )
 
     if show_summary:
