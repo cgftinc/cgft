@@ -1,6 +1,8 @@
 """Tests for BraintrustTraceAdapter span grouping and normalisation."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
+
+import pytest
 
 from cgft.traces.adapter import TraceCredentials
 from cgft.traces.braintrust.adapter import BraintrustTraceAdapter, _group_into_traces, _normalize_trace
@@ -186,3 +188,84 @@ class TestCountTraces:
             count = adapter.count_traces(creds, "proj-789")
 
         assert count == 0
+
+
+class TestFetchTraces:
+    def _make_btql_response(self, spans: list[dict]) -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"data": spans}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def _make_span(self, trace_id: str, span_id: str, is_root: bool = False) -> dict:
+        return {
+            "id": span_id,
+            "span_id": span_id if is_root else f"child_{span_id}",
+            "root_span_id": trace_id,
+            "input": {"messages": [{"role": "user", "content": "hi"}]} if is_root else {},
+            "output": {"role": "assistant", "content": "hello"} if is_root else {},
+            "scores": {},
+            "metadata": {},
+            "span_attributes": {},
+            "created": "2024-01-01T00:00:00Z",
+            "name": "root" if is_root else "child",
+        }
+
+    def test_btql_fetch_returns_traces(self):
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key="test-key")
+
+        spans = [
+            self._make_span("t1", "t1", is_root=True),
+            self._make_span("t1", "c1"),
+            self._make_span("t2", "t2", is_root=True),
+        ]
+        resp = self._make_btql_response(spans)
+
+        with patch("httpx.request", return_value=resp):
+            traces, cursor = adapter.fetch_traces(creds, "proj-123", limit=10)
+
+        assert len(traces) == 2
+        assert {t.id for t in traces} == {"t1", "t2"}
+
+    def test_btql_request_uses_btql_url(self):
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key="test-key")
+
+        spans = [self._make_span("t1", "t1", is_root=True)]
+        resp = self._make_btql_response(spans)
+
+        with patch("httpx.request", return_value=resp) as mock_req:
+            adapter.fetch_traces(creds, "proj-123", limit=10)
+
+        # Should use BTQL URL, not REST
+        url = mock_req.call_args.args[1]
+        assert "/btql" in url
+
+    def test_falls_back_to_rest_on_btql_failure(self):
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key="test-key")
+
+        btql_resp = MagicMock()
+        btql_resp.status_code = 500
+        btql_resp.raise_for_status.side_effect = Exception("BTQL error")
+
+        rest_resp = MagicMock()
+        rest_resp.status_code = 200
+        rest_resp.json.return_value = {
+            "events": [self._make_span("t1", "t1", is_root=True)],
+            "cursor": None,
+        }
+        rest_resp.raise_for_status = MagicMock()
+
+        def side_effect(method, url, **kwargs):
+            if "/btql" in url:
+                return btql_resp
+            return rest_resp
+
+        with patch("httpx.request", side_effect=side_effect):
+            traces, cursor = adapter.fetch_traces(creds, "proj-123", limit=10)
+
+        assert len(traces) == 1
+        assert traces[0].id == "t1"

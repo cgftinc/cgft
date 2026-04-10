@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from cgft.traces.adapter import (
@@ -12,9 +13,15 @@ from cgft.traces.adapter import (
 from cgft.traces.braintrust.message_extraction import extract_messages, extract_scores
 from cgft.traces.http import request_with_retry
 
+logger = logging.getLogger(__name__)
+
 _BASE_URL = "https://api.braintrust.dev/v1"
 _BTQL_URL = "https://api.braintrust.dev/btql"
 _MAX_TRACES_PER_FETCH = 1000
+_BTQL_COLUMNS = (
+    "id, span_id, root_span_id, input, output, scores, "
+    "metadata, span_attributes, created, name"
+)
 
 
 class BraintrustTraceAdapter:
@@ -84,14 +91,97 @@ class BraintrustTraceAdapter:
     ) -> tuple[list[NormalizedTrace], str | None]:
         """Fetch spans from Braintrust, group by root_span_id, and normalise.
 
-        Paginates automatically using cursor-based pagination until all
-        spans are fetched (or *limit* traces are reached).
+        Uses BTQL (higher rate limits, larger page sizes) with automatic
+        fallback to the REST API if BTQL fails.
 
         Returns ``(traces, next_cursor)``.
         """
-        headers = {**credentials.to_headers(), "Content-Type": "application/json"}
         max_traces = min(limit, _MAX_TRACES_PER_FETCH) if limit else _MAX_TRACES_PER_FETCH
 
+        try:
+            events = self._fetch_via_btql(credentials, project_id, max_traces)
+        except Exception as e:
+            logger.warning("BTQL fetch failed, falling back to REST: %s", e)
+            events, cursor = self._fetch_via_rest(
+                credentials, project_id, max_traces, cursor
+            )
+
+        trace_trees = _group_into_traces(events)
+
+        traces: list[NormalizedTrace] = []
+        for trace_id, tree in trace_trees.items():
+            traces.append(_normalize_trace(trace_id, tree))
+            if len(traces) >= max_traces:
+                break
+
+        return traces, cursor
+
+    def _fetch_via_btql(
+        self,
+        credentials: TraceCredentials,
+        project_id: str,
+        max_traces: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch spans using BTQL. Higher rate limits, 1000 rows/page."""
+        headers = {**credentials.to_headers(), "Content-Type": "application/json"}
+        all_events: list[dict[str, Any]] = []
+        offset = 0
+        # Each trace has ~10-20 child spans, so fetch 20x the desired trace count
+        span_limit = max_traces * 20
+
+        while True:
+            page_size = min(1000, span_limit - offset)
+            if page_size <= 0:
+                break
+
+            query = (
+                f"SELECT {_BTQL_COLUMNS} "
+                f"FROM project_logs('{project_id}') "
+                f"ORDER BY created DESC "
+                f"LIMIT {page_size} OFFSET {offset}"
+            )
+            resp = request_with_retry(
+                "POST",
+                _BTQL_URL,
+                headers=headers,
+                json={"query": query, "fmt": "json"},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            rows = data.get("data", data) if isinstance(data, dict) else data
+            if not isinstance(rows, list) or not rows:
+                break
+
+            all_events.extend(rows)
+            offset += len(rows)
+
+            # Check if we have enough traces
+            trace_trees = _group_into_traces(all_events)
+            if len(trace_trees) >= max_traces:
+                break
+
+            # If we got fewer rows than requested, no more data
+            if len(rows) < page_size:
+                break
+
+        logger.info(
+            "BTQL fetch: %d spans, %d traces",
+            len(all_events),
+            len(_group_into_traces(all_events)),
+        )
+        return all_events
+
+    def _fetch_via_rest(
+        self,
+        credentials: TraceCredentials,
+        project_id: str,
+        max_traces: int,
+        cursor: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Fetch spans using REST API. Fallback for BTQL failures."""
+        headers = {**credentials.to_headers(), "Content-Type": "application/json"}
         all_events: list[dict[str, Any]] = []
         page_cursor = cursor
 
@@ -116,23 +206,13 @@ class BraintrustTraceAdapter:
             all_events.extend(events)
             page_cursor = data.get("cursor")
 
-            # Group what we have so far to check trace count
             trace_trees = _group_into_traces(all_events)
             if len(trace_trees) >= max_traces:
                 break
             if not page_cursor:
                 break
 
-        # Final grouping and normalisation
-        trace_trees = _group_into_traces(all_events)
-
-        traces: list[NormalizedTrace] = []
-        for trace_id, tree in trace_trees.items():
-            traces.append(_normalize_trace(trace_id, tree))
-            if len(traces) >= max_traces:
-                break
-
-        return traces, page_cursor
+        return all_events, page_cursor
 
 
 def _group_into_traces(
