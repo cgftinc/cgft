@@ -20,7 +20,7 @@ _BTQL_URL = "https://api.braintrust.dev/btql"
 _MAX_TRACES_PER_FETCH = 1000
 _BTQL_COLUMNS = (
     "id, span_id, root_span_id, input, output, scores, "
-    "metadata, span_attributes, created, name"
+    "metadata, span_attributes, created"
 )
 
 
