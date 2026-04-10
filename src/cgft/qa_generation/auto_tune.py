@@ -3,187 +3,210 @@
 from __future__ import annotations
 
 import logging
-import statistics
-from dataclasses import dataclass
 from typing import Any
+
+from cgft.qa_generation.corpus_profile import CorpusMetadataCensus, CorpusProfile
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class CorpusStats:
-    """Statistics extracted from the corpus for parameter tuning."""
-
-    chunk_count: int
-    avg_chunk_length: int
-    median_chunk_length: int
-    multi_file_corpus: bool  # chunks span multiple source files
-    has_rich_metadata: bool  # headers, cross-references present
-
-    @classmethod
-    def from_source(cls, source: Any) -> CorpusStats:
-        """Extract stats from a ChunkSource."""
-        collection = getattr(source, "collection", None)
-        if collection is None:
-            return cls(
-                chunk_count=0,
-                avg_chunk_length=0,
-                median_chunk_length=0,
-                multi_file_corpus=False,
-                has_rich_metadata=False,
-            )
-
-        chunks = list(collection)
-        chunk_count = len(chunks)
-        if chunk_count == 0:
-            return cls(
-                chunk_count=0,
-                avg_chunk_length=0,
-                median_chunk_length=0,
-                multi_file_corpus=False,
-                has_rich_metadata=False,
-            )
-
-        lengths = [len(c.content) for c in chunks]
-        avg_chunk_length = int(statistics.mean(lengths))
-        median_chunk_length = int(statistics.median(lengths))
-
-        # Check if chunks span multiple source files.
-        files: set[str] = set()
-        rich_metadata_count = 0
-        rich_keys = {"h1", "h2", "h3", "section_header", "title", "cross_references"}
-        for chunk in chunks:
-            meta = chunk.metadata_dict if hasattr(chunk, "metadata_dict") else {}
-            file_val = meta.get("file", "")
-            if file_val:
-                files.add(str(file_val))
-            if any(meta.get(k) for k in rich_keys):
-                rich_metadata_count += 1
-
-        multi_file_corpus = len(files) > 1
-        has_rich_metadata = rich_metadata_count > chunk_count * 0.3
-
-        return cls(
-            chunk_count=chunk_count,
-            avg_chunk_length=avg_chunk_length,
-            median_chunk_length=median_chunk_length,
-            multi_file_corpus=multi_file_corpus,
-            has_rich_metadata=has_rich_metadata,
-        )
-
-
 def emit_corpus_warnings(
-    corpus_stats: CorpusStats,
+    census: CorpusMetadataCensus,
+    profile: CorpusProfile,
     cfg: Any,
 ) -> list[str]:
     """Return warnings when config looks infeasible for the corpus."""
     warnings: list[str] = []
-    chunk_count = corpus_stats.chunk_count
-    if chunk_count == 0:
+
+    if census.chunk_count == 0:
         warnings.append("Corpus has 0 chunks — auto-tune cannot assess feasibility.")
         return warnings
 
+    suitability_scores: dict[str, float] = getattr(profile, "chunk_suitability_scores", {})
+    suitable_fraction = sum(1 for s in suitability_scores.values() if s > 0.4) / max(
+        len(suitability_scores), 1
+    )
+
+    # Low date prevalence + temporal mode
+    mode_dist = dict(cfg.targets.reasoning_mode_distribution)
+    temporal_weight = mode_dist.get("temporal", 0)
+    if temporal_weight > 0 and census.date_prevalence < 0.3:
+        date_pct = int(census.date_prevalence * 100)
+        if census.date_prevalence < 0.05:
+            new_temporal_pct = 0
+        else:
+            new_temporal_pct = int(min(temporal_weight, census.date_prevalence) * 100)
+        warnings.append(
+            f"Only {date_pct}% of chunks have date metadata — "
+            f"temporal reasoning mode reduced to {new_temporal_pct}%."
+        )
+
+    # Low linkability + multi-hop ratio
+    linkability = _compute_linkability(census)
+    multi_hop_ratio = dict(cfg.targets.primary_type_distribution).get("multi_hop", 0.7)
+    adjusted_mh = max(0.3, multi_hop_ratio * linkability)
+
+    if adjusted_mh < multi_hop_ratio - 0.001:
+        scores = sorted(suitability_scores.values())
+        p50 = scores[len(scores) // 2] if scores else 0.0
+        warnings.append(
+            f"Corpus has low linkability (suitability p50={p50:.2f}) — "
+            f"multi-hop ratio reduced to {adjusted_mh:.0%}."
+        )
+
+    # Effective pool vs total_samples
+    effective_pool = int(census.chunk_count * suitable_fraction)
     total_samples = cfg.targets.total_samples
-    multi_hop_ratio = cfg.targets.primary_type_distribution.get("multi_hop", 0.7)
-    multi_hop_target = int(total_samples * multi_hop_ratio)
-
-    if total_samples > chunk_count * 2:
+    if effective_pool > 0 and total_samples > effective_pool * 2:
+        suitable_pct = int(suitable_fraction * 100)
+        cap = effective_pool * 2
         warnings.append(
-            f"Corpus has {chunk_count} chunks but {total_samples} samples "
-            f"requested. Expect high rejection rates — consider reducing "
-            f"total_samples to ~{chunk_count}."
+            f"Effective pool is {effective_pool} chunks ({suitable_pct}% suitable) — "
+            f"total_samples capped at {cap}."
         )
 
-    if multi_hop_target > chunk_count * 0.5:
-        warnings.append(
-            f"Requesting {multi_hop_target} multi_hop pairs from "
-            f"{chunk_count} chunks. Multi-hop requires cross-chunk "
-            f"linking — this may produce many rejections."
-        )
-
-    hop_dist = cfg.targets.hop_distribution
-    high_hop_pct = sum(v for k, v in hop_dist.items() if int(k) >= 3)
-    if high_hop_pct > 0.3 and chunk_count < 200:
-        warnings.append(
-            f"3+ hop questions are {high_hop_pct:.0%} of multi_hop "
-            f"target, but corpus only has {chunk_count} chunks. "
-            f"Consider reducing hop targets."
-        )
-
-    if not corpus_stats.multi_file_corpus:
+    # Single-file corpus
+    if not census.multi_file_corpus:
         warnings.append(
             "Corpus appears to be from a single source file. "
-            "Multi-hop cross-document questions may have limited "
-            "diversity."
+            "Multi-hop cross-document questions may have limited diversity."
         )
 
     return warnings
 
 
 def auto_tune(
-    corpus_stats: CorpusStats,
+    census: CorpusMetadataCensus,
+    profile: CorpusProfile,
     cfg: Any,
 ) -> dict[str, Any]:
     """Derive sensible defaults from corpus characteristics.
 
     Returns dict of adjusted values. Does NOT mutate cfg — caller applies.
 
-    Rules:
-    - Small corpus (<100 chunks): reduce total_samples to
-      min(user_target, chunk_count)
-    - total_samples capped at 2 * chunk_count
-    - Low metadata: reduce multi_hop ratio
-    - Short chunks: reduce hop targets
+    Adjustments:
+    - 7a: Multi-hop ratio — graduated by metadata regime + entity density
+    - 7b: Hop distribution — suitability-aware, with short-chunk gate preserved
+    - 7c: Total samples — capped at 2× effective pool (suitable chunks)
+    - 7d: Reasoning modes — temporal/sequential removed or capped by prevalence
     """
     adjustments: dict[str, Any] = {}
-    chunk_count = corpus_stats.chunk_count
-    if chunk_count == 0:
+
+    if census.chunk_count == 0:
         return adjustments
 
+    suitability_scores: dict[str, float] = getattr(profile, "chunk_suitability_scores", {})
+    suitable_fraction = sum(1 for s in suitability_scores.values() if s > 0.4) / max(
+        len(suitability_scores), 1
+    )
+
+    # --- 7a. Multi-hop ratio (graduated by regime + entity density) ---
+    linkability = _compute_linkability(census)
+    current_dist = dict(cfg.targets.primary_type_distribution)
+    target_mh = current_dist.get("multi_hop", 0.7)
+    adjusted_mh = max(0.3, target_mh * linkability)
+
+    if abs(adjusted_mh - target_mh) > 0.001:
+        adjustments["primary_type_distribution"] = {
+            "lookup": round(1.0 - adjusted_mh, 2),
+            "multi_hop": round(adjusted_mh, 2),
+        }
+
+    # --- 7b. Hop distribution (suitability-aware + short-chunk gate) ---
+    hop_dist = {int(k): float(v) for k, v in cfg.targets.hop_distribution.items()}
+    high_hop_weight = sum(v for k, v in hop_dist.items() if k >= 3)
+
+    if suitability_scores and suitable_fraction < 0.3:
+        # Very low suitability: cap at 2-hop
+        adjustments["hop_distribution"] = {2: 1.0}
+    elif (suitability_scores and suitable_fraction < 0.5 and high_hop_weight > 0.2) or (
+        census.content_length_p50 < 600 and high_hop_weight > 0.2
+    ):
+        # Moderate suitability or short chunks: halve 3+ hop, redistribute to 2-hop
+        adjustments["hop_distribution"] = _halve_high_hops(hop_dist)
+
+    # --- 7c. Total samples — effective pool cap ---
+    effective_pool = int(census.chunk_count * suitable_fraction)
     total_samples = cfg.targets.total_samples
+    if effective_pool > 0 and total_samples > effective_pool * 2:
+        adjustments["total_samples"] = effective_pool * 2
 
-    # Cap total_samples at 2 * chunk_count.
-    if total_samples > chunk_count * 2:
-        adjustments["total_samples"] = min(total_samples, chunk_count * 2)
+    # --- 7d. Reasoning mode distribution — prevalence-proportional ---
+    mode_dist = dict(cfg.targets.reasoning_mode_distribution)
+    mode_changed = False
 
-    # Small corpus: cap at chunk_count.
-    if chunk_count < 100 and total_samples > chunk_count:
-        adjustments["total_samples"] = min(
-            adjustments.get("total_samples", total_samples),
-            chunk_count,
-        )
+    if "temporal" in mode_dist:
+        if census.date_prevalence < 0.05:
+            temporal_weight = mode_dist.pop("temporal")
+            _redistribute_weight(mode_dist, temporal_weight)
+            mode_changed = True
+        elif census.date_prevalence < 0.3:
+            current_temporal = mode_dist["temporal"]
+            capped = min(current_temporal, census.date_prevalence)
+            if capped < current_temporal:
+                mode_dist["temporal"] = capped
+                _redistribute_weight(mode_dist, current_temporal - capped, exclude="temporal")
+                mode_changed = True
 
-    # Low metadata richness: reduce multi_hop ratio.
-    if not corpus_stats.has_rich_metadata:
-        current_dist = dict(cfg.targets.primary_type_distribution)
-        mh = current_dist.get("multi_hop", 0.7)
-        if mh > 0.4:
-            adjusted_mh = max(0.3, mh - 0.2)
-            adjusted_lookup = 1.0 - adjusted_mh
-            adjustments["primary_type_distribution"] = {
-                "lookup": round(adjusted_lookup, 2),
-                "multi_hop": round(adjusted_mh, 2),
-            }
+    if "sequential" in mode_dist:
+        if census.sequential_prevalence < 0.05:
+            seq_weight = mode_dist.pop("sequential")
+            _redistribute_weight(mode_dist, seq_weight)
+            mode_changed = True
+        elif census.sequential_prevalence < 0.3:
+            current_seq = mode_dist["sequential"]
+            capped = min(current_seq, census.sequential_prevalence)
+            if capped < current_seq:
+                mode_dist["sequential"] = capped
+                _redistribute_weight(mode_dist, current_seq - capped, exclude="sequential")
+                mode_changed = True
 
-    # Short median chunks: reduce high-hop targets.
-    if corpus_stats.median_chunk_length < 600:
-        hop_dist = {int(k): float(v) for k, v in cfg.targets.hop_distribution.items()}
-        high_hop_weight = sum(v for k, v in hop_dist.items() if k >= 3)
-        if high_hop_weight > 0.2:
-            adjusted_hop: dict[int, float] = {}
-            redistributed = 0.0
-            for k, v in hop_dist.items():
-                if k >= 3:
-                    new_v = v * 0.5
-                    redistributed += v - new_v
-                    adjusted_hop[k] = new_v
-                else:
-                    adjusted_hop[k] = v
-            # Redistribute to 2-hop.
-            adjusted_hop[2] = adjusted_hop.get(2, 0.0) + redistributed
-            adjustments["hop_distribution"] = adjusted_hop
+    if mode_changed:
+        total_weight = sum(mode_dist.values())
+        if total_weight > 0:
+            mode_dist = {k: round(v / total_weight, 4) for k, v in mode_dist.items()}
+        adjustments["reasoning_mode_distribution"] = mode_dist
 
     return adjustments
+
+
+def _redistribute_weight(
+    mode_dist: dict[str, float],
+    weight: float,
+    exclude: str | None = None,
+) -> None:
+    """Distribute *weight* proportionally across remaining modes in-place."""
+    remaining = {k: v for k, v in mode_dist.items() if k != exclude}
+    total = sum(remaining.values())
+    if total > 0:
+        for k in remaining:
+            mode_dist[k] += weight * (remaining[k] / total)
+    else:
+        mode_dist["factual"] = mode_dist.get("factual", 0) + weight
+
+
+def _compute_linkability(census: CorpusMetadataCensus) -> float:
+    """Derive linkability score from metadata regime and entity density."""
+    regime_linkability = {"structured": 1.0, "mixed": 0.6, "unstructured": 0.3}
+    linkability = regime_linkability.get(census.metadata_regime, 0.3)
+    if census.entity_density_p25 > 0.0:
+        linkability = min(1.0, linkability + 0.15)
+    return linkability
+
+
+def _halve_high_hops(hop_dist: dict[int, float]) -> dict[int, float]:
+    """Halve the weight of 3+ hop types and redistribute to 2-hop."""
+    adjusted: dict[int, float] = {}
+    redistributed = 0.0
+    for k, v in hop_dist.items():
+        if k >= 3:
+            new_v = v * 0.5
+            redistributed += v - new_v
+            adjusted[k] = new_v
+        else:
+            adjusted[k] = v
+    adjusted[2] = adjusted.get(2, 0.0) + redistributed
+    return adjusted
 
 
 def should_early_stop(

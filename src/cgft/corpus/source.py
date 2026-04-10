@@ -118,6 +118,10 @@ class ChunkSource(Protocol):
         """Return an embedding vector for *text*, or ``None`` if unsupported."""
         ...
 
+    def get_chunk_count(self) -> int:
+        """Return the total number of chunks in the corpus."""
+        ...
+
     def get_search_capabilities(self) -> SearchCapabilities:
         """Return search capabilities for this backend."""
         ...

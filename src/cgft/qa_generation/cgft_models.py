@@ -295,10 +295,11 @@ class MetadataLinkerCfg:
 class SearchAgentLinkerCfg:
     """Config for ``SearchAgentLinker`` (rollout-based)."""
 
-    max_turns: int = 2
-    max_tool_calls: int = 3
-    max_completion_tokens: int = 2048
+    max_turns: int = 4
+    max_tool_calls: int = 4
+    max_completion_tokens: int = 3072
     fallback_to_metadata: bool = True
+    auto_scale_turns: bool = True
     env_bundle: EnvBundleConfig = field(default_factory=EnvBundleConfig)
 
 
