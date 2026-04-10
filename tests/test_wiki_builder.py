@@ -31,8 +31,13 @@ class FakeChunk:
         return self.content
 
 
-def _make_entity(name: str, etype: str = "entity", df: float = 0.3) -> EntityPattern:
-    return EntityPattern(name=name, type=etype, document_frequency=df, idf_weight=1.0)
+def _make_entity(
+    name: str, etype: str = "entity", df: float = 0.05, quality_score: float = 0.9,
+) -> EntityPattern:
+    return EntityPattern(
+        name=name, type=etype, document_frequency=df,
+        idf_weight=1.0, quality_score=quality_score,
+    )
 
 
 def _make_config(**kwargs: Any) -> WikiPreprocessingConfig:
@@ -103,7 +108,7 @@ class TestClusterChunks:
             FakeChunk(content="API handles requests.", hash="h3"),
         ]
         # DF=0.95 means ubiquitous — should be ignored
-        entities = [_make_entity("API", df=0.95)]
+        entities = [_make_entity("API", df=0.95, quality_score=0.2)]
         builder = _make_builder(min_chunks_per_page=2)
 
         clusters = builder.cluster_chunks(chunks, entities)
@@ -117,7 +122,7 @@ class TestClusterChunks:
             FakeChunk(content="POST /api/v2/items creates an item.", hash="h2"),
             FakeChunk(content="No routes here, just prose.", hash="h3"),
         ]
-        entities = [_make_entity(r"(?:GET|POST) /api/v\d+/\w+", etype="code_pattern", df=0.4)]
+        entities = [_make_entity(r"(?:GET|POST) /api/v\d+/\w+", etype="code_pattern", df=0.05)]
         builder = _make_builder(min_chunks_per_page=2)
 
         clusters = builder.cluster_chunks(chunks, entities)

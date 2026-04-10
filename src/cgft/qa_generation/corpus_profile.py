@@ -40,46 +40,8 @@ class EntityPattern:
     document_frequency: float = 0.0
     idf_weight: float = 0.0
     quality_score: float = 0.0
-
-
-@dataclass
-class CorpusMetadataCensus:
-    """Corpus-relative distributions for calibrating chunk scoring.
-
-    Computed once over the profile pool after entity extraction.
-    All percentile fields are derived from ``statistics.quantiles(data, n=4)``.
-    """
-
-    # Prevalence: fraction of chunks with each metadata type
-    header_prevalence: float  # any of h1/h2/h3/title/section_header
-    doc_id_prevalence: float  # file_name/document_id/source
-    date_prevalence: float  # date/timestamp fields
-    sequential_prevalence: float  # prev_chunk_id/next_chunk_id or file+index
-
-    # Content length distribution (characters)
-    content_length_p25: int
-    content_length_p50: int
-    content_length_p75: int
-
-    # Entity density distribution (recognized entities per 1000 chars)
-    entity_density_p25: float
-    entity_density_p50: float
-    entity_density_p75: float
-
-    # Lexical diversity distribution (unique tokens / total tokens)
-    lexical_diversity_p25: float
-    lexical_diversity_p50: float
-    lexical_diversity_p75: float
-
-    # Derived classification
-    metadata_regime: str  # "structured" | "mixed" | "unstructured"
-
-    # Chunk count (from source)
-    chunk_count: int
-
-    @property
-    def multi_file_corpus(self) -> bool:
-        return self.doc_id_prevalence > 0.05
+    semantic_score: float = 0.0  # avg KeyBERT cosine similarity (0 for heuristic)
+    aliases: tuple[str, ...] = ()  # non-canonical names merged into this entity
 
 
 @dataclass
@@ -276,12 +238,15 @@ _ENTITY_STOPWORDS = frozenset({
 
 
 def _score_entity_quality(pattern: EntityPattern) -> float:
-    """Score entity quality from DF + name heuristics. Returns [0, 1].
+    """Score entity quality from DF + name heuristics + semantic signal. Returns [0, 1].
 
-    Combines three signals:
-    - DF discriminativeness (50%): flat top at 0.02-0.10, taper to 0 at 0.40.
-    - Type bonus (30%): entity > code_pattern > domain_term.
-    - Name quality (20%): uppercase required for high score; all-stopword penalised.
+    When ``semantic_score`` is set (KeyBERT entities), it replaces the name
+    quality heuristic — giving a direct, language-agnostic quality signal.
+
+    Weights:
+    - DF discriminativeness (40%): flat top at 0.02-0.10, taper to 0 at 0.40.
+    - Type bonus (20%): entity > code_pattern > domain_term.
+    - Name/semantic quality (40%): semantic_score when available, else name heuristics.
     """
     df = pattern.document_frequency
 
@@ -305,20 +270,74 @@ def _score_entity_quality(pattern: EntityPattern) -> float:
     else:  # domain_term
         type_score = 0.6
 
-    # Name quality
-    if pattern.type == "code_pattern":
-        name_score = 0.8  # regex patterns bypass text heuristics
+    # Name/semantic quality
+    if pattern.semantic_score > 0.0:
+        # KeyBERT entities: use semantic similarity directly (already 0-1 range)
+        name_score = min(pattern.semantic_score / 0.6, 1.0)  # normalize: 0.6+ → 1.0
+    elif pattern.type == "code_pattern":
+        name_score = 0.8
     else:
         words = pattern.name.lower().split()
         if all(w in _ENTITY_STOPWORDS for w in words):
             name_score = 0.0
+        elif len(pattern.name) < 4:
+            name_score = 0.4
         else:
-            has_upper = any(c.isupper() for c in pattern.name)
-            name_score = 1.0 if has_upper else 0.3
-            if len(pattern.name) < 4:
-                name_score *= 0.5
+            name_score = 0.7  # neutral baseline
 
-    return df_score * 0.5 + type_score * 0.3 + name_score * 0.2
+    return df_score * 0.4 + type_score * 0.2 + name_score * 0.4
+
+
+def _compute_entity_specificity(
+    entity_patterns: list[EntityPattern],
+    entity_chunk_idx: dict[str, set[str]],
+    chunk_entity_idx: dict[str, list[str]],
+) -> None:
+    """Second-pass quality refinement using co-occurrence entropy.
+
+    Generic section headers (Setup, Troubleshooting) co-occur with random
+    entities across many topics → high entropy → low specificity.
+    Domain-specific entities (Feature Flags, Error Tracking) co-occur with a
+    consistent set of related entities → low entropy → high specificity.
+
+    This signal is language-agnostic: it relies only on the bipartite graph
+    structure, not any English vocabulary.
+
+    Mutates ``entity_patterns`` in place, blending specificity into
+    ``quality_score``:  quality = base_quality * 0.7 + specificity * 0.3
+    """
+    for pattern in entity_patterns:
+        name_lower = pattern.name.lower()
+        chunks_with_entity = entity_chunk_idx.get(name_lower, set())
+
+        if not chunks_with_entity:
+            continue
+
+        # Build frequency distribution of co-occurring entity names
+        cooc_counts: dict[str, int] = {}
+        for chunk_hash in chunks_with_entity:
+            for other_name in chunk_entity_idx.get(chunk_hash, []):
+                if other_name.lower() == name_lower:
+                    continue
+                key = other_name.lower()
+                cooc_counts[key] = cooc_counts.get(key, 0) + 1
+
+        if not cooc_counts:
+            # Appears only in isolation — treat as maximally specific
+            specificity = 1.0
+        else:
+            total = sum(cooc_counts.values())
+            raw_entropy = 0.0
+            for count in cooc_counts.values():
+                p = count / total
+                raw_entropy -= p * math.log(p)
+
+            n_distinct = len(cooc_counts)
+            max_entropy = math.log(n_distinct) if n_distinct > 1 else 1.0
+            normalized_entropy = raw_entropy / max_entropy if max_entropy > 0 else 0.0
+            specificity = 1.0 - normalized_entropy
+
+        pattern.quality_score = pattern.quality_score * 0.7 + specificity * 0.3
 
 
 def build_entity_chunk_graph(
@@ -356,6 +375,9 @@ def build_entity_chunk_graph(
                 except re.error:
                     continue
             elif name_lower in content:
+                matched.add(chunk_hash)
+                chunk_entity_idx.setdefault(chunk_hash, []).append(pattern.name)
+            elif any(alias.lower() in content for alias in pattern.aliases):
                 matched.add(chunk_hash)
                 chunk_entity_idx.setdefault(chunk_hash, []).append(pattern.name)
 
@@ -612,100 +634,477 @@ def build_entity_patterns_from_extraction(
     return patterns
 
 
-def extract_heuristic_entities(
-    sample_chunks: list[Any],
+# Header-like metadata keys that likely contain topic names.
+_HEADER_METADATA_KEYS = frozenset({
+    "h1", "h2", "h3", "title", "section_header", "article_title",
+    "heading", "topic", "subject",
+})
+
+
+def extract_metadata_entities(
+    chunks: list[Any],
+    *,
+    min_chunks: int = 3,
+    max_df: float = 0.15,
 ) -> list[EntityPattern]:
-    """Extract entity candidates directly from corpus text using heuristics.
+    """Extract entity candidates from chunk header/title metadata.
 
-    Three methods are combined and deduplicated:
-    1. TF-IDF top terms — discriminative single tokens.
-    2. Capitalized phrase extraction — multi-word proper nouns.
-    3. Frequent n-grams (bigrams + trigrams) — recurring domain phrases.
+    Scans metadata for header-like fields (h1-h3, title, article_title, etc.)
+    and returns unique values that appear in at least ``min_chunks`` chunks
+    but no more than ``max_df`` fraction of all chunks.
 
-    Because candidates come from the actual text, they match the corpus by
-    construction — unlike LLM-invented names that can't be found downstream.
+    Language-agnostic: works on any corpus with header metadata.
     """
-    if not sample_chunks:
-        return []
+    from collections import Counter  # noqa: PLC0415
 
-    n = len(sample_chunks)
+    header_counts: Counter[str] = Counter()
+    n = len(chunks)
 
-    # --- Method 1: TF-IDF top terms ---
-    token_df, _ = compute_token_document_frequency(sample_chunks, min_token_len=4)
-    idf_terms: list[tuple[float, str]] = []
-    for token, df in token_df.items():
-        df_frac = df / n
-        if df_frac < 0.005 or df_frac > 0.30:
+    for chunk in chunks:
+        metadata = getattr(chunk, "metadata", None)
+        if not metadata:
             continue
-        if token in _STOPWORDS:
-            continue
-        idf = math.log(n / df)
-        idf_terms.append((idf, token))
-    idf_terms.sort(reverse=True)
-    tfidf_patterns = [
-        EntityPattern(name=token, type="domain_term") for _, token in idf_terms[:80]
-    ]
-
-    # --- Method 2: Capitalized phrase extraction ---
-    cap_phrase_re = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
-    phrase_df: dict[str, int] = {}
-    for chunk in sample_chunks:
-        content = chunk.content if hasattr(chunk, "content") else str(chunk)
         seen_in_chunk: set[str] = set()
-        for match in cap_phrase_re.finditer(content):
-            phrase = match.group()
-            if phrase.lower() not in _STOPWORDS and phrase not in seen_in_chunk:
-                phrase_df[phrase] = phrase_df.get(phrase, 0) + 1
-                seen_in_chunk.add(phrase)
-    cap_patterns = [
-        EntityPattern(name=phrase, type="entity")
-        for phrase, df in phrase_df.items()
-        if df >= 2
-    ]
+        items = metadata if isinstance(metadata, (list, tuple)) else []
+        for key, value in items:
+            if key not in _HEADER_METADATA_KEYS:
+                continue
+            name = str(value).strip()
+            if not name or not _is_quality_entity(name):
+                continue
+            if name not in seen_in_chunk:
+                header_counts[name] += 1
+                seen_in_chunk.add(name)
 
-    # --- Method 3: Frequent bigrams and trigrams ---
-    ngram_df: dict[tuple[str, ...], int] = {}
-    for chunk in sample_chunks:
+    max_count = int(n * max_df) if n > 0 else 1
+    seen_lower: set[str] = set()
+    patterns: list[EntityPattern] = []
+    for name, count in header_counts.most_common():
+        if count < min_chunks:
+            break
+        if count > max_count:
+            continue
+        key = name.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        # Metadata headers start as domain_term — the graph scan will compute
+        # content DF and quality_score.  Generic headers ("Setup", "FAQ") get
+        # penalised by high DF; topic-specific ones ("Feature flags") survive.
+        patterns.append(EntityPattern(name=name, type="domain_term"))
+
+    logger.info(
+        "Metadata extraction: %d entities from headers (%d unique headers scanned)",
+        len(patterns),
+        len(header_counts),
+    )
+    return patterns
+
+
+_KEYBERT_MODEL_CACHE: dict[str, Any] = {}
+
+
+@dataclass
+class _KeyphraseCandidate:
+    name: str
+    chunk_count: int
+    avg_score: float
+    chunk_hashes: set[str]
+
+
+def _load_keybert_model(model_name: str) -> Any:
+    """Lazy-load and cache a KeyBERT model backed by a SentenceTransformer."""
+    if model_name in _KEYBERT_MODEL_CACHE:
+        return _KEYBERT_MODEL_CACHE[model_name]
+    from keybert import KeyBERT  # noqa: PLC0415
+    from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+
+    st_model = SentenceTransformer(model_name)
+    model = KeyBERT(model=st_model)
+    _KEYBERT_MODEL_CACHE[model_name] = model
+    return model
+
+
+def _extract_chunk_keyphrases(
+    chunks: list[Any],
+    model: Any,
+    top_k: int,
+    chunk_embeddings: dict[str, Any],
+    score_threshold: float = 0.4,
+) -> dict[str, list[tuple[str, float]]]:
+    """Per-chunk KeyBERT extraction.
+
+    Returns {chunk_hash: [(keyphrase, score), ...]}.
+    Keyphrases with score < score_threshold or where every token is a stopword are filtered.
+    """
+    result: dict[str, list[tuple[str, float]]] = {}
+    for chunk in chunks:
+        chunk_hash = getattr(chunk, "hash", str(id(chunk)))
         content = chunk.content if hasattr(chunk, "content") else str(chunk)
-        tokens = re.findall(r"\w+", content.lower())
-        seen_in_chunk: set[tuple[str, ...]] = set()  # type: ignore[assignment]
-        for size in (2, 3):
-            for i in range(len(tokens) - size + 1):
-                ngram = tuple(tokens[i : i + size])
-                if ngram not in seen_in_chunk:
-                    ngram_df[ngram] = ngram_df.get(ngram, 0) + 1
-                    seen_in_chunk.add(ngram)
-    ngram_patterns: list[EntityPattern] = []
-    for ngram, df in ngram_df.items():
-        df_frac = df / n
-        if df_frac < 0.01 or df_frac > 0.25:
+        if not content.strip():
+            result[chunk_hash] = []
             continue
-        if df < 3:
-            continue
-        if all(tok in _STOPWORDS for tok in ngram):
-            continue
-        joined = " ".join(ngram)
-        if len(joined) < 6:
-            continue
-        ngram_patterns.append(EntityPattern(name=joined, type="domain_term"))
 
-    # --- Deduplication ---
-    # Priority: "entity" > "domain_term".  First seen wins within a type tier.
-    seen_lower: dict[str, str] = {}  # lowercased name -> winning type
-    result_map: dict[str, EntityPattern] = {}
+        kwargs: dict[str, Any] = {
+            "keyphrase_ngram_range": (1, 2),
+            "use_mmr": True,
+            "diversity": 0.5,
+            "top_n": top_k,
+        }
+        emb = chunk_embeddings.get(chunk_hash)
+        if emb is not None:
+            import numpy as np  # noqa: PLC0415
 
-    for pattern in tfidf_patterns + ngram_patterns + cap_patterns:
-        key = pattern.name.lower()
-        existing_type = seen_lower.get(key)
-        if existing_type is None:
-            seen_lower[key] = pattern.type
-            result_map[key] = pattern
-        elif existing_type == "domain_term" and pattern.type == "entity":
-            # Upgrade to entity type
-            seen_lower[key] = "entity"
-            result_map[key] = pattern
+            kwargs["doc_embeddings"] = np.asarray(emb).reshape(1, -1)
 
-    return list(result_map.values())
+        try:
+            keywords = model.extract_keywords(content, **kwargs)
+        except Exception:
+            keywords = []
+
+        filtered = [
+            (phrase, score)
+            for phrase, score in keywords
+            if score >= score_threshold
+            and not all(tok in _STOPWORDS for tok in phrase.lower().split())
+        ]
+        result[chunk_hash] = filtered
+    return result
+
+
+def _aggregate_keyphrases(
+    chunk_keyphrases: dict[str, list[tuple[str, float]]],
+) -> list[_KeyphraseCandidate]:
+    """Group by case-folded keyphrase; track chunk_count, avg_score, chunk_hashes.
+
+    Keeps most common casing as canonical form.
+    Returns candidates sorted by chunk_count * avg_score descending.
+    """
+    grouped: dict[str, list[tuple[str, float, str]]] = defaultdict(list)
+    for chunk_hash, keyphrases in chunk_keyphrases.items():
+        for phrase, score in keyphrases:
+            grouped[phrase.lower()].append((phrase, score, chunk_hash))
+
+    candidates: list[_KeyphraseCandidate] = []
+    for _folded, entries in grouped.items():
+        casing_counts: dict[str, int] = {}
+        for phrase, _, _ in entries:
+            casing_counts[phrase] = casing_counts.get(phrase, 0) + 1
+        canonical = max(casing_counts, key=lambda k: casing_counts[k])
+
+        seen_chunks: set[str] = set()
+        scores: list[float] = []
+        chunk_hashes: set[str] = set()
+        for _, score, chunk_hash in entries:
+            if chunk_hash not in seen_chunks:
+                seen_chunks.add(chunk_hash)
+                scores.append(score)
+                chunk_hashes.add(chunk_hash)
+
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        candidates.append(
+            _KeyphraseCandidate(
+                name=canonical,
+                chunk_count=len(chunk_hashes),
+                avg_score=avg_score,
+                chunk_hashes=chunk_hashes,
+            )
+        )
+
+    candidates.sort(key=lambda c: c.chunk_count * c.avg_score, reverse=True)
+    return candidates
+
+
+def _filter_notable(
+    candidates: list[_KeyphraseCandidate],
+    chunk_embeddings: dict[str, Any],
+    *,
+    min_chunks: int = 3,
+    min_clusters: int = 2,
+) -> list[_KeyphraseCandidate]:
+    """Notability filter: require chunk count + embedding diversity.
+
+    For corpora < 50 chunks: relax min_chunks to 2 and skip diversity clustering.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    n_chunks = len(chunk_embeddings)
+    small_corpus = n_chunks < 50
+    effective_min_chunks = 2 if small_corpus else min_chunks
+
+    count_filtered = [c for c in candidates if c.chunk_count >= effective_min_chunks]
+
+    if small_corpus:
+        return count_filtered
+
+    from sklearn.cluster import KMeans  # noqa: PLC0415
+
+    result: list[_KeyphraseCandidate] = []
+    for candidate in count_filtered:
+        embeddings = [
+            chunk_embeddings[h] for h in candidate.chunk_hashes if h in chunk_embeddings
+        ]
+        if len(embeddings) < min_clusters:
+            continue
+        emb_matrix = np.stack(embeddings)
+        n_clusters = min(min_clusters, len(embeddings))
+        try:
+            km = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
+            km.fit(emb_matrix)
+            if len(set(km.labels_)) >= min_clusters:
+                result.append(candidate)
+        except Exception:
+            result.append(candidate)
+
+    return result
+
+
+_REGEX_CHARS = re.compile(r"[\\.*+?^${}()|[\]]")
+
+
+def _candidates_to_entity_patterns(
+    candidates: list[_KeyphraseCandidate],
+) -> list[EntityPattern]:
+    """Convert keyphrase candidates to EntityPattern with type classification.
+
+    - Contains regex-like chars → "code_pattern"
+    - Single capitalized word or multi-word with any capitalized word → "entity"
+    - Else → "domain_term"
+    """
+    patterns: list[EntityPattern] = []
+    seen_lower: set[str] = set()
+
+    for candidate in candidates:
+        name = candidate.name
+        key = name.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+
+        if _REGEX_CHARS.search(name):
+            entity_type = "code_pattern"
+        else:
+            words = name.split()
+            if any(w and w[0].isupper() for w in words):
+                entity_type = "entity"
+            else:
+                entity_type = "domain_term"
+
+        patterns.append(EntityPattern(name=name, type=entity_type))
+
+    return patterns
+
+
+_TYPE_PRIORITY: dict[str, int] = {"entity": 0, "code_pattern": 1, "domain_term": 2}
+
+
+def _merge_synonym_entities(
+    patterns: list[EntityPattern],
+    model: Any,
+    *,
+    similarity_threshold: float = 0.95,
+    max_cluster_size: int = 5,
+) -> list[EntityPattern]:
+    """Merge synonym entities using embedding similarity.
+
+    Embeds all entity names, clusters by cosine similarity, then per cluster picks
+    the canonical name (highest semantic_score, longest name as tiebreak), merges
+    type (highest priority: entity > code_pattern > domain_term), and stores
+    non-canonical names as aliases for graph scanning.
+
+    Skips clusters larger than max_cluster_size to avoid over-merging.
+    """
+    if len(patterns) < 2:
+        return patterns
+
+    import numpy as np  # noqa: PLC0415
+    from sklearn.cluster import AgglomerativeClustering  # noqa: PLC0415
+
+    names = [p.name for p in patterns]
+    try:
+        raw = model.model.embed(names)
+        embeddings = np.asarray(raw, dtype=np.float32)
+        if embeddings.ndim != 2 or embeddings.shape[0] != len(patterns):
+            return patterns
+    except Exception:
+        return patterns
+
+    # Normalize for cosine distance
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    normalized = (embeddings / norms).astype(np.float64)
+
+    clustering = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=1.0 - similarity_threshold,
+        linkage="average",
+        metric="cosine",
+    )
+    try:
+        labels = clustering.fit_predict(normalized)
+    except Exception:
+        return patterns
+
+    # Group patterns by cluster label
+    clusters: dict[int, list[EntityPattern]] = {}
+    for pattern, label in zip(patterns, labels):
+        clusters.setdefault(int(label), []).append(pattern)
+
+    def _numeric_signature(name: str) -> tuple[str, ...]:
+        """Extract numbers from a name — entities with different numbers should not merge."""
+        return tuple(re.findall(r"\d+", name))
+
+    result: list[EntityPattern] = []
+    for cluster_patterns in clusters.values():
+        if len(cluster_patterns) > max_cluster_size:
+            result.extend(cluster_patterns)
+            continue
+
+        if len(cluster_patterns) == 1:
+            result.append(cluster_patterns[0])
+            continue
+
+        # Sub-split: entities with different numeric content stay separate.
+        # "article 21" and "article 22" have similar embeddings but are distinct.
+        by_nums: dict[tuple[str, ...], list[EntityPattern]] = {}
+        for p in cluster_patterns:
+            sig = _numeric_signature(p.name)
+            by_nums.setdefault(sig, []).append(p)
+
+        for sub_group in by_nums.values():
+            if len(sub_group) == 1:
+                result.append(sub_group[0])
+                continue
+
+            # Canonical: highest semantic_score, longest name as tiebreak
+            canonical = max(sub_group, key=lambda p: (p.semantic_score, len(p.name)))
+
+            # Type: highest priority (lowest numeric value)
+            best_type = min(
+                (p.type for p in sub_group),
+                key=lambda t: _TYPE_PRIORITY.get(t, 99),
+            )
+
+            aliases = tuple(p.name for p in sub_group if p.name != canonical.name)
+            best_score = max(p.semantic_score for p in sub_group)
+
+            result.append(
+                EntityPattern(
+                    name=canonical.name,
+                    type=best_type,
+                    semantic_score=best_score,
+                    aliases=aliases,
+                )
+            )
+
+    return result
+
+
+def extract_entities(
+    chunks: list[Any],
+    *,
+    top_k_per_chunk: int = 20,
+    model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
+    score_threshold: float = 0.4,
+    notability_min_chunks: int = 3,
+    diversity_min_clusters: int = 2,
+) -> tuple[list[EntityPattern], dict[str, set[str]], dict[str, list[str]]]:
+    """Extract entity patterns using KeyBERT + metadata headers.
+
+    Automatically samples a subset of chunks for KeyBERT extraction
+    (7% of corpus, floor 500, cap 3000), then runs a cheap O(E×N) scan
+    with the discovered entities against the full corpus to build
+    the entity↔chunk bipartite graph.
+
+    Also extracts entities from chunk header metadata (h1-h3, title, etc.)
+    and merges them with KeyBERT candidates.
+
+    Args:
+        chunks: Full corpus chunks. A sample is drawn internally for
+            KeyBERT extraction; the full set is used for the graph scan
+            and metadata extraction.
+        top_k_per_chunk: Max keyphrases to extract per chunk.
+        model_name: SentenceTransformer model name for KeyBERT.
+        score_threshold: Minimum KeyBERT similarity score to keep a keyphrase.
+        notability_min_chunks: Min chunk count a keyphrase must appear in.
+        diversity_min_clusters: Min KMeans clusters required for diversity gate.
+
+    Returns:
+        (entity_patterns, entity_chunk_index, chunk_entity_index)
+        where entity_patterns have document_frequency and quality_score populated.
+    """
+    if not chunks:
+        return [], {}, {}
+
+    import numpy as np  # noqa: PLC0415
+
+    # Auto-sample for KeyBERT extraction
+    n_total = len(chunks)
+    sample_size = max(500, min(int(n_total * 0.07), 3000))
+    if n_total <= sample_size:
+        sample_chunks = chunks
+    else:
+        rng = random.Random(42)
+        sample_chunks = rng.sample(chunks, sample_size)
+
+    model = _load_keybert_model(model_name)
+    n_sample = len(sample_chunks)
+
+    contents = [
+        chunk.content if hasattr(chunk, "content") else str(chunk)
+        for chunk in sample_chunks
+    ]
+    chunk_hashes = [getattr(chunk, "hash", str(id(chunk))) for chunk in sample_chunks]
+
+    raw_embeddings: Any = model.model.embed(contents)
+    chunk_embeddings: dict[str, Any] = {
+        h: np.asarray(raw_embeddings[i]) for i, h in enumerate(chunk_hashes)
+    }
+
+    chunk_keyphrases = _extract_chunk_keyphrases(
+        sample_chunks, model, top_k_per_chunk, chunk_embeddings, score_threshold
+    )
+    candidates = _aggregate_keyphrases(chunk_keyphrases)
+    notable = _filter_notable(
+        candidates,
+        chunk_embeddings,
+        min_chunks=notability_min_chunks,
+        min_clusters=diversity_min_clusters,
+    )
+
+    patterns = _candidates_to_entity_patterns(notable)
+
+    # Populate semantic_score from KeyBERT avg_score
+    candidate_by_name: dict[str, _KeyphraseCandidate] = {
+        c.name.lower(): c for c in notable
+    }
+    for pattern in patterns:
+        candidate = candidate_by_name.get(pattern.name.lower())
+        if candidate is not None:
+            pattern.semantic_score = candidate.avg_score
+
+    # Merge metadata-derived entities (headers, titles)
+    metadata_patterns = extract_metadata_entities(chunks)
+    kb_names = {p.name.lower() for p in patterns}
+    for mp in metadata_patterns:
+        if mp.name.lower() not in kb_names:
+            patterns.append(mp)
+            kb_names.add(mp.name.lower())
+
+    # Merge semantic synonyms before scanning (e.g. "feature flag" / "feature flags")
+    patterns = _merge_synonym_entities(patterns, model)
+
+    # Cheap full-corpus scan with only the notable entities
+    entity_chunk_index, chunk_entity_index, _ = build_entity_chunk_graph(
+        patterns, chunks
+    )
+
+    logger.info(
+        "KeyBERT extraction: %d notable keyphrases from %d chunks",
+        len(notable),
+        n_sample,
+    )
+    return patterns, entity_chunk_index, chunk_entity_index
 
 
 def diverse_profile_sample(
