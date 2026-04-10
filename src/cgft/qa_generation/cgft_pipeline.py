@@ -54,6 +54,7 @@ from cgft.qa_generation.corpus_profile import (
 from cgft.qa_generation.filters import (
     DeterministicGuardsFilter,
     GroundingLLMFilter,
+    QualityGateFilter,
     RetrievalLLMFilter,
 )
 from cgft.qa_generation.formatters import TrainEvalFormatter
@@ -70,7 +71,7 @@ from cgft.qa_generation.protocols import (
 )
 from cgft.qa_generation.response_parsers import parse_corpus_summary_response
 from cgft.qa_generation.scoring import compute_eval_scores, extract_filter_scores
-from cgft.qa_generation.transformers import LLMStyleTransformer
+from cgft.qa_generation.transformers import BaseQuestionTransformer
 from cgft.qa_generation.transformers.dedup import IncrementalDeduplicator
 from cgft.trainer.client import RolloutClient
 
@@ -164,11 +165,13 @@ def _format_heuristic_candidates(candidates: list) -> str:
     return "\n\n".join(parts)
 
 
+_QUALITY_GATE_FILTER_STAGE = "quality_gate"
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
 _GROUNDING_FILTER_STAGE = "grounding_llm"
 _HOP_COUNT_VALIDITY_FILTER_STAGE = "hop_count_validity"
 _ENV_ROLLOUT_FILTER_STAGE = "env_rollout"
 _SUPPORTED_FILTER_STAGES = (
+    _QUALITY_GATE_FILTER_STAGE,
     _GROUNDING_FILTER_STAGE,
     _RETRIEVAL_TOO_EASY_FILTER_STAGE,
     _HOP_COUNT_VALIDITY_FILTER_STAGE,
@@ -276,6 +279,7 @@ def _build_metadata_linker(
             filter_same_file=mcfg.filter_same_file,
             min_coherence=mcfg.min_coherence,
             max_secondary_similarity=mcfg.max_secondary_similarity,
+            max_primary_similarity=mcfg.max_primary_similarity,
             retry_confidence=mcfg.retry_confidence,
             header_keys=mcfg.header_keys,
         ),
@@ -343,7 +347,8 @@ def _build_generator(
 
 
 def _build_transformer(cfg: CgftPipelineConfig) -> QuestionTransformer:
-    return LLMStyleTransformer(cfg.transformation)
+    del cfg
+    return BaseQuestionTransformer()
 
 
 def _build_filter_from_stage_name(
@@ -354,6 +359,8 @@ def _build_filter_from_stage_name(
     rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> EvaluatorFilter:
     stage = str(stage_name or "").strip().lower()
+    if stage == _QUALITY_GATE_FILTER_STAGE:
+        return QualityGateFilter(cfg.filtering.quality_gate)
     if stage == _GROUNDING_FILTER_STAGE:
         return GroundingLLMFilter(
             chunk_source=source,
@@ -852,6 +859,7 @@ def _build_regeneration_prompt(
     reasoning = str(verdict.reasoning if verdict is not None else "").strip()
     hint = str(metadata.get("refinement_hint", "")).strip()
     judge_reasoning = str(metadata.get("judge_reasoning", "")).strip()
+    lexical_evidence = str(metadata.get("judge_lexical_anchor_evidence", "")).strip()
     failure_type = _normalize_failure_type_for_regeneration(
         metadata=metadata,
         reason_code=reason_code,
@@ -880,6 +888,8 @@ def _build_regeneration_prompt(
         lines.append(f"- previous_refinement_hint: {hint}")
     if judge_reasoning:
         lines.append(f"- previous_judge_reasoning: {judge_reasoning}")
+    if lexical_evidence:
+        lines.append(f"- overlapping_terms_that_caused_rejection: {lexical_evidence}")
     if switched_seed:
         lines.append(
             "- reanchor_action: switched seed chunk after repeated failures "
@@ -1210,6 +1220,8 @@ def _generate_entity_extraction_patterns(
             temperature=0.0,
         )
         raw = completion.choices[0].message.content or ""
+        # Strip control characters that break JSON parsing
+        raw = re.sub(r"[\x00-\x1f]", " ", raw)
         data = json.loads(raw)
 
         valid_patterns: dict[str, str] = {}

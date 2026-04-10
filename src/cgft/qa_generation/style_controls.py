@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping, cast
+from typing import Any, cast
 
 from cgft.qa_generation.generated_qa import GeneratedQA
 
@@ -27,9 +28,9 @@ DEFAULT_QUERY_STYLE_DISTRIBUTION = {
 
 QA_TYPE_STYLE_DISTRIBUTIONS: dict[str, dict[str, float]] = {
     "lookup": {
-        QUERY_STYLE_KEYWORD: 0.60,
-        QUERY_STYLE_NATURAL: 0.30,
-        QUERY_STYLE_EXPERT: 0.10,
+        QUERY_STYLE_KEYWORD: 0.35,
+        QUERY_STYLE_NATURAL: 0.45,
+        QUERY_STYLE_EXPERT: 0.20,
     },
     "multi_hop": {
         QUERY_STYLE_KEYWORD: 0.10,

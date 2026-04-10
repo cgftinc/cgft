@@ -5,32 +5,23 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from cgft.qa_generation.cgft_models import CgftContext, TransformationConfig
+from cgft.qa_generation.cgft_models import CgftContext
 from cgft.qa_generation.generated_qa import GeneratedQA
 from cgft.qa_generation.style_controls import classify_query_style
-from cgft.qa_generation.transformers.validator import LLMSanityValidator
 
 logger = logging.getLogger(__name__)
 
 
 class BaseQuestionTransformer:
-    """Shared transform flow: mutate, validate, annotate style, and record metadata."""
+    """Annotation-only transformer: classifies query style and records metadata."""
 
     stats_mode = "base"
-
-    def __init__(self, cfg: TransformationConfig, *, enable_validation: bool = True) -> None:
-        self.cfg = cfg
-        self.validator: LLMSanityValidator | None = None
-        if enable_validation and cfg.validation_enabled:
-            self.validator = LLMSanityValidator(cfg)
 
     def transform(self, items: list[GeneratedQA], context: CgftContext) -> list[GeneratedQA]:
         stats = self._stats_bucket(context)
         for item in items:
             stats["processed"] = int(stats.get("processed", 0)) + 1
             original_question = str(item.qa.get("question", "")).strip()
-            if self.cfg.preserve_original_in_metadata and original_question:
-                item.generation_metadata.setdefault("original_question", original_question)
 
             try:
                 candidate_question, step_meta = self._transform_question(
@@ -48,16 +39,6 @@ class BaseQuestionTransformer:
             changed = bool(candidate_question and candidate_question != original_question)
             if changed:
                 self._set_question_fields(item, candidate_question)
-
-            validation_reason = "not_run"
-            if changed and self.validator is not None:
-                is_valid, validation_reason = self.validator.is_valid(item, context)
-                if not is_valid:
-                    self._set_question_fields(item, original_question)
-                    changed = False
-                    stats["validation_reverted"] = int(stats.get("validation_reverted", 0)) + 1
-
-            if changed:
                 stats["mutated"] = int(stats.get("mutated", 0)) + 1
             else:
                 stats["unchanged"] = int(stats.get("unchanged", 0)) + 1
@@ -68,7 +49,6 @@ class BaseQuestionTransformer:
                 item,
                 changed=changed,
                 style_observed=observed_style,
-                validation_reason=validation_reason,
                 original_question=original_question,
                 final_question=final_question,
                 step_meta=step_meta,
@@ -97,7 +77,6 @@ class BaseQuestionTransformer:
         mode_stats.setdefault("processed", 0)
         mode_stats.setdefault("mutated", 0)
         mode_stats.setdefault("unchanged", 0)
-        mode_stats.setdefault("validation_reverted", 0)
         mode_stats.setdefault("errors", 0)
         return mode_stats
 
@@ -122,7 +101,6 @@ class BaseQuestionTransformer:
         *,
         changed: bool,
         style_observed: str,
-        validation_reason: str,
         original_question: str,
         final_question: str,
         step_meta: dict[str, Any],
@@ -133,7 +111,6 @@ class BaseQuestionTransformer:
             "mode": self.stats_mode,
             "changed": changed,
             "style_observed": style_observed,
-            "validation_reason": validation_reason,
         }
         if step_meta:
             entry.update(step_meta)
@@ -145,6 +122,4 @@ class BaseQuestionTransformer:
         transform_meta["steps"] = steps
         transform_meta["style_observed"] = style_observed
         transform_meta["changed"] = any(bool(step.get("changed")) for step in steps)
-        if "target_style" in entry and entry["target_style"]:
-            transform_meta["target_style"] = entry["target_style"]
         item.generation_metadata["transformation"] = transform_meta
