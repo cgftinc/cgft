@@ -374,7 +374,7 @@ class RetrievalLLMFilterConfig:
     judge_user_template: str = DEFAULT_RETRIEVAL_JUDGE_USER_TEMPLATE
     top_k: int = 5
     overlap_threshold: float = 0.5
-    too_easy_confidence_threshold: float = 0.75
+    too_easy_confidence_threshold: float = 0.85
     too_easy_overlap_threshold: float = 0.65
     stats_key: str = "retrieval_too_easy_filter_stats"
     max_concurrent: int = 8
@@ -515,6 +515,21 @@ class OutputConfig:
 
 
 @dataclass
+class WikiPreprocessingConfig:
+    """Configuration for the optional wiki preprocessing stage."""
+
+    enabled: bool = False
+    min_chunks_per_page: int = 3
+    max_chunks_per_page: int = 20
+    max_entity_chunks: int = 100
+    max_page_tokens: int = 1500
+    max_context_tokens: int = 2000
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""
+
+
+@dataclass
 class CgftPipelineConfig:
     """Unified configuration for the Cgft pipeline."""
 
@@ -531,6 +546,7 @@ class CgftPipelineConfig:
     split: SplitConfig = field(default_factory=SplitConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    wiki_preprocessing: WikiPreprocessingConfig = field(default_factory=WikiPreprocessingConfig)
     micro_batch: MicroBatchConfig = field(default_factory=MicroBatchConfig)
     random_seed: int = 42
     verbose: bool = True
@@ -587,6 +603,13 @@ class CgftPipelineConfig:
             self.refinement.api_key = shared_llm_key
         if not self.refinement.base_url:
             self.refinement.base_url = shared_llm_base_url
+
+        if not self.wiki_preprocessing.api_key:
+            self.wiki_preprocessing.api_key = shared_llm_key
+        if not self.wiki_preprocessing.base_url:
+            self.wiki_preprocessing.base_url = shared_llm_base_url
+        if not self.wiki_preprocessing.model:
+            self.wiki_preprocessing.model = self.generation.llm_direct.model
 
 
 @dataclass
