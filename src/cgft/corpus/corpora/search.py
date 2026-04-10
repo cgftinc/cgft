@@ -56,27 +56,13 @@ class CorporaSearch:
         query: str,
         mode: str = "auto",
         top_k: int = 10,
-    ) -> list[str]:
-        """Search and return content strings. Lexical (BM25) only."""
+    ) -> list[dict[str, Any]]:
+        """Search and return structured results. Lexical (BM25) only."""
         if mode not in ("auto", "lexical"):
             raise ValueError(
                 f"CorporaSearch only supports 'lexical' mode, got '{mode}'. "
                 f"The Corpora API uses BM25 search only."
             )
-        client = self._get_client()
-        corpus_id = self._get_corpus_id()
-        result = client.search(corpus_id=corpus_id, query=query, limit=top_k)
-        return [chunk.content for chunk in result.results]
-
-    def search_with_metadata(
-        self,
-        query: str,
-        mode: str = "auto",
-        top_k: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Search and return structured results with metadata."""
-        if mode not in ("auto", "lexical"):
-            raise ValueError(f"CorporaSearch only supports 'lexical' mode, got '{mode}'.")
         client = self._get_client()
         corpus_id = self._get_corpus_id()
         result = client.search(corpus_id=corpus_id, query=query, limit=top_k)

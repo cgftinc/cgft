@@ -62,8 +62,8 @@ class ChromaSearch:
         query: str,
         mode: str = "auto",
         top_k: int = 10,
-    ) -> list[str]:
-        """Search and return content strings."""
+    ) -> list[dict[str, Any]]:
+        """Search and return structured results."""
         client = self._get_client()
 
         if mode == "auto":
@@ -96,7 +96,15 @@ class ChromaSearch:
                 top_k=top_k,
             )
 
-        return [client.extract_content(r["content"], r["metadata"]) for r in rows]
+        return [
+            {
+                "content": client.extract_content(r["content"], r["metadata"]),
+                "source": str(r["metadata"].get("file") or r["metadata"].get("file_path") or ""),
+                "metadata": r["metadata"],
+                "score": float(r.get("score", 0.0) or 0.0),
+            }
+            for r in rows
+        ]
 
     def embed(self, text: str) -> list[float] | None:
         """Return embedding vector, or None for auto-embed."""
