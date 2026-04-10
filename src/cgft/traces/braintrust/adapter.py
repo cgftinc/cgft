@@ -119,38 +119,53 @@ class BraintrustTraceAdapter:
     ) -> dict[str, dict[str, Any]]:
         """Fetch spans using BTQL, return grouped trace trees.
 
-        Single query with large LIMIT (no OFFSET — BTQL only supports
-        cursor-based pagination, not numeric offsets).
+        BTQL has a 1000-row max per query.  Paginates using
+        ``WHERE created < '{last_timestamp}'`` to fetch additional pages.
         ``project_id`` is always from ``list_projects()`` — not user input.
         """
         headers = {**credentials.to_headers(), "Content-Type": "application/json"}
-        # Each trace has ~10-20 child spans, so fetch 20x the desired trace count.
-        # BTQL has a max row limit (~1000), so cap there. For larger fetches
-        # the REST fallback handles it.
-        span_limit = min(max_traces * 20, 1000)
+        all_rows: list[dict[str, Any]] = []
+        created_before: str | None = None
+        trace_trees: dict[str, dict[str, Any]] = {}
 
-        query = (
-            f"SELECT {_BTQL_COLUMNS} "
-            f"FROM project_logs('{project_id}') "
-            f"ORDER BY created DESC "
-            f"LIMIT {span_limit}"
-        )
-        resp = request_with_retry(
-            "POST",
-            _BTQL_URL,
-            headers=headers,
-            json={"query": query, "fmt": "json"},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        while True:
+            where = f"WHERE created < '{created_before}'" if created_before else ""
+            query = (
+                f"SELECT {_BTQL_COLUMNS} "
+                f"FROM project_logs('{project_id}') "
+                f"{where} "
+                f"ORDER BY created DESC "
+                f"LIMIT 1000"
+            )
+            resp = request_with_retry(
+                "POST",
+                _BTQL_URL,
+                headers=headers,
+                json={"query": query, "fmt": "json"},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-        rows = data.get("data", data) if isinstance(data, dict) else data
-        if not isinstance(rows, list):
-            rows = []
+            rows = data.get("data", data) if isinstance(data, dict) else data
+            if not isinstance(rows, list) or not rows:
+                break
 
-        trace_trees = _group_into_traces(rows)
-        logger.info("BTQL fetch: %d spans, %d traces", len(rows), len(trace_trees))
+            all_rows.extend(rows)
+            created_before = rows[-1].get("created")
+
+            trace_trees = _group_into_traces(all_rows)
+            if len(trace_trees) >= max_traces:
+                break
+
+            # Last page — fewer than 1000 rows means no more data
+            if len(rows) < 1000:
+                break
+
+        if not trace_trees:
+            trace_trees = _group_into_traces(all_rows)
+
+        logger.info("BTQL fetch: %d spans, %d traces", len(all_rows), len(trace_trees))
         return trace_trees
 
     def _fetch_via_rest(
