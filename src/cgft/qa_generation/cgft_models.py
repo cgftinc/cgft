@@ -352,6 +352,17 @@ class DeterministicGuardsConfig:
 
 
 @dataclass
+class QualityGateConfig:
+    """Heuristic quality gate — runs before LLM filters to save cost."""
+
+    enabled: bool = True
+    reject_fragments: bool = True
+    reject_structural: bool = True
+    reject_guide_pointers: bool = True
+    refine_thin_answers: bool = True
+
+
+@dataclass
 class RetrievalLLMFilterConfig:
     """Retrieval + judge filter settings."""
 
@@ -430,12 +441,14 @@ class FilteringConfig:
     )
     filters: list[str] = field(
         default_factory=lambda: [
+            "quality_gate",
             "retrieval_too_easy_llm",
             "grounding_llm",
             "hop_count_validity",
         ]
     )
     query_rewrite: QueryRewriteConfig = field(default_factory=QueryRewriteConfig)
+    quality_gate: QualityGateConfig = field(default_factory=QualityGateConfig)
     retrieval_llm: RetrievalLLMFilterConfig = field(default_factory=RetrievalLLMFilterConfig)
     grounding_llm: GroundingLLMFilterConfig = field(default_factory=GroundingLLMFilterConfig)
     hop_count_validity: HopCountValidityCfg = field(default_factory=HopCountValidityCfg)

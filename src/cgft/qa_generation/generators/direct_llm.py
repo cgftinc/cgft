@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +22,11 @@ from cgft.qa_generation.cgft_models import (
 from cgft.qa_generation.generated_qa import GeneratedQA
 from cgft.qa_generation.helpers import render_template
 from cgft.qa_generation.models import QADataPoint, ReferenceChunk
+from cgft.qa_generation.style_controls import (
+    allocate_largest_remainder,
+    get_style_distribution,
+    style_sequence_from_counts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +66,10 @@ _DEFAULT_TEMPLATE = (
     "Your task is to generate a {qa_type} question that will require "
     "{target_hop_count} search steps to answer by gathering information from multiple sources.\n\n"
     "[[if reasoning_mode_instruction]]Reasoning focus: {reasoning_mode_instruction}\n\n[[endif]]"
-    "You must first reason inside <think> and </think> about how to connect the information "
-    "across the provided documents to create a challenging, multi-hop question.\n\n"
+    "You must first reason inside <think> and </think>:\n"
+    "1. Identify the 3 most distinctive content terms from EACH chunk provided.\n"
+    "2. Plan how to connect the chunks into a question framed around a SCENARIO or PROBLEM — not around the topics themselves.\n"  # noqa: E501
+    "3. Verify your planned question does NOT contain any of the terms from step 1. If it does, rephrase using descriptions of what those terms DO.\n\n"  # noqa: E501
     "[[if regeneration_attempt]]attempt={regeneration_attempt}\n[[endif]]"
     "[[if source_task_id]]source_task_id={source_task_id}\n[[endif]]"
     "[[if previous_failure_type]]previous_failure_type={previous_failure_type}\n[[endif]]"
@@ -94,6 +102,9 @@ _DEFAULT_TEMPLATE = (
     "     GOOD: 'When debugging why a feature rollout isn't behaving as expected for certain users,\n"  # noqa: E501
     "     what built-in tool shows you exactly what those users experienced?'\n"
     "     → Requires reasoning to connect feature flags and session recording. The connection is implicit.\n"  # noqa: E501
+    "     BAD: 'How do I make a tracking snippet load from my PHP theme layer?'\n"
+    "     → 'tracking snippet', 'PHP theme' are chunk terms. Keyword search retrieves directly.\n"
+    "     GOOD: 'How can I ensure visitor behavior is captured on every page of my CMS site without manually adding code to each template?'\n"  # noqa: E501
     "  2. PARAPHRASE CHUNK LANGUAGE: Replace key terms from source chunks with synonyms or descriptions.\n"  # noqa: E501
     "     If a human could find the answer by searching for 3+ words from your question, rewrite it.\n"  # noqa: E501
     "  If your question names specific features, APIs, or concepts from multiple chunks,\n"
@@ -101,13 +112,21 @@ _DEFAULT_TEMPLATE = (
     "  3. ANSWER GROUNDING: While the QUESTION should be obfuscated, the ANSWER must stay\n"
     "     closely grounded in the exact language of the source chunks. Use the same terms,\n"
     "     phrases, and specifics from the chunks in your answer. Do NOT paraphrase the answer.\n"
+    "[[if target_style]]- QUERY STYLE: Generate a {target_style}-style question.\n"
+    "  - 'keyword': Short phrase (3-7 words), no question mark. Like a search query.\n"
+    "  - 'natural': Full natural-language question with interrogative.\n"
+    "  - 'expert': Technical/diagnostic framing with domain terminology.\n"
+    "  IMPORTANT: Regardless of style, the RETRIEVAL DIFFICULTY requirements above still apply.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=too_easy:\n"
-    "  Your previous question was rejected because a search agent could find the answer too easily.\n"  # noqa: E501
-    "  The question reveals which chunks are needed.\n"
-    "  REWRITE as a SCENARIO: describe what the user is trying to achieve or what problem they're facing.\n"  # noqa: E501
-    "  Don't name the features or concepts directly.\n"
+    "  Your previous question was REJECTED because it shares keywords with the source chunk,\n"
+    "  making it trivially retrievable via BM25 keyword search.\n"
+    "  REWRITE by:\n"
+    "  1. Read the overlapping terms listed in the feedback (if available) — these caused the rejection.\n"  # noqa: E501
+    "  2. Replace ALL chunk-derived terms with goal/problem descriptions or synonyms.\n"
+    "  3. Frame as a SCENARIO: what is the user trying to accomplish? What symptom are they seeing?\n"  # noqa: E501
+    "  4. Self-check: would a keyword search for any 3-word substring of your new question find the chunk? If yes, rephrase again.\n"  # noqa: E501
     "  Previous failed question: {failed_question}\n"
-    "  Hint: Instead of naming the topics, describe their EFFECTS or USE CASES.\n[[endif]]"
+    "  Hint: Describe EFFECTS and USE CASES, not features and mechanisms.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer using current chunk evidence only.\n[[endif]]"
     "- Output exactly one question and one answer.\n"
     "- In chunks_used, list the indices of chunks you referenced (0=primary, 1+=secondary).\n"
@@ -123,10 +142,10 @@ _LOOKUP_TEMPLATE = (
     "[[if corpus_language]]LANGUAGE REQUIREMENT: You MUST generate the question and answer in {corpus_language}. "
     "Do not use any other language.\n\n[[endif]]"
     "Your task is to generate a single-hop lookup question answerable from one chunk.\n\n"
-    "You must first reason inside <think> and </think> about what a real user would "
-    "search for when they need the information in this chunk — but frame the question "
-    "using the user's language (goals, problems, symptoms), NOT the documentation's "
-    "terminology (feature names, config keys, API methods).\n\n"
+    "You must first reason inside <think> and </think>:\n"
+    "1. Identify the 5 most distinctive content terms in this chunk (feature names, config keys, product names, API methods).\n"  # noqa: E501
+    "2. Plan a question that a real user would ask when they need this information — framed around their GOAL or PROBLEM.\n"  # noqa: E501
+    "3. Verify your planned question does NOT contain any of the 5 terms from step 1. If it does, rephrase using synonyms or descriptions of what the term DOES.\n\n"  # noqa: E501
     "[[if regeneration_attempt]]attempt={regeneration_attempt}\n[[endif]]"
     "[[if source_task_id]]source_task_id={source_task_id}\n[[endif]]"
     "[[if previous_failure_type]]previous_failure_type={previous_failure_type}\n[[endif]]"
@@ -141,21 +160,40 @@ _LOOKUP_TEMPLATE = (
     "[[if regeneration_prompt]]Feedback:\n{regeneration_prompt}\n\n[[endif]]"
     "Requirements:\n"
     "- The question must be answerable from the primary chunk alone.\n"
-    "- RETRIEVAL DIFFICULTY REQUIREMENT:\n"
-    "  Frame the question as a user trying to accomplish something or solve a problem.\n"
-    "  Do NOT use key terms from the chunk — describe the goal, not the mechanism.\n"
-    "  BAD: 'How do I set up a dynamic exclusion in Tableau?'\n"
-    "  GOOD: 'How can I automatically hide future time periods in a dashboard based on the selected date grouping?'\n"  # noqa: E501
+    "- RETRIEVAL DIFFICULTY — CRITICAL:\n"
+    "  1. OBFUSCATE KEY TERMS: Your question must NOT use terminology from the chunk.\n"
+    "     Describe the GOAL or PROBLEM, not the mechanism or feature.\n"
+    "     If a human could find the answer by searching for 3+ content words from your question, rewrite it.\n"  # noqa: E501
+    "     BAD: 'How do I set up a dynamic exclusion in Tableau?'\n"
+    "     → Shares terminology with the chunk. Keyword search trivially retrieves it.\n"
+    "     GOOD: 'How can I automatically hide future time periods in a dashboard based on the selected date grouping?'\n"  # noqa: E501
+    "     BAD: 'How do I connect my PostHog account to a v0 chat assistant?'\n"
+    "     → Shares 'PostHog', 'connect', 'chat assistant' with chunk.\n"
+    "     GOOD: 'I want my product analytics tool to surface usage insights inside the AI coding interface I use — how do I wire that up?'\n"  # noqa: E501
+    "  2. PARAPHRASE CHUNK LANGUAGE: Replace feature names, API methods, and config keys with\n"
+    "     descriptions of what they DO or what PROBLEM they solve.\n"
+    "  3. ANSWER GROUNDING (MANDATORY): While the QUESTION must be obfuscated, the ANSWER must stay\n"  # noqa: E501
+    "     closely grounded in the exact language of the source chunk. Use the same terms,\n"
+    "     phrases, and specifics from the chunk in your answer. Do NOT paraphrase the answer.\n"
+    "     The question tests retrieval skill; the answer tests extraction accuracy.\n"
+    "[[if target_style]]- QUERY STYLE: Generate a {target_style}-style question.\n"
+    "  - 'keyword': Short phrase (3-7 words), no question mark. Like a search query.\n"
+    "  - 'natural': Full natural-language question with interrogative.\n"
+    "  - 'expert': Technical/diagnostic framing with domain terminology.\n"
+    "  IMPORTANT: Regardless of style, the RETRIEVAL DIFFICULTY requirements above still apply.\n[[endif]]"
     "- The answer should be specific and grounded in chunk evidence.\n"
     "- Use only chunk evidence; do not use outside knowledge.\n"
     "- Prefer task-oriented use-cases over internal implementation trivia.\n"
     "[[if previous_failure_type]]- If previous_failure_type=too_easy:\n"
-    "  Your previous question was rejected because a search agent could find the answer too easily.\n"  # noqa: E501
-    "  The question reveals which chunks are needed.\n"
-    "  REWRITE as a SCENARIO: describe what the user is trying to achieve or what problem they're facing.\n"  # noqa: E501
-    "  Don't name the features or concepts directly.\n"
+    "  Your previous question was REJECTED because it shares keywords with the source chunk,\n"
+    "  making it trivially retrievable via BM25 keyword search.\n"
+    "  REWRITE by:\n"
+    "  1. Read the overlapping terms listed in the feedback (if available) — these caused the rejection.\n"  # noqa: E501
+    "  2. Replace ALL chunk-derived terms with goal/problem descriptions or synonyms.\n"
+    "  3. Frame as a SCENARIO: what is the user trying to accomplish? What symptom are they seeing?\n"  # noqa: E501
+    "  4. Self-check: would a keyword search for any 3-word substring of your new question find the chunk? If yes, rephrase again.\n"  # noqa: E501
     "  Previous failed question: {failed_question}\n"
-    "  Hint: Instead of naming the topics, describe their EFFECTS or USE CASES.\n[[endif]]"
+    "  Hint: Describe EFFECTS and USE CASES, not features and mechanisms.\n[[endif]]"
     "[[if previous_failure_type]]- If previous_failure_type=unsupported, revise answer "
     "using current chunk evidence only.\n[[endif]]"
     "- Output exactly one question and one answer.\n"
@@ -390,6 +428,18 @@ class DirectLLMGenerator:
         corpus_description = str(context.get("corpus_description", "") or "").strip()
         corpus_language = str(context.get("corpus_language", "") or "").strip()
 
+        style_sequences: dict[str, list[str]] = {}
+        for qa_type_key in ("lookup", "multi_hop"):
+            type_tasks = [t for t in tasks if (t.qa_type or "lookup") == qa_type_key]
+            if type_tasks:
+                dist = get_style_distribution(qa_type_key)
+                counts = allocate_largest_remainder(len(type_tasks), dist)
+                seq = style_sequence_from_counts(counts)
+                context.rng.shuffle(seq)
+                style_sequences[qa_type_key] = seq
+
+        style_iters: dict[str, Iterator[str]] = {k: iter(v) for k, v in style_sequences.items()}
+
         prepared: list[_PreparedTask] = []
         show_prep_progress = self.cfg.show_batch_progress and len(tasks) > 1
         for task in tqdm(tasks, desc="Linking chunks", disable=not show_prep_progress):
@@ -450,6 +500,8 @@ class DirectLLMGenerator:
                     resolved_hop_count = requested_hop_count
                 resolved_hop_count = max(1, resolved_hop_count)
 
+            target_style = next(style_iters.get(resolved_qa_type, iter([])), "")
+
             builtin_default = (
                 _LOOKUP_TEMPLATE if resolved_qa_type == "lookup" else _DEFAULT_TEMPLATE
             )
@@ -473,6 +525,7 @@ class DirectLLMGenerator:
                 "expected_action": task.expected_action,
                 "failed_question": task.failed_question,
                 "failed_answer": task.failed_answer,
+                "target_style": target_style,
                 "primary_chunk": (
                     f"[0] {anchor.primary_chunk.chunk_str()}"
                     if hasattr(anchor.primary_chunk, "chunk_str")

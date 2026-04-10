@@ -54,6 +54,7 @@ from cgft.qa_generation.corpus_profile import (
 from cgft.qa_generation.filters import (
     DeterministicGuardsFilter,
     GroundingLLMFilter,
+    QualityGateFilter,
     RetrievalLLMFilter,
 )
 from cgft.qa_generation.formatters import TrainEvalFormatter
@@ -162,11 +163,13 @@ def _format_heuristic_candidates(candidates: list) -> str:
     return "\n\n".join(parts)
 
 
+_QUALITY_GATE_FILTER_STAGE = "quality_gate"
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
 _GROUNDING_FILTER_STAGE = "grounding_llm"
 _HOP_COUNT_VALIDITY_FILTER_STAGE = "hop_count_validity"
 _ENV_ROLLOUT_FILTER_STAGE = "env_rollout"
 _SUPPORTED_FILTER_STAGES = (
+    _QUALITY_GATE_FILTER_STAGE,
     _GROUNDING_FILTER_STAGE,
     _RETRIEVAL_TOO_EASY_FILTER_STAGE,
     _HOP_COUNT_VALIDITY_FILTER_STAGE,
@@ -354,6 +357,8 @@ def _build_filter_from_stage_name(
     rollout_client_factory: Callable[[CgftPipelineConfig], RolloutClient] | None = None,
 ) -> EvaluatorFilter:
     stage = str(stage_name or "").strip().lower()
+    if stage == _QUALITY_GATE_FILTER_STAGE:
+        return QualityGateFilter(cfg.filtering.quality_gate)
     if stage == _GROUNDING_FILTER_STAGE:
         return GroundingLLMFilter(
             chunk_source=source,
@@ -852,6 +857,7 @@ def _build_regeneration_prompt(
     reasoning = str(verdict.reasoning if verdict is not None else "").strip()
     hint = str(metadata.get("refinement_hint", "")).strip()
     judge_reasoning = str(metadata.get("judge_reasoning", "")).strip()
+    lexical_evidence = str(metadata.get("judge_lexical_anchor_evidence", "")).strip()
     failure_type = _normalize_failure_type_for_regeneration(
         metadata=metadata,
         reason_code=reason_code,
@@ -880,6 +886,8 @@ def _build_regeneration_prompt(
         lines.append(f"- previous_refinement_hint: {hint}")
     if judge_reasoning:
         lines.append(f"- previous_judge_reasoning: {judge_reasoning}")
+    if lexical_evidence:
+        lines.append(f"- overlapping_terms_that_caused_rejection: {lexical_evidence}")
     if switched_seed:
         lines.append(
             "- reanchor_action: switched seed chunk after repeated failures "
