@@ -77,6 +77,10 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 strict_optional = true
 
+[tool.pytest.ini_options]
+markers = ["integration: requires live API credentials (deselected by default)"]
+addopts = "-m 'not integration'"
+
 [dependency-groups]
 dev = [
     "jedi-language-server>=0.46.0",
