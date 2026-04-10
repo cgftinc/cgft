@@ -80,23 +80,29 @@ def _reconstruct_from_children(
     # Start with the best child's input messages (the fullest context)
     messages = list(_parse_messages_field(best_child.get("input", {})))
 
+    # Track content already in the best child's input so we can skip
+    # subsequent children whose output was already consumed.
+    seen_content = {m.content for m in messages if m.content}
+
     # Append the best child's output
     output_msgs = _parse_output(best_child.get("output", {}))
     messages.extend(output_msgs)
 
-    # Append subsequent children's outputs
+    # Append subsequent children's outputs (skip duplicates already in input)
     if best_idx >= 0:
         for child in children[best_idx + 1 :]:
             span_type = _get_span_type(child)
             if span_type == "tool":
-                # Tool response
                 tool_output = _extract_tool_response(child)
-                if tool_output:
+                if tool_output and tool_output.content not in seen_content:
                     messages.append(tool_output)
+                    seen_content.add(tool_output.content)
             else:
-                # LLM or other span — append output
                 output_msgs = _parse_output(child.get("output", {}))
-                messages.extend(output_msgs)
+                for msg in output_msgs:
+                    if msg.content not in seen_content:
+                        messages.append(msg)
+                        seen_content.add(msg.content)
 
     return messages if _has_assistant_messages(messages) else []
 
