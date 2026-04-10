@@ -107,7 +107,9 @@ Return JSON only:
   "confidence": "high"
 }}"""
 
-_ENTITY_CONSOLIDATION_SYSTEM_PROMPT = "You are an expert at organizing and consolidating entity lists extracted from a document corpus."  # noqa: E501
+_ENTITY_CONSOLIDATION_SYSTEM_PROMPT = (
+    "You are an expert at organizing and consolidating entity lists extracted from a document corpus."  # noqa: E501
+)
 
 _ENTITY_CONSOLIDATION_USER_TEMPLATE = """\
 You are organizing entity candidates extracted from a corpus.
@@ -1188,8 +1190,7 @@ def _generate_entity_extraction_patterns(
         language_note = (
             f"\nLanguage: {corpus_language}. Candidates and chunks are in "
             f"{corpus_language} — evaluate them in that language.\n"
-            if corpus_language
-            else ""
+            if corpus_language else ""
         )
         user_prompt = _ENTITY_CONSOLIDATION_USER_TEMPLATE.format(
             corpus_description=corpus_description,
@@ -1463,10 +1464,7 @@ class CgftPipeline:
 
             # Phase 2: LLM consolidation (consolidates heuristic candidates)
             extraction = _generate_entity_extraction_patterns(
-                cfg,
-                source,
-                context,
-                heuristic_candidates=heuristic_entities,
+                cfg, source, context, heuristic_candidates=heuristic_entities,
             )
             if extraction is not None:
                 cfg.corpus_context.entity_extraction = extraction
@@ -2318,8 +2316,7 @@ def _filter_and_sample_seeds(
         # In-memory: score all chunks on-the-fly, filter by threshold
         candidates = [c for c in collection.chunks if len(c.content) >= min_chars]
         eligible = [
-            c
-            for c in candidates
+            c for c in candidates
             if (
                 profile.chunk_suitability_scores.get(c.hash)
                 or compute_chunk_suitability(c, profile.census, profile)
@@ -2350,8 +2347,7 @@ def _filter_and_sample_seeds(
             return []
 
         eligible = [
-            c
-            for c in all_chunks
+            c for c in all_chunks
             if compute_chunk_suitability(c, profile.census, profile) > threshold
         ]
         profile._api_eligible_cache = eligible if eligible else all_chunks
