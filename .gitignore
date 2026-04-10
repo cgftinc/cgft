@@ -32,6 +32,9 @@ htmlcov/
 .DS_Store
 *.log
 
+# Integration test secrets (use .env.test.example as template)
+.env.test
+
 # Generated artifacts
 *.jsonl
 
