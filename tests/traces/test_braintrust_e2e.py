@@ -104,3 +104,44 @@ class TestBraintrustE2E:
             for msg in trace.messages:
                 assert msg.role in ("system", "user", "assistant", "tool")
                 assert isinstance(msg.content, str)
+
+    def test_fetch_traces_default_limit(self):
+        """Fetch with no limit — matches the wizard Modal worker usage.
+
+        The Modal worker calls ``fetch_traces(creds, project_id)`` with
+        no limit, which defaults to 1000. This exercises the BTQL
+        ``span_limit = max_traces * 20`` heuristic at real scale.
+        """
+        _skip_if_no_creds()
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key=_API_KEY)
+
+        count = adapter.count_traces(creds, _PROJECT_ID)
+        if count < 50:
+            pytest.skip("Need at least 50 traces for bulk fetch test")
+
+        # No limit — matches actual wizard usage
+        traces, _ = adapter.fetch_traces(creds, _PROJECT_ID)
+        assert len(traces) >= 50
+
+        # Every trace should have an id and at least one message
+        for trace in traces:
+            assert trace.id
+            assert len(trace.messages) > 0
+
+        # No duplicate trace IDs
+        trace_ids = [t.id for t in traces]
+        assert len(trace_ids) == len(set(trace_ids))
+
+    def test_btql_direct_no_fallback(self):
+        """Call _fetch_via_btql directly — proves BTQL works without REST fallback."""
+        _skip_if_no_creds()
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key=_API_KEY)
+
+        # Call BTQL directly — any BTQL error will raise, not silently fall back
+        trace_trees = adapter._fetch_via_btql(creds, _PROJECT_ID, max_traces=100)
+        assert len(trace_trees) > 0
+        for trace_id, tree in trace_trees.items():
+            assert "root" in tree
+            assert tree["root"] is not None
