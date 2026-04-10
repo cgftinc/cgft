@@ -46,7 +46,9 @@ def _format_email_block(email_message: dict, reply_chain_message_index: int | No
     cc_addresses = email_message.get("cc") if isinstance(email_message.get("cc"), list) else []
     cc_str = "; ".join(_format_address(address) for address in cc_addresses) if cc_addresses else ""
 
-    order_prefix = f"msg #{reply_chain_message_index} | " if reply_chain_message_index is not None else ""
+    order_prefix = (
+        f"msg #{reply_chain_message_index} | " if reply_chain_message_index is not None else ""
+    )
     header = f"[{order_prefix}{date_str} | {from_str} -> {to_str}"
     if cc_str:
         header += f" | cc: {cc_str}"
@@ -128,7 +130,9 @@ def _normalize_thread_rows_for_reconstruction(
         row["cc"] = cc_addresses
         row["_reconstruct_message_id"] = message_id_for_coverage
         row["_reconstruct_parent_id"] = parent_message_id
-        row["_reconstruct_date_sort_key"] = _coerce_date_sort_key(row.get("date"), canonical_message_id)
+        row["_reconstruct_date_sort_key"] = _coerce_date_sort_key(
+            row.get("date"), canonical_message_id
+        )
         normalized_rows.append(row)
 
     return normalized_rows
@@ -160,7 +164,9 @@ def _build_thread_graph(
             continue
 
         if parent_message_id in canonical_row_by_message_id:
-            parent_coverage_id = canonical_row_by_message_id[parent_message_id]["_reconstruct_message_id"]
+            parent_coverage_id = canonical_row_by_message_id[parent_message_id][
+                "_reconstruct_message_id"
+            ]
             child_message_ids_by_parent_id[parent_coverage_id].append(coverage_message_id)
             parent_id_by_message_id[coverage_message_id] = parent_coverage_id
 
@@ -209,7 +215,9 @@ def _find_graph_components(
         while stack:
             current_message_id = stack.pop()
             component_message_ids.append(current_message_id)
-            for neighbor_message_id in sorted(undirected_neighbors_by_message_id[current_message_id]):
+            for neighbor_message_id in sorted(
+                undirected_neighbors_by_message_id[current_message_id]
+            ):
                 if neighbor_message_id in visited_message_ids:
                     continue
                 visited_message_ids.add(neighbor_message_id)
@@ -230,7 +238,11 @@ def _build_leaf_path(
     seen_message_ids: set[str] = set()
     current_message_id = leaf_message_id
 
-    while current_message_id and current_message_id in message_by_id and current_message_id not in seen_message_ids:
+    while (
+        current_message_id
+        and current_message_id in message_by_id
+        and current_message_id not in seen_message_ids
+    ):
         seen_message_ids.add(current_message_id)
         path_message_ids_reversed.append(current_message_id)
         current_message_id = parent_id_by_message_id.get(current_message_id, "")
@@ -283,10 +295,15 @@ def _build_cycle_component_path(
     - choose cycle start by newest date (tie: lexicographic message id)
     - follow parent pointers until repeat
     """
-    cycle_message_ids = _find_cycle_nodes_in_component(component_message_ids, parent_id_by_message_id)
+    cycle_message_ids = _find_cycle_nodes_in_component(
+        component_message_ids, parent_id_by_message_id
+    )
     if not cycle_message_ids:
         return [
-            sorted(component_message_ids, key=lambda message_id: message_by_id[message_id]["_reconstruct_date_sort_key"])[-1]
+            sorted(
+                component_message_ids,
+                key=lambda message_id: message_by_id[message_id]["_reconstruct_date_sort_key"],
+            )[-1]
         ]
 
     cycle_start_message_id = sorted(
@@ -349,7 +366,7 @@ def _compact_fork_paths(
                 best_shared_prefix = shared_prefix_length
 
         if best_shared_prefix > SHARED_PREFIX_THRESHOLD:
-            trimmed_path = current_path[max(0, best_shared_prefix - CONTEXT_TAIL_FOR_BRANCH):]
+            trimmed_path = current_path[max(0, best_shared_prefix - CONTEXT_TAIL_FOR_BRANCH) :]
             compacted_paths.append(trimmed_path)
         else:
             compacted_paths.append(current_path)
@@ -437,7 +454,10 @@ def _reconstruct_paths_from_reply_graph(
             retained_descriptors: list[dict] = []
             compacted_signatures = {tuple(path) for path in compacted_leaf_paths}
             for descriptor in reconstructed_path_descriptors:
-                if descriptor["component_index"] != component_index or descriptor["path_type"] != "leaf_path":
+                if (
+                    descriptor["component_index"] != component_index
+                    or descriptor["path_type"] != "leaf_path"
+                ):
                     retained_descriptors.append(descriptor)
                     continue
                 if tuple(descriptor["message_ids"]) in compacted_signatures:
@@ -488,7 +508,9 @@ def _reconstruct_paths_from_reply_graph(
             }
         )
 
-    reconstructed_paths = [descriptor["message_ids"] for descriptor in reconstructed_path_descriptors]
+    reconstructed_paths = [
+        descriptor["message_ids"] for descriptor in reconstructed_path_descriptors
+    ]
     reconstructed_paths = _ensure_full_message_coverage(
         reconstructed_paths=reconstructed_paths,
         all_message_ids=all_message_ids,
@@ -496,7 +518,8 @@ def _reconstruct_paths_from_reply_graph(
 
     # Reattach metadata to possibly-extended path set.
     path_descriptor_by_signature = {
-        tuple(descriptor["message_ids"]): descriptor for descriptor in reconstructed_path_descriptors
+        tuple(descriptor["message_ids"]): descriptor
+        for descriptor in reconstructed_path_descriptors
     }
     final_path_descriptors: list[dict] = []
     for path_message_ids in reconstructed_paths:
@@ -619,7 +642,7 @@ class EmailChunker:
             if not path_messages:
                 continue
 
-            subject = (path_messages[0].get("subject") or "")
+            subject = path_messages[0].get("subject") or ""
             windows = _build_windows_from_path(
                 path_messages=path_messages,
                 max_chars=self.max_chars,
@@ -639,7 +662,9 @@ class EmailChunker:
                 window_start_order = min(window_message_orders)
                 window_end_order = max(window_message_orders)
                 participant_info = extract_participants(window_only_messages)
-                participants_display = _compact_participants_display(str(participant_info["display"]))
+                participants_display = _compact_participants_display(
+                    str(participant_info["display"])
+                )
                 participants = list(participant_info["tokens"])
                 date_start = date_yyyy_mm_dd(window_only_messages[0].get("date"))
                 date_end = date_yyyy_mm_dd(window_only_messages[-1].get("date"))
@@ -652,8 +677,7 @@ class EmailChunker:
                 content = (
                     f"Subject: {subject or 'unknown'}\n"
                     f"Date: {date_range_display}\n"
-                    f"Participants: {participants_display}\n\n"
-                    + "\n\n".join(blocks)
+                    f"Participants: {participants_display}\n\n" + "\n\n".join(blocks)
                 )
                 chunk_id = f"{chain_key}-{chunk_index_in_path + 1}"
                 path_chunk_descriptors.append(
@@ -687,7 +711,9 @@ class EmailChunker:
             for descriptor in path_chunk_descriptors:
                 parent_chunk_id = str(descriptor.get("parent_chunk_id") or "")
                 if parent_chunk_id:
-                    child_chunk_ids_by_parent_id[parent_chunk_id].append(str(descriptor["chunk_id"]))
+                    child_chunk_ids_by_parent_id[parent_chunk_id].append(
+                        str(descriptor["chunk_id"])
+                    )
 
             for descriptor in path_chunk_descriptors:
                 chunk_id = str(descriptor["chunk_id"])
@@ -719,7 +745,9 @@ class EmailChunker:
         else:
             raw_rows = json.loads(text)
             if not isinstance(raw_rows, list):
-                raise ValueError(f"Expected a JSON array in {file_path}, got {type(raw_rows).__name__}")
+                raise ValueError(
+                    f"Expected a JSON array in {file_path}, got {type(raw_rows).__name__}"
+                )
 
         schema_warnings = validate_rows(raw_rows)
         if schema_warnings:
@@ -741,10 +769,12 @@ class EmailChunker:
         folder_path = Path(folder_path).resolve()
         all_chunks: list[Chunk] = []
 
-        json_files = sorted([
-            *folder_path.rglob("*.json"),
-            *folder_path.rglob("*.jsonl"),
-        ])
+        json_files = sorted(
+            [
+                *folder_path.rglob("*.json"),
+                *folder_path.rglob("*.jsonl"),
+            ]
+        )
         if not json_files:
             print(f"No .json or .jsonl files found in {folder_path}")
             return ChunkCollection([])

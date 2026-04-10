@@ -31,7 +31,7 @@ class ChunkInspector:
         """Build hierarchical file tree from flat file paths."""
         self.tree: dict[str, Any] = {}
         for file in self.collection.files:
-            parts = file.split('/')
+            parts = file.split("/")
             current = self.tree
             for part in parts[:-1]:  # folders
                 if part not in current:
@@ -39,16 +39,9 @@ class ChunkInspector:
                 current = current[part]
             # Store file with chunk count
             chunks = self.collection.get_file_chunks(file)
-            current[parts[-1]] = {
-                "_chunks": len(chunks),
-                "_file_path": file
-            }
+            current[parts[-1]] = {"_chunks": len(chunks), "_file_path": file}
 
-    def summary(
-        self,
-        max_depth: int = 3,
-        max_files_per_folder: int = 10
-    ) -> None:
+    def summary(self, max_depth: int = 3, max_files_per_folder: int = 10) -> None:
         """Print tree-based summary of collection.
 
         Args:
@@ -87,16 +80,10 @@ class ChunkInspector:
         print(f"  Mean: {mean_size} chars")
         print()
         print("File Structure:")
-        self._print_tree(self.tree, depth=0, max_depth=max_depth,
-                        max_files=max_files_per_folder)
+        self._print_tree(self.tree, depth=0, max_depth=max_depth, max_files=max_files_per_folder)
 
     def _print_tree(
-        self,
-        node: dict[str, Any],
-        depth: int,
-        max_depth: int,
-        max_files: int,
-        prefix: str = ""
+        self, node: dict[str, Any], depth: int, max_depth: int, max_files: int, prefix: str = ""
     ) -> None:
         """Recursively print tree structure."""
         if depth >= max_depth:
@@ -113,8 +100,7 @@ class ChunkInspector:
             print(f"{prefix}{connector}{name}/")
 
             extension = "    " if is_last_folder else "│   "
-            self._print_tree(subtree, depth + 1, max_depth, max_files,
-                           prefix + extension)
+            self._print_tree(subtree, depth + 1, max_depth, max_files, prefix + extension)
 
         # Print files
         displayed_files = files[:max_files]
@@ -132,7 +118,7 @@ class ChunkInspector:
         chunk: Chunk,
         show_context_before: bool = False,
         show_context_after: bool = False,
-        context_max_chars: int = 200
+        context_max_chars: int = 200,
     ) -> str:
         """Format a chunk as a string with optional context.
 
@@ -176,11 +162,7 @@ class ChunkInspector:
         lines.append("\n" + "=" * 80)
         return "\n".join(lines)
 
-    def read_file(
-        self,
-        file_path: str,
-        max_chunks: int | None = None
-    ) -> str:
+    def read_file(self, file_path: str, max_chunks: int | None = None) -> str:
         """Read all chunks from a specific file.
 
         Args:

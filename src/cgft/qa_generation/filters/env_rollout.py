@@ -259,7 +259,10 @@ class EnvRolloutFilter:
             model=self.cfg.judge_model,
             messages=[
                 {"role": "system", "content": _JUDGE_SYSTEM},
-                {"role": "user", "content": _JUDGE_USER.format(reference=reference, candidate=candidate)},
+                {
+                    "role": "user",
+                    "content": _JUDGE_USER.format(reference=reference, candidate=candidate),
+                },
             ],
             temperature=0.0,
             response_format={"type": "json_object"},

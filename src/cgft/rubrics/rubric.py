@@ -1,4 +1,3 @@
-
 import asyncio
 import fcntl
 import json
@@ -36,7 +35,7 @@ def load_rubric_cache() -> Dict[str, Dict]:
         return {}
 
     try:
-        with open(RUBRIC_CACHE_FILE, 'r') as f:
+        with open(RUBRIC_CACHE_FILE, "r") as f:
             # Acquire shared lock for reading (multiple readers allowed)
             fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             try:
@@ -55,7 +54,7 @@ def save_rubric_cache(cache: Dict[str, Dict]) -> None:
         # Use a temporary file and atomic rename to prevent corruption
         temp_file = RUBRIC_CACHE_FILE + f".tmp.{os.getpid()}"
 
-        with open(temp_file, 'w') as f:
+        with open(temp_file, "w") as f:
             # Acquire exclusive lock for writing (blocks all other access)
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
@@ -71,7 +70,7 @@ def save_rubric_cache(cache: Dict[str, Dict]) -> None:
     except Exception as e:
         print(f"Error saving rubric cache: {e}")
         # Clean up temp file if it exists
-        if 'temp_file' in locals() and os.path.exists(temp_file):
+        if "temp_file" in locals() and os.path.exists(temp_file):
             try:
                 os.remove(temp_file)
             except:
@@ -119,14 +118,16 @@ def _build_rubric_eval_tasks(
             if not text:
                 tasks.append(_zero_rubric_result())
             else:
-                tasks.append(evaluate_single_rubric(
-                    rubric=rubric,
-                    question=question,
-                    response=text,
-                    model_name=model_name,
-                    base_url=base_url,
-                    timeout=timeout,
-                ))
+                tasks.append(
+                    evaluate_single_rubric(
+                        rubric=rubric,
+                        question=question,
+                        response=text,
+                        model_name=model_name,
+                        base_url=base_url,
+                        timeout=timeout,
+                    )
+                )
             meta.append((i, rubric.type, rubric))
     return tasks, meta
 
@@ -164,7 +165,8 @@ def atomic_cache_update(update_fn, max_retries: int = 5) -> None:
                 print(f"Failed to update cache after {max_retries} attempts: {e}")
                 raise
             # Retry with exponential backoff
-            time.sleep(0.1 * (2 ** attempt))
+            time.sleep(0.1 * (2**attempt))
+
 
 RUBRIC_EVALUATION_PROMPT = """You are evaluating a response against a specific quality criterion.
 
@@ -316,9 +318,10 @@ Never create positive/negative versions of same criterion:
 Generate only the most impactful, non-redundant rubrics revealing meaningful quality differences.
 """
 
+
 def _static_rubric_key(title: str) -> str:
     key = title.lower()
-    key = re.sub(r'[^a-z0-9]+', '_', key)
+    key = re.sub(r"[^a-z0-9]+", "_", key)
     return f"rubric_{key.strip('_')}"
 
 
@@ -340,6 +343,7 @@ def _extract_json(s: str) -> dict:
             pass
 
     raise ValueError("Response did not contain valid JSON.")
+
 
 async def generate_instance_wise_adaptive_rubrics(
     question: str,
@@ -369,7 +373,7 @@ async def generate_instance_wise_adaptive_rubrics(
     """
     prompt_suffix = f"Question: {question}\nGround Truth: {ground_truth}\nResponses:\n"
     for i, response in enumerate(response_list):
-        prompt_suffix += f"Response {i+1}:\n{response}\n\n"
+        prompt_suffix += f"Response {i + 1}:\n{response}\n\n"
 
     if existing_rubrics:
         prompt_suffix += f"\n\nExisting Rubrics:\n{existing_rubrics}"
@@ -431,15 +435,12 @@ async def evaluate_single_rubric(
     """
     ground_truth_text = str(ground_truth or "").strip()
     ground_truth_block = (
-        f"**Ground Truth (Optional)**: {ground_truth_text}\n"
-        if ground_truth_text
-        else ""
+        f"**Ground Truth (Optional)**: {ground_truth_text}\n" if ground_truth_text else ""
     )
     if rubric.score_map:
         allowed_scores = ", ".join(str(score) for score in rubric.score_map.keys())
         score_rubric = "\n".join(
-            f"- {score}: {description}"
-            for score, description in rubric.score_map.items()
+            f"- {score}: {description}" for score, description in rubric.score_map.items()
         )
         prompt = RUBRIC_RANGED_EVALUATION_PROMPT.format(
             rubric_type=rubric.type,
@@ -546,9 +547,7 @@ def filter_and_cache_rubrics(
 
         # Keep only top 3 rubrics by std for this type
         cache[rubric_type] = sorted(
-            cache[rubric_type],
-            key=lambda x: x.get("std", 0),
-            reverse=True
+            cache[rubric_type], key=lambda x: x.get("std", 0), reverse=True
         )[:3]
 
         print(f"Cached {rubric_type}: {len(cache[rubric_type])} rubrics (top 3 by std)")
@@ -668,7 +667,9 @@ async def group_rubric_based_reward_function(
     question_hash = str(abs(hash(str(user_prompt))))
     log_buffer: Dict[str, List[str]] = {rid: [] for rid in rollout_ids}
     for rid in rollout_ids:
-        log_buffer[rid].append(f"[ground_truth]\n{ground_truth}\n{len([t for t in completion_texts if t])}")
+        log_buffer[rid].append(
+            f"[ground_truth]\n{ground_truth}\n{len([t for t in completion_texts if t])}"
+        )
 
     # Adaptive rubrics are generated per-instance and aggregated into a single reward component.
     adaptive_raw = [0.0] * len(completion_texts)
@@ -692,35 +693,71 @@ async def group_rubric_based_reward_function(
         n_adaptive_neg = len(cache["negative_rubrics"])
         adap_tasks, adap_meta = [], []
         for tasks, meta in [
-            _build_rubric_eval_tasks(completion_texts, [_cache_dict_to_rubric(r, "positive") for r in cache["positive_rubrics"]], question=user_prompt, model_name=model_name, base_url=llm_judge_url, timeout=timeout),
-            _build_rubric_eval_tasks(completion_texts, [_cache_dict_to_rubric(r, "negative") for r in cache["negative_rubrics"]], question=user_prompt, model_name=model_name, base_url=llm_judge_url, timeout=timeout),
+            _build_rubric_eval_tasks(
+                completion_texts,
+                [_cache_dict_to_rubric(r, "positive") for r in cache["positive_rubrics"]],
+                question=user_prompt,
+                model_name=model_name,
+                base_url=llm_judge_url,
+                timeout=timeout,
+            ),
+            _build_rubric_eval_tasks(
+                completion_texts,
+                [_cache_dict_to_rubric(r, "negative") for r in cache["negative_rubrics"]],
+                question=user_prompt,
+                model_name=model_name,
+                base_url=llm_judge_url,
+                timeout=timeout,
+            ),
         ]:
             adap_tasks.extend(tasks)
             adap_meta.extend(meta)
 
-        for (i, rubric_type, rubric), result in zip(adap_meta, await asyncio.gather(*adap_tasks) if adap_tasks else []):
+        for (i, rubric_type, rubric), result in zip(
+            adap_meta, await asyncio.gather(*adap_tasks) if adap_tasks else []
+        ):
             sign = 1.0 if rubric_type == "positive" else -1.0
             adaptive_raw[i] += sign * result["score"]
             marker = "+" if rubric_type == "positive" else "-"
-            log_buffer[rollout_ids[i]].append(f"  [{marker}][adaptive] {rubric.title}: score={result['score']} reasoning={result['reasoning']}")
+            log_buffer[rollout_ids[i]].append(
+                f"  [{marker}][adaptive] {rubric.title}: score={result['score']} reasoning={result['reasoning']}"
+            )
 
     # Static rubrics (each scored independently)
     static_rewards: List[Dict[str, float]] = [{} for _ in completions]
     stat_tasks, stat_meta = [], []
     for tasks, meta in [
-        _build_rubric_eval_tasks(completion_texts, static_positive, question=user_prompt, model_name=model_name, base_url=llm_judge_url, timeout=timeout),
-        _build_rubric_eval_tasks(completion_texts, static_negative, question=user_prompt, model_name=model_name, base_url=llm_judge_url, timeout=timeout),
+        _build_rubric_eval_tasks(
+            completion_texts,
+            static_positive,
+            question=user_prompt,
+            model_name=model_name,
+            base_url=llm_judge_url,
+            timeout=timeout,
+        ),
+        _build_rubric_eval_tasks(
+            completion_texts,
+            static_negative,
+            question=user_prompt,
+            model_name=model_name,
+            base_url=llm_judge_url,
+            timeout=timeout,
+        ),
     ]:
         stat_tasks.extend(tasks)
         stat_meta.extend(meta)
 
-    for (i, rubric_type, rubric), result in zip(stat_meta, await asyncio.gather(*stat_tasks) if stat_tasks else []):
+    for (i, rubric_type, rubric), result in zip(
+        stat_meta, await asyncio.gather(*stat_tasks) if stat_tasks else []
+    ):
         raw = result["score"]
         score = raw if rubric_type == "positive" else 1.0 - raw
         key = _static_rubric_key(rubric.title)
         static_rewards[i][key] = score
         marker = "+" if rubric_type == "positive" else "-"
-        log_buffer[rollout_ids[i]].append(f"  [{marker}][static] {rubric.title} ({key}): score={score} reasoning={result['reasoning']}\n    llm_output: {result.get('llm_output', '')}")
+        log_buffer[rollout_ids[i]].append(
+            f"  [{marker}][static] {rubric.title} ({key}): score={score} reasoning={result['reasoning']}\n    llm_output: {result.get('llm_output', '')}"
+        )
 
     # Final Reward dict
     rewards: List[Dict[str, float]] = []
@@ -767,7 +804,9 @@ async def single_rubric_based_reward_function(
     log_lines = [f"[ground_truth]\n{ground_truth}"]
 
     tasks = [
-        _zero_rubric_result() if not text else evaluate_single_rubric(
+        _zero_rubric_result()
+        if not text
+        else evaluate_single_rubric(
             rubric=rubric,
             question=prompt,
             response=text,

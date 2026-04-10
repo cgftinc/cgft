@@ -500,7 +500,11 @@ async def apply_pivot_filter_async(
         if llm_client is None:
             raise ValueError("Either llm_client or ratings must be provided")
         all_ratings = await _compute_ratings_async(
-            examples, traces, llm_client, model, max_concurrency,
+            examples,
+            traces,
+            llm_client,
+            model,
+            max_concurrency,
             checkpoint_dir=checkpoint_dir,
             progress_callback=progress_callback,
         )
@@ -594,10 +598,7 @@ async def _compute_ratings_async(
         checkpoint = PivotCheckpointManager(checkpoint_dir, model)
         cached_ratings = checkpoint.resume()
 
-    uncached = [
-        ex for ex in llm_examples
-        if (ex.trace_id, ex.turn_index) not in cached_ratings
-    ]
+    uncached = [ex for ex in llm_examples if (ex.trace_id, ex.turn_index) not in cached_ratings]
 
     if cached_ratings:
         logger.info(
@@ -618,7 +619,11 @@ async def _compute_ratings_async(
     # Phase 3: rate uncached turns via LLM
     if uncached:
         new_ratings = await _rate_all_turns(
-            llm_client, model, uncached, traces, max_concurrency,
+            llm_client,
+            model,
+            uncached,
+            traces,
+            max_concurrency,
             checkpoint=checkpoint,
             progress_callback=progress_callback,
             completed_offset=completed_offset,

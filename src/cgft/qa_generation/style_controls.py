@@ -111,11 +111,19 @@ def style_sequence_from_counts(style_counts: Mapping[str, int]) -> list[str]:
     return sequence
 
 
-def classify_query_style(question: str) -> str:
-    """Classify a question into keyword, natural, or expert style."""
+def classify_query_style(question: str, language: str = "") -> str:
+    """Classify a question into keyword, natural, or expert style.
+
+    When *language* is provided, uses language-appropriate tokenization and
+    interrogative detection so that non-Latin scripts are not misclassified
+    as keyword style.
+    """
     text = question.strip()
     lower = text.lower()
-    tokens = re.findall(r"[a-z0-9$_.:/-]+", lower)
+
+    # Unicode-aware tokenization: split on whitespace, then count.
+    # For CJK/Korean where spaces are optional, also count by characters.
+    tokens = re.findall(r"[\w$.:/-]+", lower, re.UNICODE)
     token_count = len(tokens)
 
     if token_count == 0:
@@ -140,6 +148,27 @@ def classify_query_style(question: str) -> str:
         )
     )
     has_question_mark = "?" in text
+
+    # Korean interrogative patterns (어떻게/무엇/왜/언제/어디/누가/~인가/~나요 etc.)
+    _lang = language.lower()
+    if _lang in ("korean", "ko") or (not _lang and re.search(r"[\uac00-\ud7a3]", text)):
+        kr_interrogative = bool(
+            re.search(
+                r"(어떻게|무엇|무슨|왜|언제|어디|누가|어느|어떤"
+                r"|인가요|ᆫ가요|나요|습니까|ᆯ까요|할까|는지|할지)",
+                text,
+            )
+        )
+        starts_interrogative = starts_interrogative or kr_interrogative
+
+    # Japanese interrogative patterns (何/どう/なぜ/いつ/どこ/誰/か？ etc.)
+    if _lang in ("japanese", "ja") or (
+        not _lang and re.search(r"[\u3040-\u309f\u30a0-\u30ff]", text)
+    ):
+        jp_interrogative = bool(
+            re.search(r"(何|どう|なぜ|いつ|どこ|誰|どの|どんな|ですか|ますか)", text)
+        )
+        starts_interrogative = starts_interrogative or jp_interrogative
     expert_terms = {
         "troubleshoot",
         "debug",

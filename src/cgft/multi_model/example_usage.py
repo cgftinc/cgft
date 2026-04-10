@@ -52,9 +52,9 @@ def example_1_basic_multi_model_call(registry: ClientRegistry):
 
     Call multiple models with the same prompt and compare responses.
     """
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("EXAMPLE 1: Basic Multi-Model Call")
-    print("="*80)
+    print("=" * 80)
 
     # Define system and user prompts
     system_prompt = "You are a helpful assistant that provides concise answers."
@@ -89,9 +89,9 @@ def example_2_with_template_variables(registry: ClientRegistry):
 
     Use the template rendering helpers to create dynamic prompts.
     """
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("EXAMPLE 2: With Template Variables")
-    print("="*80)
+    print("=" * 80)
 
     # Define a template with variables
     prompt_template = """Analyze the following topic and provide insights:
@@ -133,9 +133,9 @@ def example_3_openai_specific_arguments(registry: ClientRegistry):
 
     Pass model-specific arguments like reasoning effort for OpenAI models.
     """
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("EXAMPLE 3: With OpenAI-Specific Arguments")
-    print("="*80)
+    print("=" * 80)
 
     # Models that support OpenAI-style arguments
     models = [
@@ -172,9 +172,9 @@ def example_4_debugging_prompts(registry: ClientRegistry):
 
     Use the print_sections helper to preview your prompts.
     """
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("EXAMPLE 4: Debugging Prompts Before Running")
-    print("="*80)
+    print("=" * 80)
 
     # Define prompts
     system_prompt = """You are a knowledge extraction specialist.
@@ -214,9 +214,9 @@ def example_5_testing_multiple_models(registry: ClientRegistry):
 
     Test different models to choose the best one for your use case.
     """
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("EXAMPLE 5: Testing Multiple Models for Selection")
-    print("="*80)
+    print("=" * 80)
 
     # Test a variety of models across different providers
     test_models = [
@@ -261,9 +261,9 @@ def example_6_loop_through_prompts(registry: ClientRegistry):
 
     Test models on multiple different prompts in sequence.
     """
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("EXAMPLE 6: Loop Through Multiple Prompts")
-    print("="*80)
+    print("=" * 80)
 
     # Multiple test cases
     test_cases = [
@@ -285,13 +285,13 @@ def example_6_loop_through_prompts(registry: ClientRegistry):
 
     # Test each case
     for i, test_case in enumerate(test_cases, 1):
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"TEST CASE {i}: {test_case['name']}")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         benchmark = call_multi_model_sync(
             registry=registry,
-            prompt=test_case['prompt'],
+            prompt=test_case["prompt"],
             system_prompt="You are a technical expert.",
             models=models,
             max_tokens=800,

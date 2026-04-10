@@ -252,8 +252,7 @@ class ChromaClient:
             self._embed_dim = dim
         elif dim != self._embed_dim:
             raise ValueError(
-                f"Embedding dimension mismatch: expected {self._embed_dim}, "
-                f"got {dim}."
+                f"Embedding dimension mismatch: expected {self._embed_dim}, got {dim}."
             )
 
     # ------------------------------------------------------------------
@@ -277,9 +276,7 @@ class ChromaClient:
             return str(meta.get(self.content_attr[0], doc or ""))
         import json
 
-        return json.dumps(
-            {f: meta.get(f, "") for f in self.content_attr}, default=str
-        )
+        return json.dumps({f: meta.get(f, "") for f in self.content_attr}, default=str)
 
     # ------------------------------------------------------------------
     # Raw result conversion helpers
@@ -295,12 +292,14 @@ class ChromaClient:
         rows: list[dict[str, Any]] = []
         for i, (doc, meta, dist) in enumerate(zip(docs, metas, distances)):
             score = 1.0 / (1.0 + dist) if dist >= 0 else 0.0
-            rows.append({
-                "id": ids[i] if i < len(ids) else f"id_{i}",
-                "content": doc,
-                "metadata": _clean_metadata(meta),
-                "score": score,
-            })
+            rows.append(
+                {
+                    "id": ids[i] if i < len(ids) else f"id_{i}",
+                    "content": doc,
+                    "metadata": _clean_metadata(meta),
+                    "score": score,
+                }
+            )
         return rows
 
     @staticmethod
@@ -314,12 +313,14 @@ class ChromaClient:
         rows: list[dict[str, Any]] = []
         for row in payloads[0]:
             meta = row.get("metadata") or {}
-            rows.append({
-                "id": row.get("id", ""),
-                "content": row.get("document", ""),
-                "metadata": _clean_metadata(meta) if isinstance(meta, dict) else {},
-                "score": row.get("score", 0.0) or 0.0,
-            })
+            rows.append(
+                {
+                    "id": row.get("id", ""),
+                    "content": row.get("document", ""),
+                    "metadata": _clean_metadata(meta) if isinstance(meta, dict) else {},
+                    "score": row.get("score", 0.0) or 0.0,
+                }
+            )
         return rows
 
     @staticmethod
@@ -330,12 +331,14 @@ class ChromaClient:
         ids = result.get("ids") or []
         rows: list[dict[str, Any]] = []
         for i, (doc, meta) in enumerate(zip(docs, metas)):
-            rows.append({
-                "id": ids[i] if i < len(ids) else f"id_{i}",
-                "content": doc,
-                "metadata": _clean_metadata(meta) if isinstance(meta, dict) else {},
-                "score": 0.0,
-            })
+            rows.append(
+                {
+                    "id": ids[i] if i < len(ids) else f"id_{i}",
+                    "content": doc,
+                    "metadata": _clean_metadata(meta) if isinstance(meta, dict) else {},
+                    "score": 0.0,
+                }
+            )
         return rows
 
     # ------------------------------------------------------------------
@@ -382,8 +385,4 @@ class _WrapEmbedFn:
 
 def _clean_metadata(meta: dict[str, Any]) -> dict[str, Any]:
     """Filter metadata to JSON-serializable scalar values only."""
-    return {
-        k: v
-        for k, v in meta.items()
-        if isinstance(v, (str, int, float, bool, type(None)))
-    }
+    return {k: v for k, v in meta.items() if isinstance(v, (str, int, float, bool, type(None)))}

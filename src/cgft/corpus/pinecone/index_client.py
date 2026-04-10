@@ -259,10 +259,7 @@ class PineconeIndexClient:
         index = self._get_index()
 
         if show_summary:
-            print(
-                f"\nUploading {len(documents)} chunks to Pinecone"
-                f" index '{self._index_name}'..."
-            )
+            print(f"\nUploading {len(documents)} chunks to Pinecone index '{self._index_name}'...")
 
         all_ids: list[str] = []
 
@@ -279,11 +276,13 @@ class PineconeIndexClient:
             upsert_batch: list[dict[str, Any]] = []
             for i, (vec_id, meta) in enumerate(zip(batch_ids, batch_metas)):
                 all_ids.append(vec_id)
-                upsert_batch.append({
-                    "id": vec_id,
-                    "values": vectors[i],
-                    "metadata": meta,
-                })
+                upsert_batch.append(
+                    {
+                        "id": vec_id,
+                        "values": vectors[i],
+                        "metadata": meta,
+                    }
+                )
 
             index.upsert(vectors=upsert_batch, namespace=self._namespace)
 
@@ -360,9 +359,7 @@ class PineconeIndexClient:
         response = index.fetch(ids=ids, namespace=self._namespace)
         vectors = response.vectors or {}
         return [
-            self.fetch_to_raw(vid, vdata)
-            for vid, vdata in vectors.items()
-            if vdata is not None
+            self.fetch_to_raw(vid, vdata) for vid, vdata in vectors.items() if vdata is not None
         ]
 
     def sample_ids(self, n: int) -> list[str]:

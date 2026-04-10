@@ -102,9 +102,7 @@ class ClientRegistry:
             api_key=api_key,
         )
 
-    def get_client(
-        self, model: str, use_responses_api: bool = False
-    ) -> tuple[Any, ModelConfig]:
+    def get_client(self, model: str, use_responses_api: bool = False) -> tuple[Any, ModelConfig]:
         """Get the appropriate client and config for a model.
 
         Args:
@@ -119,8 +117,7 @@ class ClientRegistry:
         """
         if model not in self._model_configs:
             raise ValueError(
-                f"Unknown model: {model}. "
-                f"Available models: {list(self._model_configs.keys())}"
+                f"Unknown model: {model}. Available models: {list(self._model_configs.keys())}"
             )
 
         config = self._model_configs[model]

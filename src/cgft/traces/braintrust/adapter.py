@@ -19,8 +19,7 @@ _BASE_URL = "https://api.braintrust.dev/v1"
 _BTQL_URL = "https://api.braintrust.dev/btql"
 _MAX_TRACES_PER_FETCH = 1000
 _BTQL_COLUMNS = (
-    "id, span_id, root_span_id, input, output, scores, "
-    "metadata, span_attributes, created"
+    "id, span_id, root_span_id, input, output, scores, metadata, span_attributes, created"
 )
 
 
@@ -30,9 +29,7 @@ class BraintrustTraceAdapter:
     def connect(self, credentials: TraceCredentials) -> dict[str, Any]:
         """Validate the API key by listing projects."""
         headers = credentials.to_headers()
-        resp = request_with_retry(
-            "GET", f"{_BASE_URL}/project", headers=headers, timeout=15
-        )
+        resp = request_with_retry("GET", f"{_BASE_URL}/project", headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         objects = data.get("objects", []) if isinstance(data, dict) else []
@@ -41,9 +38,7 @@ class BraintrustTraceAdapter:
     def list_projects(self, credentials: TraceCredentials) -> list[TraceProject]:
         """List projects visible to the API key."""
         headers = credentials.to_headers()
-        resp = request_with_retry(
-            "GET", f"{_BASE_URL}/project", headers=headers, timeout=15
-        )
+        resp = request_with_retry("GET", f"{_BASE_URL}/project", headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         objects = data.get("objects", data) if isinstance(data, dict) else data
@@ -106,9 +101,7 @@ class BraintrustTraceAdapter:
             trace_trees = self._fetch_via_btql(credentials, project_id, max_traces)
         except (httpx.HTTPError, httpx.TimeoutException, httpx.ConnectError, KeyError) as e:
             logger.warning("BTQL fetch failed, falling back to REST: %s", e)
-            trace_trees, cursor = self._fetch_via_rest(
-                credentials, project_id, max_traces, cursor
-            )
+            trace_trees, cursor = self._fetch_via_rest(credentials, project_id, max_traces, cursor)
 
         traces: list[NormalizedTrace] = []
         for trace_id, tree in trace_trees.items():

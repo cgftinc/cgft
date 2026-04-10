@@ -56,4 +56,3 @@ def any_of(*clauses: FilterPredicate) -> OrPredicate:
 def not_(clause: FilterPredicate) -> NotPredicate:
     """Negate one predicate."""
     return NotPredicate(clause=clause)
-

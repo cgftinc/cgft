@@ -69,9 +69,7 @@ def _check_language(text: str, language: str) -> bool:
     if not non_space:
         return True
 
-    matching = sum(
-        1 for c in non_space if any(lo <= ord(c) <= hi for lo, hi in ranges)
-    )
+    matching = sum(1 for c in non_space if any(lo <= ord(c) <= hi for lo, hi in ranges))
     return matching / len(non_space) >= 0.5
 
 

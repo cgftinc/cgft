@@ -116,7 +116,9 @@ def extract_participants(email_messages: list[dict[str, Any]]) -> dict[str, Any]
         display_values.append(cleaned)
 
     for email_message in email_messages:
-        from_address = email_message.get("from") if isinstance(email_message.get("from"), dict) else {}
+        from_address = (
+            email_message.get("from") if isinstance(email_message.get("from"), dict) else {}
+        )
         add_label((from_address.get("name") or from_address.get("email") or "").strip())
 
         to_addresses = email_message.get("to") if isinstance(email_message.get("to"), list) else []
@@ -161,9 +163,7 @@ def validate_rows(rows: list[dict[str, Any]], max_warnings: int = 200) -> list[s
                 f"row={idx} has empty 'id' (thread_id={as_str(row.get('thread_id'))!r})"
             )
         if not as_str(row.get("thread_id")):
-            warnings.append(
-                f"row={idx} has empty 'thread_id' (id={as_str(row.get('id'))!r})"
-            )
+            warnings.append(f"row={idx} has empty 'thread_id' (id={as_str(row.get('id'))!r})")
         if not isinstance(row.get("from"), dict):
             warnings.append(
                 f"row={idx} has invalid 'from' type={type(row.get('from')).__name__}; expected object"

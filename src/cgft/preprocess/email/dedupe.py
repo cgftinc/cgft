@@ -179,7 +179,9 @@ def _exact_jaccard(a: set[int], b: set[int]) -> float:
     return inter / union if union else 0.0
 
 
-def _minhash_signature(shingle_hashes: set[int], a_coeffs: list[int], b_coeffs: list[int]) -> list[int]:
+def _minhash_signature(
+    shingle_hashes: set[int], a_coeffs: list[int], b_coeffs: list[int]
+) -> list[int]:
     if not shingle_hashes:
         return [MAX_HASH] * len(a_coeffs)
     sig = [MAX_HASH] * len(a_coeffs)
@@ -311,7 +313,9 @@ def _choose_cluster_representative(members: list[ThreadDoc]) -> ThreadDoc:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -463,7 +467,9 @@ def dedupe_parsed_messages(
         if overall_jac < config.jaccard_threshold:
             continue
         body_jac = _exact_jaccard(threads[i].body_shingles, threads[j].body_shingles)
-        participant_jac = _exact_jaccard(threads[i].participant_shingles, threads[j].participant_shingles)
+        participant_jac = _exact_jaccard(
+            threads[i].participant_shingles, threads[j].participant_shingles
+        )
         verified_pairs.append((i, j, overall_jac, body_jac, participant_jac))
 
     dsu = DSU(len(threads))
@@ -472,7 +478,10 @@ def dedupe_parsed_messages(
     participant_guard_blocked_pairs: list[tuple[int, int, float, float, float]] = []
 
     for i, j, overall_jac, body_jac, participant_jac in verified_pairs:
-        if overall_jac <= config.overall_body_check_threshold or body_jac <= config.body_jaccard_threshold:
+        if (
+            overall_jac <= config.overall_body_check_threshold
+            or body_jac <= config.body_jaccard_threshold
+        ):
             body_guard_blocked_pairs.append((i, j, overall_jac, body_jac, participant_jac))
             continue
         if participant_jac <= config.participant_jaccard_threshold:
@@ -558,7 +567,9 @@ def dedupe_parsed_messages(
     removed_by_subset: dict[int, dict[str, Any]] = {}
     subset_participant_guard_blocked_pairs = 0
 
-    order = sorted(kept_candidates, key=lambda idx: (len(threads[idx].thread_text_subject_body), idx))
+    order = sorted(
+        kept_candidates, key=lambda idx: (len(threads[idx].thread_text_subject_body), idx)
+    )
 
     for pos, i in enumerate(order):
         if i in removed_by_subset:
@@ -720,9 +731,7 @@ def dedupe_email_folder(
     Returns the dedupe report dict.
     """
     folder = Path(folder)
-    jsonl_files = sorted(
-        f for f in folder.rglob("*.jsonl") if not f.name.startswith("_")
-    )
+    jsonl_files = sorted(f for f in folder.rglob("*.jsonl") if not f.name.startswith("_"))
     if not jsonl_files:
         print(f"No .jsonl files found in {folder}")
         return {"counts": {"input_messages": 0, "output_messages_total": 0}}

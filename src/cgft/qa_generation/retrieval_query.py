@@ -43,7 +43,9 @@ def resolve_retrieval_query(
             point["retrieval_query"] = explicit_query
         return explicit_query
 
-    user_question = str(point.get("user_question", "")).strip() or str(point.get("question", "")).strip()
+    user_question = (
+        str(point.get("user_question", "")).strip() or str(point.get("question", "")).strip()
+    )
     if persist:
         point["user_question"] = user_question
 

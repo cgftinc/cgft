@@ -119,9 +119,15 @@ def to_turbopuffer_filters(
             )
         return [predicate.field, op, predicate.value]
     if isinstance(predicate, AndPredicate):
-        return ["And", [to_turbopuffer_filters(clause, capabilities) for clause in predicate.clauses]]
+        return [
+            "And",
+            [to_turbopuffer_filters(clause, capabilities) for clause in predicate.clauses],
+        ]
     if isinstance(predicate, OrPredicate):
-        return ["Or", [to_turbopuffer_filters(clause, capabilities) for clause in predicate.clauses]]
+        return [
+            "Or",
+            [to_turbopuffer_filters(clause, capabilities) for clause in predicate.clauses],
+        ]
     if isinstance(predicate, NotPredicate):
         return ["Not", to_turbopuffer_filters(predicate.clause, capabilities)]
 
