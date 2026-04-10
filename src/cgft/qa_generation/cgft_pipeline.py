@@ -43,6 +43,7 @@ from cgft.qa_generation.corpus_profile import (
     _get_doc_id,
     build_entity_patterns_from_extraction,
     compute_chunk_suitability,
+    compute_entity_document_frequency,
     compute_header_prevalence,
     compute_metadata_census,
     compute_token_document_frequency,
@@ -106,7 +107,9 @@ Return JSON only:
   "confidence": "high"
 }}"""
 
-_ENTITY_CONSOLIDATION_SYSTEM_PROMPT = "You are an expert at organizing and consolidating entity lists extracted from a document corpus."  # noqa: E501
+_ENTITY_CONSOLIDATION_SYSTEM_PROMPT = (
+    "You are an expert at organizing and consolidating entity lists extracted from a document corpus."  # noqa: E501
+)
 
 _ENTITY_CONSOLIDATION_USER_TEMPLATE = """\
 You are organizing entity candidates extracted from a corpus.
@@ -313,7 +316,6 @@ def _build_linker(
             WikiChunkLinker,
             WikiChunkLinkerConfig,
         )
-
         mcfg = cfg.linker.metadata
         return WikiChunkLinker(
             source=source,
@@ -1213,8 +1215,7 @@ def _generate_entity_extraction_patterns(
         language_note = (
             f"\nLanguage: {corpus_language}. Candidates and chunks are in "
             f"{corpus_language} — evaluate them in that language.\n"
-            if corpus_language
-            else ""
+            if corpus_language else ""
         )
         user_prompt = _ENTITY_CONSOLIDATION_USER_TEMPLATE.format(
             corpus_description=corpus_description,
@@ -1462,22 +1463,19 @@ class CgftPipeline:
                     chunk_count,
                 )
                 all_chunks = source.sample_chunks(
-                    chunk_count,
-                    min_chars=cfg.corpus.min_chunk_chars,
+                    chunk_count, min_chars=cfg.corpus.min_chunk_chars,
                 )
                 if all_chunks:
                     source.collection = ChunkCollection(chunks=all_chunks)  # type: ignore[attr-defined]
                     logger.info(
                         "Cached %d/%d chunks on source.collection",
-                        len(all_chunks),
-                        chunk_count,
+                        len(all_chunks), chunk_count,
                     )
             else:
                 logger.warning(
                     "Corpus too large to materialise (%d chunks > %d cap); "
                     "entity-chunk graph will use profile sample only.",
-                    chunk_count,
-                    max_materialize,
+                    chunk_count, max_materialize,
                 )
 
         profile_sample = diverse_profile_sample(
@@ -1520,10 +1518,7 @@ class CgftPipeline:
 
             # Phase 2: LLM consolidation (consolidates heuristic candidates)
             extraction = _generate_entity_extraction_patterns(
-                cfg,
-                source,
-                context,
-                heuristic_candidates=heuristic_entities,
+                cfg, source, context, heuristic_candidates=heuristic_entities,
             )
             if extraction is not None:
                 cfg.corpus_context.entity_extraction = extraction
@@ -1557,7 +1552,6 @@ class CgftPipeline:
                 domain_terms=ext.domain_terms,
             )
             from cgft.qa_generation.corpus_profile import build_entity_chunk_graph  # noqa: PLC0415
-
             # Use full corpus for graph when available (denser graph = better linking)
             graph_chunks = (
                 list(source.collection.chunks)
@@ -1565,8 +1559,7 @@ class CgftPipeline:
                 else profile_sample
             )
             entity_chunk_idx, chunk_entity_idx, cooccurrence = build_entity_chunk_graph(
-                entity_patterns,
-                graph_chunks,
+                entity_patterns, graph_chunks,
             )
             n_ubiquitous = sum(1 for e in entity_patterns if e.document_frequency >= 0.80)
             if n_ubiquitous > 0:
@@ -1645,6 +1638,7 @@ class CgftPipeline:
                 _chunk, census, profile
             )
         context["census"] = census
+
 
         warnings = emit_corpus_warnings(census, profile, cfg)
         for w in warnings:
@@ -2430,8 +2424,7 @@ def _filter_and_sample_seeds(
         # In-memory: score all chunks on-the-fly, filter by threshold
         candidates = [c for c in collection.chunks if len(c.content) >= min_chars]
         eligible = [
-            c
-            for c in candidates
+            c for c in candidates
             if (
                 profile.chunk_suitability_scores.get(c.hash)
                 or compute_chunk_suitability(c, profile.census, profile)
@@ -2462,8 +2455,7 @@ def _filter_and_sample_seeds(
             return []
 
         eligible = [
-            c
-            for c in all_chunks
+            c for c in all_chunks
             if compute_chunk_suitability(c, profile.census, profile) > threshold
         ]
         profile._api_eligible_cache = eligible if eligible else all_chunks

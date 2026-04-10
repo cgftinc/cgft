@@ -117,7 +117,9 @@ class MetadataChunkLinker:
             retry_queries = self._generate_content_queries(primary_chunk)
             retry_queries = [q for q in retry_queries if q not in queries]
             if retry_queries:
-                retry_candidates = self._search_and_filter(primary_chunk, retry_queries, overrides)
+                retry_candidates = self._search_and_filter(
+                    primary_chunk, retry_queries, overrides
+                )
                 # Merge: existing candidates first, then new ones.
                 seen = {getattr(c, "hash", id(c)) for c in candidates}
                 for rc in retry_candidates:
@@ -187,7 +189,8 @@ class MetadataChunkLinker:
             primary_hash = getattr(primary_chunk, "hash", None)
             if primary_hash and primary_hash in self.wiki_index.chunk_to_pages:
                 existing_hashes = {
-                    r.get("hash") or getattr(r.get("chunk"), "hash", None) for r in search_results
+                    r.get("hash") or getattr(r.get("chunk"), "hash", None)
+                    for r in search_results
                 }
                 wiki_hashes: set[str] = set()
                 for page_title in self.wiki_index.chunk_to_pages[primary_hash]:
@@ -226,10 +229,7 @@ class MetadataChunkLinker:
             )
             if overrides.min_coherence > 0 and jaccard < overrides.min_coherence:
                 continue
-            if (
-                self.config.max_primary_similarity > 0
-                and jaccard > self.config.max_primary_similarity
-            ):  # noqa: E501
+            if self.config.max_primary_similarity > 0 and jaccard > self.config.max_primary_similarity:  # noqa: E501
                 continue
             scored.append((chunk, search_score, jaccard))
 
@@ -276,8 +276,11 @@ class MetadataChunkLinker:
             # Normalise weights to sum to 1 when wiki bonus applies.
             base_weight = 1.0 - wiki_bonus
             composite = (
-                base_weight
-                * (0.4 * (search_score / max_search) + 0.3 * jaccard + 0.3 * entity_ratio)
+                base_weight * (
+                    0.4 * (search_score / max_search)
+                    + 0.3 * jaccard
+                    + 0.3 * entity_ratio
+                )
                 + wiki_bonus
             )
             ranked.append((composite, idx, chunk))

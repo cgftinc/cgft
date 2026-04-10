@@ -10,7 +10,6 @@ No wiki page generation is required — the linker operates entirely on the
 entity-chunk graph (entity_chunk_index, chunk_entity_index, entity_cooccurrence)
 stored on CorpusProfile.
 """
-
 from __future__ import annotations
 
 import logging
@@ -102,7 +101,8 @@ class WikiChunkLinker:
         pool_lookup: dict[str, Any] = {}
         if corpus_pool:
             pool_lookup = {
-                getattr(c, "hash", None): c for c in corpus_pool if getattr(c, "hash", None)
+                getattr(c, "hash", None): c for c in corpus_pool
+                if getattr(c, "hash", None)
             }
 
         # Step 3: Score candidates
@@ -114,7 +114,9 @@ class WikiChunkLinker:
         scored: list[tuple[str, float, Any, set[str]]] = []
 
         for ch in candidate_hashes:
-            candidate_entities = set(e.lower() for e in self.profile.chunk_entity_index.get(ch, []))
+            candidate_entities = set(
+                e.lower() for e in self.profile.chunk_entity_index.get(ch, [])
+            )
             shared = primary_entity_set & candidate_entities
             new = candidate_entities - primary_entity_set
 
@@ -122,7 +124,9 @@ class WikiChunkLinker:
                 continue  # no coherence signal
 
             # Shared entity score (coherence): quality-weighted
-            shared_score = sum(eq_map.get(e, 0.5) for e in shared) / max(len(primary_entity_set), 1)
+            shared_score = sum(eq_map.get(e, 0.5) for e in shared) / max(
+                len(primary_entity_set), 1
+            )
 
             # New entity score (complementary): quality-weighted
             new_score = (
@@ -133,8 +137,7 @@ class WikiChunkLinker:
 
             # Entity proximity via co-occurrence graph
             proximity_score = self._entity_proximity_score(
-                primary_entity_set,
-                candidate_entities,
+                primary_entity_set, candidate_entities,
             )
 
             # Cross-file bonus
@@ -150,7 +153,9 @@ class WikiChunkLinker:
             if self.config.max_primary_similarity > 0 and primary_tokens:
                 cand_tokens = set(c_text.lower().split())
                 if cand_tokens:
-                    jaccard = len(primary_tokens & cand_tokens) / len(primary_tokens | cand_tokens)
+                    jaccard = len(primary_tokens & cand_tokens) / len(
+                        primary_tokens | cand_tokens
+                    )
                     if jaccard > self.config.max_primary_similarity:
                         continue
 
@@ -170,9 +175,7 @@ class WikiChunkLinker:
 
         # Step 4: Coverage-greedy selection from top candidates
         selected = self._select_diverse(
-            scored,
-            primary_entity_set,
-            n_secondaries,
+            scored, primary_entity_set, n_secondaries,
         )
 
         # Register used hashes
@@ -209,9 +212,7 @@ class WikiChunkLinker:
     # ------------------------------------------------------------------
 
     def _entity_proximity_score(
-        self,
-        primary_entities: set[str],
-        candidate_entities: set[str],
+        self, primary_entities: set[str], candidate_entities: set[str],
     ) -> float:
         """Score entity-level proximity via co-occurrence graph.
 
@@ -240,9 +241,7 @@ class WikiChunkLinker:
         return min(1.0, avg_cooc / max(max_cooc * 0.1, 1.0))
 
     def _resolve_chunk(
-        self,
-        chunk_hash: str,
-        pool_lookup: dict[str, Any],
+        self, chunk_hash: str, pool_lookup: dict[str, Any],
     ) -> Any | None:
         """Look up a chunk object by hash."""
         collection = getattr(self.source, "collection", None)
@@ -260,7 +259,7 @@ class WikiChunkLinker:
         selected: list[Any] = []
         covered: set[str] = set(primary_entities)
         # Work from top-K candidates (capped for performance)
-        pool = scored[: n * 5]
+        pool = scored[:n * 5]
 
         for _ in range(n):
             if not pool:
