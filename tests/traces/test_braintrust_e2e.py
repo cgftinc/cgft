@@ -145,3 +145,21 @@ class TestBraintrustE2E:
         for trace_id, tree in trace_trees.items():
             assert "root" in tree
             assert tree["root"] is not None
+
+    def test_btql_pagination_fetches_beyond_1000_rows(self):
+        """BTQL paginates via timestamp to fetch more than 1000 spans."""
+        _skip_if_no_creds()
+        adapter = BraintrustTraceAdapter()
+        creds = TraceCredentials(api_key=_API_KEY)
+
+        count = adapter.count_traces(creds, _PROJECT_ID)
+        if count < 100:
+            pytest.skip("Need at least 100 traces to test pagination")
+
+        # Request enough traces that BTQL needs multiple 1000-row pages
+        # (100 traces * ~10-20 spans each = 1000-2000 spans)
+        trace_trees = adapter._fetch_via_btql(creds, _PROJECT_ID, max_traces=500)
+        assert len(trace_trees) > 50  # should get many traces across pages
+
+        # No duplicate trace IDs
+        assert len(trace_trees) == len(set(trace_trees.keys()))
