@@ -131,8 +131,10 @@ class BraintrustTraceAdapter:
         ``project_id`` is always from ``list_projects()`` — not user input.
         """
         headers = {**credentials.to_headers(), "Content-Type": "application/json"}
-        # Each trace has ~10-20 child spans, so fetch 20x the desired trace count
-        span_limit = max_traces * 20
+        # Each trace has ~10-20 child spans, so fetch 20x the desired trace count.
+        # BTQL has a max row limit (~1000), so cap there. For larger fetches
+        # the REST fallback handles it.
+        span_limit = min(max_traces * 20, 1000)
 
         query = (
             f"SELECT {_BTQL_COLUMNS} "
