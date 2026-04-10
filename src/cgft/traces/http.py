@@ -33,7 +33,8 @@ def request_with_retry(
     for attempt in range(max_retries):
         try:
             resp = httpx.request(
-                method, url, headers=headers, json=json, timeout=timeout
+                method, url, headers=headers, json=json, timeout=timeout,
+                follow_redirects=True,
             )
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             if attempt == max_retries - 1:
