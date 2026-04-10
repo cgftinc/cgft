@@ -17,13 +17,13 @@ class TestScoreEntityQuality:
         """Proper named entity in the DF sweet spot scores near 1.0."""
         p = EntityPattern(name="PostHog", type="entity", document_frequency=0.05)
         score = _score_entity_quality(p)
-        assert score >= 0.9
+        assert score >= 0.85
 
     def test_domain_term_reasonable_score(self):
         """Lowercase domain term with good DF scores moderately."""
         p = EntityPattern(name="redis", type="domain_term", document_frequency=0.08)
         score = _score_entity_quality(p)
-        assert 0.4 < score < 0.8
+        assert 0.5 < score < 0.9
 
     def test_stopword_phrase_low_score(self):
         """All-stopword phrase gets penalized via name_score=0."""
@@ -43,7 +43,7 @@ class TestScoreEntityQuality:
         """Entity with DF=0 gets low score — type + name but no DF signal."""
         p = EntityPattern(name="PostHog", type="entity", document_frequency=0.0)
         score = _score_entity_quality(p)
-        assert score == 0.5  # 0*0.5 + 1.0*0.3 + 1.0*0.2
+        assert score == pytest.approx(0.48)  # 0*0.4 + 1.0*0.2 + 0.7*0.4
 
     def test_very_high_df_scores_low(self):
         """Ubiquitous entity (DF > 0.40) gets zero DF component."""

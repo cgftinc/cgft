@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 import random
-import re
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -34,16 +32,13 @@ from cgft.qa_generation.cgft_models import (
     CgftContext,
     CgftPipelineConfig,
     CgftRunStats,
-    EntityExtractionConfig,
     GenerationTask,
     load_cgft_config,
 )
 from cgft.qa_generation.corpus_profile import (
     CorpusProfile,
     _get_doc_id,
-    build_entity_patterns_from_extraction,
     compute_chunk_suitability,
-    compute_entity_document_frequency,
     compute_header_prevalence,
     compute_metadata_census,
     compute_token_document_frequency,
@@ -76,94 +71,6 @@ from cgft.qa_generation.transformers.dedup import IncrementalDeduplicator
 from cgft.trainer.client import RolloutClient
 
 logger = logging.getLogger(__name__)
-
-_ENTITY_EXTRACTION_SYSTEM_PROMPT = (
-    "You are an expert at analyzing documentation corpora to identify linkable entities, "
-    "code patterns, and domain terminology that can be used for keyword search."
-)
-
-_ENTITY_EXTRACTION_USER_TEMPLATE = """\
-Analyze these sample chunks from a documentation corpus and identify patterns for \
-finding related content via keyword (BM25) search.
-
-<samples>
-{chunk_samples}
-</samples>
-
-Identify the following:
-1. Named entities: product names, tools, services, APIs, brand names that appear across chunks
-2. Code patterns: regex patterns for extracting function calls, file paths, config keys, properties
-3. Domain terminology: technical terms, acronyms, and jargon specific to this corpus
-4. Query templates: search phrase templates using {{entity}} as a placeholder
-
-Return JSON only:
-{{
-  "entity_names": ["Name1", "Name2"],
-  "code_patterns": {{
-    "category_name": "<regex_pattern>"
-  }},
-  "domain_terms": ["term1", "term2"],
-  "query_templates": ["{{entity}} setup", "configure {{entity}}", "{{entity}} guide"],
-  "confidence": "high"
-}}"""
-
-_ENTITY_CONSOLIDATION_SYSTEM_PROMPT = (
-    "You are an expert at organizing and consolidating entity lists extracted from a document corpus."  # noqa: E501
-)
-
-_ENTITY_CONSOLIDATION_USER_TEMPLATE = """\
-You are organizing entity candidates extracted from a corpus.
-
-Corpus description: {corpus_description}
-{language_note}
-The following candidates were extracted from the corpus text using statistical methods \
-(TF-IDF, capitalized phrases, frequent n-grams).
-
-<candidates>
-{candidates_text}
-</candidates>
-
-<sample_chunks>
-{chunk_samples}
-</sample_chunks>
-
-Tasks:
-1. Merge only exact duplicates and clear near-duplicates (singular/plural, hyphenation variants) \
-into canonical forms. Always prefer the form that appears most frequently.
-2. Classify each into one of three categories:
-   - entity_names: named things (products, tools, APIs, teams, people, organizations)
-   - code_patterns: code references — provide a regex pattern for each
-   - domain_terms: domain concepts, processes, methodologies, technical terms
-3. Rank by domain importance (most central to the corpus first).
-4. Add up to 15 important entities you notice in the sample chunks that the candidates missed.
-
-Do NOT remove candidates for being "low quality" or "generic". All candidates were statistically \
-extracted and will be filtered downstream by document frequency. Your only job is to merge \
-duplicates, classify, and augment.
-
-Return a JSON object:
-{{
-  "entity_names": ["Entity1", "Entity2", ...],
-  "code_patterns": {{"category": "regex_pattern", ...}},
-  "domain_terms": ["term1", "term2", ...],
-  "query_templates": ["search query template 1", ...],
-  "confidence": "high" | "medium" | "low"
-}}
-
-Important: Use the EXACT text forms from the candidates list. Do not rephrase or conceptualize them."""  # noqa: E501
-
-
-def _format_heuristic_candidates(candidates: list) -> str:
-    """Format heuristic entity candidates grouped by type for the consolidation prompt."""
-    by_type: dict[str, list[str]] = {"entity": [], "domain_term": [], "code_pattern": []}
-    for c in candidates:
-        by_type.get(c.type, by_type["domain_term"]).append(c.name)
-    parts = []
-    for label, names in by_type.items():
-        if names:
-            parts.append(f"{label}s ({len(names)}):\n" + "\n".join(f"  - {n}" for n in names))
-    return "\n\n".join(parts)
-
 
 _QUALITY_GATE_FILTER_STAGE = "quality_gate"
 _RETRIEVAL_TOO_EASY_FILTER_STAGE = "retrieval_too_easy_llm"
@@ -1178,106 +1085,6 @@ def _regenerate_with_generator(
     return regenerated_for_retry, failed_to_regenerate
 
 
-def _generate_entity_extraction_patterns(
-    cfg: CgftPipelineConfig,
-    source: Any,
-    context: CgftContext,
-    heuristic_candidates: list | None = None,
-) -> EntityExtractionConfig | None:
-    """Generate entity extraction patterns from corpus samples via LLM.
-
-    When ``heuristic_candidates`` are provided (Phase 1a output), the LLM consolidates
-    them rather than discovering entities from scratch.  This produces higher-fidelity
-    entity names because the candidates are guaranteed to appear in the corpus text.
-    Falls back to the discovery prompt when no candidates are supplied.
-    """
-    profile_cfg = cfg.corpus_context
-    samples: list[Any] = []
-
-    corpus_pool: list[Any] = context.get("corpus_pool", []) or []
-    if corpus_pool:
-        rng = context.rng
-        use_consolidation = bool(heuristic_candidates)
-        n = min(15 if use_consolidation else 50, len(corpus_pool))
-        samples = select_diverse(corpus_pool, n, rng=rng, stratify_key=_get_doc_id)
-
-    if not samples:
-        return None
-
-    chunk_samples_text = "\n\n---\n\n".join(
-        chunk.chunk_str() if hasattr(chunk, "chunk_str") else str(chunk) for chunk in samples
-    )
-
-    if heuristic_candidates:
-        candidates_text = _format_heuristic_candidates(heuristic_candidates)
-        corpus_description = context.get("corpus_description", "")
-        corpus_language = str(context.get("corpus_language", "") or "").strip()
-        language_note = (
-            f"\nLanguage: {corpus_language}. Candidates and chunks are in "
-            f"{corpus_language} — evaluate them in that language.\n"
-            if corpus_language else ""
-        )
-        user_prompt = _ENTITY_CONSOLIDATION_USER_TEMPLATE.format(
-            corpus_description=corpus_description,
-            candidates_text=candidates_text,
-            chunk_samples=chunk_samples_text,
-            language_note=language_note,
-        )
-        system_prompt = _ENTITY_CONSOLIDATION_SYSTEM_PROMPT
-    else:
-        user_prompt = _ENTITY_EXTRACTION_USER_TEMPLATE.format(chunk_samples=chunk_samples_text)
-        system_prompt = _ENTITY_EXTRACTION_SYSTEM_PROMPT
-
-    try:
-        entity_llm_cfg = profile_cfg.entity_extraction_llm
-        client = _build_openai_client(
-            api_key=entity_llm_cfg.api_key,
-            base_url=entity_llm_cfg.base_url,
-        )
-        completion = _chat_completion_with_retry(
-            client=client,
-            model=entity_llm_cfg.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-        )
-        raw = completion.choices[0].message.content or ""
-        # Strip control characters that break JSON parsing
-        raw = re.sub(r"[\x00-\x1f]", " ", raw)
-        data = json.loads(raw)
-
-        valid_patterns: dict[str, str] = {}
-        for name, pattern in (data.get("code_patterns") or {}).items():
-            try:
-                re.compile(str(pattern))
-                valid_patterns[str(name)] = str(pattern)
-            except re.error:
-                logger.warning("Skipping invalid entity extraction regex '%s': %s", name, pattern)
-
-        return EntityExtractionConfig(
-            entity_names=[
-                str(e).strip() for e in (data.get("entity_names") or []) if str(e).strip()
-            ],
-            code_patterns=valid_patterns,
-            domain_terms=[
-                str(t).strip() for t in (data.get("domain_terms") or []) if str(t).strip()
-            ],
-            query_templates=[
-                str(q).strip() for q in (data.get("query_templates") or []) if str(q).strip()
-            ],
-            confidence=str(data.get("confidence", "low")).strip().lower(),
-        )
-    except Exception as exc:
-        logger.warning(
-            "Entity extraction pattern generation failed; BM25 will use metadata fallback. reason=%s",  # noqa: E501
-            exc,
-        )
-        return None
-
-
 def _build_corpus_profile(cfg: CgftPipelineConfig, source: Any, context: CgftContext) -> None:
     """Generate corpus summary/example queries from description and samples."""
     profile_cfg = cfg.corpus_context
@@ -1504,70 +1311,54 @@ class CgftPipeline:
         _build_corpus_profile(cfg, source, context)
         _print_progress("[2/6] Built corpus profile", verbose=cfg.verbose)
 
+        kb_entities: list = []
+        kb_entity_idx: dict[str, set[str]] = {}
+        kb_chunk_idx: dict[str, list[str]] = {}
+        kb_cooccurrence: dict[tuple[str, str], int] = {}
+
         if cfg.corpus_context.generate_entity_patterns:
             _print_progress("[3/6] Extracting entity patterns...", verbose=cfg.verbose)
 
-            # Phase 1a: Heuristic extraction (deterministic, zero LLM cost)
-            from cgft.qa_generation.corpus_profile import extract_heuristic_entities
+            # Phase 1a: KeyBERT + metadata entity extraction.
+            # Handles its own sampling internally; scans full corpus for graph.
+            from cgft.qa_generation.corpus_profile import extract_entities
 
-            heuristic_entities = extract_heuristic_entities(profile_sample)
+            all_chunks = (
+                list(source.collection.chunks)
+                if getattr(source, "collection", None)
+                else profile_sample
+            )
+            kb_entities, kb_entity_idx, kb_chunk_idx = extract_entities(
+                all_chunks
+            )
+            # Compute co-occurrence from the KeyBERT graph
+            kb_entity_names = sorted(
+                name for name, hashes in kb_entity_idx.items() if hashes
+            )
+            kb_cooccurrence: dict[tuple[str, str], int] = {}
+            for i, e1 in enumerate(kb_entity_names):
+                for e2 in kb_entity_names[i + 1:]:
+                    overlap = len(kb_entity_idx[e1] & kb_entity_idx[e2])
+                    if overlap > 0:
+                        kb_cooccurrence[(e1, e2)] = overlap
+
             logger.info(
-                "Phase 1a heuristic extraction: %d candidates",
-                len(heuristic_entities),
+                "KeyBERT extraction: %d entities from %d chunks",
+                len(kb_entities),
+                len(all_chunks),
             )
 
-            # Phase 2: LLM consolidation (consolidates heuristic candidates)
-            extraction = _generate_entity_extraction_patterns(
-                cfg, source, context, heuristic_candidates=heuristic_entities,
-            )
-            if extraction is not None:
-                cfg.corpus_context.entity_extraction = extraction
-                logger.info(
-                    "Entity extraction patterns generated: %d entities, %d code patterns, "
-                    "%d domain terms (confidence=%s)",
-                    len(extraction.entity_names),
-                    len(extraction.code_patterns),
-                    len(extraction.domain_terms),
-                    extraction.confidence,
-                )
-                n_entities = len(extraction.entity_names)
-                n_patterns = len(extraction.code_patterns) + len(extraction.domain_terms)
-                _print_progress(
-                    f"[3/6] Generated entity patterns: {n_entities} entities,"
-                    f" {n_patterns} patterns",
-                    verbose=cfg.verbose,
-                )
         else:
             _print_progress("[3/6] Skipped entity pattern generation", verbose=cfg.verbose)
 
         # --- Build CorpusProfile from stages 2-3 outputs ---
         from cgft.qa_generation.corpus_capabilities import CorpusCapabilities
 
-        entity_patterns = []
-        if cfg.corpus_context.entity_extraction is not None:
-            ext = cfg.corpus_context.entity_extraction
-            entity_patterns = build_entity_patterns_from_extraction(
-                entity_names=ext.entity_names,
-                code_patterns=ext.code_patterns,
-                domain_terms=ext.domain_terms,
-            )
-            from cgft.qa_generation.corpus_profile import build_entity_chunk_graph  # noqa: PLC0415
-            # Use full corpus for graph when available (denser graph = better linking)
-            graph_chunks = (
-                list(source.collection.chunks)
-                if getattr(source, "collection", None)
-                else profile_sample
-            )
-            entity_chunk_idx, chunk_entity_idx, cooccurrence = build_entity_chunk_graph(
-                entity_patterns, graph_chunks,
-            )
-            n_ubiquitous = sum(1 for e in entity_patterns if e.document_frequency >= 0.80)
-            if n_ubiquitous > 0:
-                logger.info(
-                    "Entity DF filtering: %d/%d entities are ubiquitous (DF >= 0.80)",
-                    n_ubiquitous,
-                    len(entity_patterns),
-                )
+        # Use KeyBERT graph directly — already built during extract_entities().
+        entity_patterns = kb_entities if cfg.corpus_context.generate_entity_patterns else []
+        entity_chunk_idx = kb_entity_idx if entity_patterns else {}
+        chunk_entity_idx = kb_chunk_idx if entity_patterns else {}
+        cooccurrence = kb_cooccurrence if entity_patterns else {}
 
         token_df, token_df_n = compute_token_document_frequency(profile_sample)
 
@@ -1581,9 +1372,9 @@ class CgftPipeline:
             best_search_mode=best_search_mode,
             token_document_frequency=token_df,
             token_df_sample_size=token_df_n,
-            entity_chunk_index=entity_chunk_idx if entity_patterns else {},
-            chunk_entity_index=chunk_entity_idx if entity_patterns else {},
-            entity_cooccurrence=cooccurrence if entity_patterns else {},
+            entity_chunk_index=entity_chunk_idx,
+            chunk_entity_index=chunk_entity_idx,
+            entity_cooccurrence=cooccurrence,
         )
         context.profile = profile
 
@@ -1638,7 +1429,6 @@ class CgftPipeline:
                 _chunk, census, profile
             )
         context["census"] = census
-
 
         warnings = emit_corpus_warnings(census, profile, cfg)
         for w in warnings:
@@ -2424,7 +2214,8 @@ def _filter_and_sample_seeds(
         # In-memory: score all chunks on-the-fly, filter by threshold
         candidates = [c for c in collection.chunks if len(c.content) >= min_chars]
         eligible = [
-            c for c in candidates
+            c
+            for c in candidates
             if (
                 profile.chunk_suitability_scores.get(c.hash)
                 or compute_chunk_suitability(c, profile.census, profile)
@@ -2455,7 +2246,8 @@ def _filter_and_sample_seeds(
             return []
 
         eligible = [
-            c for c in all_chunks
+            c
+            for c in all_chunks
             if compute_chunk_suitability(c, profile.census, profile) > threshold
         ]
         profile._api_eligible_cache = eligible if eligible else all_chunks
