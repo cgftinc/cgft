@@ -101,3 +101,34 @@ Adding a new provider: create `traces/<provider>/adapter.py` implementing `conne
 - **OpenAI API** — LLM for QA generation (primary)
 - **benchmax** — RL training framework (`BaseEnv`, `ToolDefinition`, `StandardizedExample`)
 
+## Design Principles
+
+This library is used across diverse agentic trace types (customer service, code agents, research agents, non-English). Code must be generalizable, not tuned to one domain.
+
+### No hardcoded language or cultural assumptions
+- No English stop word lists, locale-specific date formats, or currency symbols baked into library code. Use universal patterns (e.g., `\d+` for all numbers) instead of domain-specific regex.
+- If a heuristic only works for English natural-language text, it doesn't belong in the library. Expose a threshold parameter and let the algorithm handle the rest.
+
+### Design the composition layer, not just the leaves
+- When building a set of related functions (filters, adapters, processing steps), design how they compose before implementing the individual pieces. A pipeline runner, combined result type, or chaining mechanism should exist from day one.
+- Without a composition layer, every consumer (wizard, notebook, Modal worker) writes its own ad-hoc accumulator, and they diverge.
+
+### Fail loudly, never silently reorder or fix
+- If a user provides an invalid configuration (e.g., wrong ordering of pipeline steps), raise an error explaining the constraint. Don't silently reorder or "correct" it — the caller won't learn the constraint and the behavior becomes invisible.
+
+### Structured metadata over string parsing
+- Return types that carry structured metadata (e.g., `DropReason(filter, reason, detail)`) instead of encoding information into strings that consumers have to parse with `startswith()` hacks.
+
+### Shared utilities need their own tests
+- Extracting shared code (e.g., HTTP retry, tokenization) is only valuable if the shared utility has dedicated tests covering its edge cases. Tests that exercise it transitively through callers don't count — they only test the happy path.
+
+### Preserve caller expectations
+- Functions in a pipeline should preserve input ordering unless there's a documented reason not to. If a function must reorder (e.g., for determinism), document it explicitly.
+
+### External API code must be tested against real APIs
+- Unit tests with mocked HTTP responses cannot validate query formats, column names, auth flows, pagination behavior, or rate limit handling. Mocks return whatever you tell them to — they don't catch invalid SQL, wrong endpoint paths, or missing fields.
+- This applies to all external integrations: trace adapters (Braintrust, Langfuse), corpus backends (Turbopuffer, Pinecone, Chroma), the CGFT platform API (training jobs, blob storage), and any future provider.
+- Any PR that changes fetch logic, query construction, column lists, pagination, or retry behavior must pass integration tests before merge. This is non-negotiable.
+- Reviewers: if a PR touches provider API interaction and the diff contains no integration test changes, that is a red flag. Do not approve without verifying the new behavior works against the real API.
+- Integration tests use `@pytest.mark.integration` and are skipped in CI. Run locally: `pytest -m integration` (credentials loaded from `.env.test`). See `.env.test.example` for required keys per provider.
+
