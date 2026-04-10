@@ -83,6 +83,46 @@ class CorpusMetadataCensus:
 
 
 @dataclass
+class CorpusMetadataCensus:
+    """Corpus-relative distributions for calibrating chunk scoring.
+
+    Computed once over the profile pool after entity extraction.
+    All percentile fields are derived from ``statistics.quantiles(data, n=4)``.
+    """
+
+    # Prevalence: fraction of chunks with each metadata type
+    header_prevalence: float  # any of h1/h2/h3/title/section_header
+    doc_id_prevalence: float  # file_name/document_id/source
+    date_prevalence: float  # date/timestamp fields
+    sequential_prevalence: float  # prev_chunk_id/next_chunk_id or file+index
+
+    # Content length distribution (characters)
+    content_length_p25: int
+    content_length_p50: int
+    content_length_p75: int
+
+    # Entity density distribution (recognized entities per 1000 chars)
+    entity_density_p25: float
+    entity_density_p50: float
+    entity_density_p75: float
+
+    # Lexical diversity distribution (unique tokens / total tokens)
+    lexical_diversity_p25: float
+    lexical_diversity_p50: float
+    lexical_diversity_p75: float
+
+    # Derived classification
+    metadata_regime: str  # "structured" | "mixed" | "unstructured"
+
+    # Chunk count (from source)
+    chunk_count: int
+
+    @property
+    def multi_file_corpus(self) -> bool:
+        return self.doc_id_prevalence > 0.05
+
+
+@dataclass
 class CorpusProfile:
     """Shared mutable corpus context threaded across pipeline stages.
 
