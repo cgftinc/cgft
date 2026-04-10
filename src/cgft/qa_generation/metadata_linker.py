@@ -27,6 +27,7 @@ from typing import Any
 
 from cgft.qa_generation.anchor_selector import AnchorBundle
 from cgft.qa_generation.corpus_profile import CorpusProfile
+from cgft.qa_generation.wiki_builder import WikiIndex
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class MetadataLinkerConfig:
     max_primary_similarity: float = 0.55
     retry_confidence: float = 0.5
     header_keys: tuple[str, ...] = ("h2", "h3", "section_header", "title", "h1")
+    wiki_cooccurrence_weight: float = 0.3
 
 
 @dataclass(frozen=True)
@@ -71,10 +73,12 @@ class MetadataChunkLinker:
         profile: CorpusProfile,
         *,
         config: MetadataLinkerConfig | None = None,
+        wiki_index: WikiIndex | None = None,
     ) -> None:
         self.source = source
         self.profile = profile
         self.config = config or MetadataLinkerConfig()
+        self.wiki_index = wiki_index
         self._used_hashes: set[str] = set()
         self._last_primary_entities: set[str] = set()
 
@@ -179,6 +183,33 @@ class MetadataChunkLinker:
             primary_chunk, queries, search_mode_override=overrides.prefer_search_mode
         )
 
+        # Inject wiki-co-occurring chunks into the search results so they
+        # enter the candidate pool even when BM25 doesn't return them.
+        if self.wiki_index is not None:
+            primary_hash = getattr(primary_chunk, "hash", None)
+            if primary_hash and primary_hash in self.wiki_index.chunk_to_pages:
+                existing_hashes = {
+                    r.get("hash") or getattr(r.get("chunk"), "hash", None)
+                    for r in search_results
+                }
+                wiki_hashes: set[str] = set()
+                for page_title in self.wiki_index.chunk_to_pages[primary_hash]:
+                    page = self.wiki_index.pages.get(page_title)
+                    if page:
+                        wiki_hashes.update(page.source_chunk_ids)
+                        for linked_title in page.cross_links:
+                            linked_page = self.wiki_index.pages.get(linked_title)
+                            if linked_page:
+                                wiki_hashes.update(linked_page.source_chunk_ids)
+                wiki_hashes.discard(primary_hash)
+                wiki_hashes -= existing_hashes
+                # Look up actual chunk objects and inject with score 0.
+                if hasattr(self.source, "collection") and self.source.collection:
+                    for wh in wiki_hashes:
+                        chunk_obj = self.source.collection.get_chunk_by_hash(wh)
+                        if chunk_obj is not None:
+                            search_results.append({"chunk": chunk_obj, "max_score": 0.0})
+
         # Filter: same-file, min chars, dedup, used hashes.
         # Returns (chunk, search_score) pairs to preserve relevance signal.
         filtered = self._filter_candidates(
@@ -205,9 +236,28 @@ class MetadataChunkLinker:
         if not scored:
             return []
 
-        # Composite ranking: search relevance + jaccard + entity overlap.
+        # Composite ranking: search relevance + jaccard + entity overlap + wiki co-occurrence.
         primary_entities = self._last_primary_entities
         max_search = max(s for _, s, _ in scored) or 1.0
+
+        # Compute wiki-boosted hashes from the primary chunk.
+        wiki_boosted: set[str] = set()
+        if self.wiki_index is not None:
+            primary_hash = getattr(primary_chunk, "hash", None)
+            if primary_hash and primary_hash in self.wiki_index.chunk_to_pages:
+                # Co-occurrence: chunks that share wiki pages with the primary.
+                for page_title in self.wiki_index.chunk_to_pages[primary_hash]:
+                    page = self.wiki_index.pages.get(page_title)
+                    if page:
+                        wiki_boosted.update(page.source_chunk_ids)
+                        # Cross-link signal: chunks from related entity pages.
+                        for linked_title in page.cross_links:
+                            linked_page = self.wiki_index.pages.get(linked_title)
+                            if linked_page:
+                                wiki_boosted.update(linked_page.source_chunk_ids)
+            # Don't boost the primary chunk itself.
+            if primary_hash:
+                wiki_boosted.discard(primary_hash)
 
         ranked: list[tuple[float, int, Any]] = []
         for idx, (chunk, search_score, jaccard) in enumerate(scored):
@@ -217,10 +267,21 @@ class MetadataChunkLinker:
                 hits = sum(1 for e in primary_entities if e in content_lower)
                 entity_ratio = hits / len(primary_entities)
 
+            wiki_bonus = 0.0
+            if wiki_boosted:
+                chunk_hash = getattr(chunk, "hash", None)
+                if chunk_hash and chunk_hash in wiki_boosted:
+                    wiki_bonus = self.config.wiki_cooccurrence_weight
+
+            # Normalise weights to sum to 1 when wiki bonus applies.
+            base_weight = 1.0 - wiki_bonus
             composite = (
-                0.4 * (search_score / max_search)
-                + 0.3 * jaccard
-                + 0.3 * entity_ratio
+                base_weight * (
+                    0.4 * (search_score / max_search)
+                    + 0.3 * jaccard
+                    + 0.3 * entity_ratio
+                )
+                + wiki_bonus
             )
             ranked.append((composite, idx, chunk))
 
@@ -257,21 +318,30 @@ class MetadataChunkLinker:
         discriminative = self.profile.get_discriminative_entities()
         found_entities: list[str] = []
 
-        for entity in discriminative:
-            if entity.type == "code_pattern":
-                try:
-                    matches = re.findall(entity.name, content)
-                    for match in matches[:2]:
-                        token = match[0] if isinstance(match, tuple) else match
-                        token = str(token).strip()
-                        if token and token not in queries:
-                            queries.append(token)
-                except re.error:
-                    continue
-            else:
-                if entity.name.lower() in content_lower:
+        # Text entities: fast path from graph, fallback to scan
+        primary_hash = getattr(primary_chunk, "hash", None)
+        if primary_hash and primary_hash in self.profile.chunk_entity_index:
+            graph_entities = self.profile.chunk_entity_index[primary_hash]
+            disc_lower = {e.name.lower() for e in discriminative if e.type != "code_pattern"}
+            found_entities = [e for e in graph_entities if e.lower() in disc_lower]
+        else:
+            for entity in discriminative:
+                if entity.type != "code_pattern" and entity.name.lower() in content_lower:
                     found_entities.append(entity.name)
 
+        # Code patterns: still need regex to extract matched tokens
+        for entity in discriminative:
+            if entity.type != "code_pattern":
+                continue
+            try:
+                matches = re.findall(entity.name, content)
+                for match in matches[:2]:
+                    token = match[0] if isinstance(match, tuple) else match
+                    token = str(token).strip()
+                    if token and token not in queries:
+                        queries.append(token)
+            except re.error:
+                continue
             if len(queries) >= max_queries:
                 break
 

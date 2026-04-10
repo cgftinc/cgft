@@ -248,7 +248,7 @@ class SearchAgentLinker:
             secondary_chunks=secondary_chunks,
             target_hop_count=min(hop_count, actual_hop_count),
             structural_hints={
-                "linker": "search_agent",
+                "linker": "search_agent_v2",
                 "confidence": confidence,
                 "confidence_fulfillment": (
                     min(len(secondary_chunks) / n_secondaries, 1.0)

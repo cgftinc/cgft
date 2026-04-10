@@ -8,6 +8,7 @@ version for prompt conditioning.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import random
@@ -38,6 +39,47 @@ class EntityPattern:
     type: str  # "entity" | "code_pattern" | "domain_term"
     document_frequency: float = 0.0
     idf_weight: float = 0.0
+    quality_score: float = 0.0
+
+
+@dataclass
+class CorpusMetadataCensus:
+    """Corpus-relative distributions for calibrating chunk scoring.
+
+    Computed once over the profile pool after entity extraction.
+    All percentile fields are derived from ``statistics.quantiles(data, n=4)``.
+    """
+
+    # Prevalence: fraction of chunks with each metadata type
+    header_prevalence: float  # any of h1/h2/h3/title/section_header
+    doc_id_prevalence: float  # file_name/document_id/source
+    date_prevalence: float  # date/timestamp fields
+    sequential_prevalence: float  # prev_chunk_id/next_chunk_id or file+index
+
+    # Content length distribution (characters)
+    content_length_p25: int
+    content_length_p50: int
+    content_length_p75: int
+
+    # Entity density distribution (recognized entities per 1000 chars)
+    entity_density_p25: float
+    entity_density_p50: float
+    entity_density_p75: float
+
+    # Lexical diversity distribution (unique tokens / total tokens)
+    lexical_diversity_p25: float
+    lexical_diversity_p50: float
+    lexical_diversity_p75: float
+
+    # Derived classification
+    metadata_regime: str  # "structured" | "mixed" | "unstructured"
+
+    # Chunk count (from source)
+    chunk_count: int
+
+    @property
+    def multi_file_corpus(self) -> bool:
+        return self.doc_id_prevalence > 0.05
 
 
 @dataclass
@@ -120,6 +162,14 @@ class CorpusProfile:
     connection_distribution: dict[str, int] = field(default_factory=dict)
     _query_effectiveness: dict[str, list[int]] = field(default_factory=dict)
 
+    # --- Entity-chunk graph (computed during profiling) ---
+    entity_chunk_index: dict[str, set[str]] = field(default_factory=dict)
+    # entity name (lower) -> set of chunk hashes containing it (unfiltered)
+    chunk_entity_index: dict[str, list[str]] = field(default_factory=dict)
+    # chunk hash -> list of entity names found in it (unfiltered)
+    entity_cooccurrence: dict[tuple[str, str], int] = field(default_factory=dict)
+    # (entity_a, entity_b) canonicalized pair -> count of chunks containing both
+
     # --- Census and suitability (computed after entity extraction) ---
     census: CorpusMetadataCensus | None = None
     chunk_suitability_scores: dict[str, float] = field(default_factory=dict)
@@ -131,6 +181,11 @@ class CorpusProfile:
     def corpus_queries_bulleted(self) -> str:
         """Queries formatted for prompt templates."""
         return "\n".join(f"- {q}" for q in self.corpus_queries)
+
+    @functools.cached_property
+    def entity_quality_map(self) -> dict[str, float]:
+        """Cached mapping of entity name (lower) -> quality_score."""
+        return {p.name.lower(): p.quality_score for p in self.entity_patterns}
 
     def get_discriminative_entities(
         self,
@@ -211,36 +266,132 @@ class CorpusProfile:
         )
 
 
+_ENTITY_STOPWORDS = frozenset({
+    "the", "a", "an", "in", "on", "at", "to", "for", "of", "is", "it", "if",
+    "you", "your", "this", "that", "with", "from", "by", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "can", "could", "would", "should", "may", "not", "no", "or", "and", "but",
+    "so", "as", "its", "our", "we", "re", "s", "t",
+})
+
+
+def _score_entity_quality(pattern: EntityPattern) -> float:
+    """Score entity quality from DF + name heuristics. Returns [0, 1].
+
+    Combines three signals:
+    - DF discriminativeness (50%): flat top at 0.02-0.10, taper to 0 at 0.40.
+    - Type bonus (30%): entity > code_pattern > domain_term.
+    - Name quality (20%): uppercase required for high score; all-stopword penalised.
+    """
+    df = pattern.document_frequency
+
+    # DF discriminativeness: sweet spot 0.02-0.10
+    if df <= 0.0:
+        df_score = 0.0
+    elif df < 0.02:
+        df_score = df / 0.02
+    elif df <= 0.10:
+        df_score = 1.0
+    elif df <= 0.40:
+        df_score = 1.0 - (df - 0.10) / 0.30
+    else:
+        df_score = 0.0
+
+    # Type bonus
+    if pattern.type == "entity":
+        type_score = 1.0
+    elif pattern.type == "code_pattern":
+        type_score = 0.85
+    else:  # domain_term
+        type_score = 0.6
+
+    # Name quality
+    if pattern.type == "code_pattern":
+        name_score = 0.8  # regex patterns bypass text heuristics
+    else:
+        words = pattern.name.lower().split()
+        if all(w in _ENTITY_STOPWORDS for w in words):
+            name_score = 0.0
+        else:
+            has_upper = any(c.isupper() for c in pattern.name)
+            name_score = 1.0 if has_upper else 0.3
+            if len(pattern.name) < 4:
+                name_score *= 0.5
+
+    return df_score * 0.5 + type_score * 0.3 + name_score * 0.2
+
+
+def build_entity_chunk_graph(
+    entity_patterns: list[EntityPattern],
+    chunks: list[Any],
+) -> tuple[dict[str, set[str]], dict[str, list[str]], dict[tuple[str, str], int]]:
+    """Single O(E×N) scan: build entity↔chunk bipartite graph and compute DF/quality.
+
+    Mutates ``entity_patterns`` in place, setting ``document_frequency``,
+    ``idf_weight``, and ``quality_score`` on each pattern.
+
+    Returns (entity_chunk_index, chunk_entity_index, entity_cooccurrence).
+    All indexes are **unfiltered** — consumers apply their own quality thresholds.
+    """
+    n = len(chunks)
+    if n == 0:
+        return {}, {}, {}
+
+    entity_chunk_idx: dict[str, set[str]] = {}
+    chunk_entity_idx: dict[str, list[str]] = {}
+
+    for pattern in entity_patterns:
+        name_lower = pattern.name.lower()
+        matched: set[str] = set()
+
+        for chunk in chunks:
+            content = (chunk.content if hasattr(chunk, "content") else str(chunk)).lower()
+            chunk_hash = getattr(chunk, "hash", str(id(chunk)))
+
+            if pattern.type == "code_pattern":
+                try:
+                    if re.search(pattern.name, content, re.IGNORECASE):
+                        matched.add(chunk_hash)
+                        chunk_entity_idx.setdefault(chunk_hash, []).append(pattern.name)
+                except re.error:
+                    continue
+            elif name_lower in content:
+                matched.add(chunk_hash)
+                chunk_entity_idx.setdefault(chunk_hash, []).append(pattern.name)
+
+        entity_chunk_idx[name_lower] = matched
+        count = len(matched)
+        pattern.document_frequency = count / n
+        pattern.idf_weight = math.log(n / max(count, 1))
+
+    # Compute quality scores (needs DF to be set first)
+    for pattern in entity_patterns:
+        pattern.quality_score = _score_entity_quality(pattern)
+
+    # Co-occurrence from the full graph
+    cooccurrence: dict[tuple[str, str], int] = {}
+    entity_names = sorted(
+        name for name, hashes in entity_chunk_idx.items() if hashes
+    )
+    for i, e1 in enumerate(entity_names):
+        for e2 in entity_names[i + 1:]:
+            overlap = len(entity_chunk_idx[e1] & entity_chunk_idx[e2])
+            if overlap > 0:
+                cooccurrence[(e1, e2)] = overlap
+
+    return entity_chunk_idx, chunk_entity_idx, cooccurrence
+
+
 def compute_entity_document_frequency(
     entity_patterns: list[EntityPattern],
     sample_chunks: list[Any],
 ) -> None:
-    """Compute document frequency for each entity against a chunk sample.
+    """Compute DF and quality score for each entity. Thin wrapper around graph build.
 
-    Mutates ``entity_patterns`` in place, setting ``document_frequency``
-    and ``idf_weight`` on each pattern.
+    Mutates ``entity_patterns`` in place, setting ``document_frequency``,
+    ``idf_weight``, and ``quality_score`` on each pattern.
     """
-    n = len(sample_chunks)
-    if n == 0:
-        return
-
-    chunk_contents = [
-        (chunk.content if hasattr(chunk, "content") else str(chunk)).lower()
-        for chunk in sample_chunks
-    ]
-
-    for pattern in entity_patterns:
-        if pattern.type == "code_pattern":
-            try:
-                compiled = re.compile(pattern.name, re.IGNORECASE)
-                count = sum(1 for content in chunk_contents if compiled.search(content))
-            except re.error:
-                count = 0
-        else:
-            name_lower = pattern.name.lower()
-            count = sum(1 for content in chunk_contents if name_lower in content)
-        pattern.document_frequency = count / n
-        pattern.idf_weight = math.log(n / max(count, 1))
+    build_entity_chunk_graph(entity_patterns, sample_chunks)
 
 
 def compute_token_document_frequency(
@@ -1051,12 +1202,19 @@ def compute_chunk_suitability(
         richness += 1
     metadata_score = richness / 4.0
 
-    # 2. Entity density: entities per 1000 chars, percentile-normalised
-    entity_names_lower = [
-        name.lower() for name in profile.get_entity_names(discriminative_only=False)
-    ]
-    entity_count = sum(1 for name in entity_names_lower if name in content_lower)
-    raw_entity_density = entity_count / max(len(content) / 1000, 0.001)
+    # 2. Entity density: quality-weighted entities per 1000 chars, percentile-normalised
+    chunk_hash = getattr(chunk, "hash", str(id(chunk)))
+    eq_map = profile.entity_quality_map
+    if chunk_hash in profile.chunk_entity_index:
+        # Fast path: read from pre-computed entity-chunk graph
+        chunk_entities = profile.chunk_entity_index[chunk_hash]
+        quality_weighted_count = sum(eq_map.get(e.lower(), 0.5) for e in chunk_entities)
+    else:
+        # Fallback: inline scan for chunks not in the graph (API backends, on-the-fly)
+        quality_weighted_count = sum(
+            score for name, score in eq_map.items() if name in content_lower
+        )
+    raw_entity_density = quality_weighted_count / max(len(content) / 1000, 0.001)
     entity_density = _percentile_normalize(
         raw_entity_density,
         census.entity_density_p25,

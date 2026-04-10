@@ -265,6 +265,7 @@ def _build_metadata_linker(
     cfg: CgftPipelineConfig,
     source: Any,
     profile: CorpusProfile,
+    wiki_index: Any = None,
 ) -> MetadataChunkLinker:
     from cgft.qa_generation.metadata_linker import MetadataLinkerConfig
 
@@ -283,6 +284,7 @@ def _build_metadata_linker(
             retry_confidence=mcfg.retry_confidence,
             header_keys=mcfg.header_keys,
         ),
+        wiki_index=wiki_index,
     )
 
 
@@ -290,8 +292,9 @@ def _build_linker(
     cfg: CgftPipelineConfig,
     source: Any,
     profile: CorpusProfile | None = None,
+    wiki_index: Any = None,
 ) -> ChunkLinker:
-    if cfg.linker.type not in ("metadata", "search_agent"):
+    if cfg.linker.type not in ("metadata", "search_agent", "wiki"):
         logger.warning(
             "Unknown linker type '%s'; falling back to 'metadata'.",
             cfg.linker.type,
@@ -302,11 +305,33 @@ def _build_linker(
             "(corpus_context must be enabled in stages 2/3)."
         )
 
+    if cfg.linker.type == "wiki":
+        if not profile.entity_chunk_index:
+            logger.warning(
+                "Wiki linker requested but entity-chunk graph is empty; "
+                "falling back to metadata linker.",
+            )
+            return _build_metadata_linker(cfg, source, profile, wiki_index=wiki_index)
+        from cgft.qa_generation.wiki_chunk_linker import (  # noqa: PLC0415
+            WikiChunkLinker,
+            WikiChunkLinkerConfig,
+        )
+        mcfg = cfg.linker.metadata
+        return WikiChunkLinker(
+            source=source,
+            profile=profile,
+            config=WikiChunkLinkerConfig(
+                max_secondaries=mcfg.max_secondaries,
+                min_chunk_chars=mcfg.min_chunk_chars,
+                max_primary_similarity=mcfg.max_primary_similarity,
+            ),
+        )
+
     if cfg.linker.type == "search_agent":
         from cgft.corpus.corpora.search import CorporaSearch
         from cgft.qa_generation.search_agent_linker import SearchAgentLinker
 
-        metadata_linker = _build_metadata_linker(cfg, source, profile)
+        metadata_linker = _build_metadata_linker(cfg, source, profile, wiki_index=wiki_index)
         search_client = CorporaSearch(
             api_key=cfg.platform.api_key,
             corpus_name=cfg.corpus.corpus_name,
@@ -326,7 +351,7 @@ def _build_linker(
             llm_api_key=llm_cfg.api_key,
         )
 
-    return _build_metadata_linker(cfg, source, profile)
+    return _build_metadata_linker(cfg, source, profile, wiki_index=wiki_index)
 
 
 def _build_generator(
@@ -1424,6 +1449,35 @@ class CgftPipeline:
         except AttributeError:
             chunk_count = cfg.targets.total_samples * 10
 
+        # Ensure all chunks are accessible in memory.  CorporaChunkSource
+        # already materialises via populate; API-only backends (Turbopuffer)
+        # need an explicit fetch so the entity-chunk graph and linker can
+        # resolve any chunk by hash.
+        max_materialize = 50_000
+        if getattr(source, "collection", None) is None and chunk_count > 0:
+            if chunk_count <= max_materialize:
+                from cgft.chunkers.models import ChunkCollection  # noqa: PLC0415
+
+                logger.info(
+                    "Materialising %d chunks from API backend into memory...",
+                    chunk_count,
+                )
+                all_chunks = source.sample_chunks(
+                    chunk_count, min_chars=cfg.corpus.min_chunk_chars,
+                )
+                if all_chunks:
+                    source.collection = ChunkCollection(chunks=all_chunks)  # type: ignore[attr-defined]
+                    logger.info(
+                        "Cached %d/%d chunks on source.collection",
+                        len(all_chunks), chunk_count,
+                    )
+            else:
+                logger.warning(
+                    "Corpus too large to materialise (%d chunks > %d cap); "
+                    "entity-chunk graph will use profile sample only.",
+                    chunk_count, max_materialize,
+                )
+
         profile_sample = diverse_profile_sample(
             source,
             corpus_size=chunk_count,
@@ -1497,7 +1551,16 @@ class CgftPipeline:
                 code_patterns=ext.code_patterns,
                 domain_terms=ext.domain_terms,
             )
-            compute_entity_document_frequency(entity_patterns, profile_sample)
+            from cgft.qa_generation.corpus_profile import build_entity_chunk_graph  # noqa: PLC0415
+            # Use full corpus for graph when available (denser graph = better linking)
+            graph_chunks = (
+                list(source.collection.chunks)
+                if getattr(source, "collection", None)
+                else profile_sample
+            )
+            entity_chunk_idx, chunk_entity_idx, cooccurrence = build_entity_chunk_graph(
+                entity_patterns, graph_chunks,
+            )
             n_ubiquitous = sum(1 for e in entity_patterns if e.document_frequency >= 0.80)
             if n_ubiquitous > 0:
                 logger.info(
@@ -1518,8 +1581,52 @@ class CgftPipeline:
             best_search_mode=best_search_mode,
             token_document_frequency=token_df,
             token_df_sample_size=token_df_n,
+            entity_chunk_index=entity_chunk_idx if entity_patterns else {},
+            chunk_entity_index=chunk_entity_idx if entity_patterns else {},
+            entity_cooccurrence=cooccurrence if entity_patterns else {},
         )
         context.profile = profile
+
+        # --- Optional wiki preprocessing ---
+        if cfg.wiki_preprocessing.enabled:
+            _print_progress("[3.5/6] Building wiki from entity clusters...", verbose=cfg.verbose)
+            from openai import OpenAI as _OpenAI  # noqa: PLC0415
+
+            from cgft.qa_generation.wiki_builder import WikiBuilder  # noqa: PLC0415
+
+            wiki_client = _OpenAI(
+                api_key=cfg.wiki_preprocessing.api_key,
+                base_url=cfg.wiki_preprocessing.base_url or None,
+            )
+            wiki_builder = WikiBuilder(cfg.wiki_preprocessing, wiki_client)
+
+            # Use all corpus chunks for clustering, not just the profile sample.
+            wiki_chunks = list(getattr(source, "collection", None) or profile_sample)
+            clusters = wiki_builder.cluster_chunks(
+                wiki_chunks,
+                profile.entity_patterns,
+                profile=profile,
+            )
+
+            if clusters:
+                wiki_index = wiki_builder.generate_pages(
+                    clusters,
+                    corpus_summary=context.get("corpus_summary", ""),
+                    corpus_description=context.get("corpus_description", ""),
+                    corpus_language=str(context.get("corpus_language", "") or "").strip(),
+                )
+                context["wiki_index"] = wiki_index
+                context["wiki_builder"] = wiki_builder
+                _print_progress(
+                    f"[3.5/6] Built {len(wiki_index.pages)} wiki pages from "
+                    f"{len(clusters)} entity clusters",
+                    verbose=cfg.verbose,
+                )
+            else:
+                _print_progress(
+                    "[3.5/6] No entity clusters large enough for wiki pages",
+                    verbose=cfg.verbose,
+                )
 
         # --- Corpus-aware auto-tuning and warnings ---
         _entity_names = profile.get_entity_names(discriminative_only=False)
@@ -1531,6 +1638,7 @@ class CgftPipeline:
                 _chunk, census, profile
             )
         context["census"] = census
+
 
         warnings = emit_corpus_warnings(census, profile, cfg)
         for w in warnings:
@@ -1587,7 +1695,7 @@ class CgftPipeline:
 
         _print_progress("[4/6] Preparing generation...", verbose=cfg.verbose)
 
-        linker = _build_linker(cfg, source, profile=profile)
+        linker = _build_linker(cfg, source, profile=profile, wiki_index=context.get("wiki_index"))
         generator = _build_generator(cfg, linker=linker)
         guard_filter = DeterministicGuardsFilter(cfg.filtering.deterministic_guards)
         filter_stage_names, filter_chain = _build_filter_chain(
