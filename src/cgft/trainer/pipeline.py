@@ -241,6 +241,8 @@ def train(
     validate_env: bool = True,
     validate_env_remotely: bool = True,
     show_summary: bool = True,
+    # Rollout / training configuration
+    validation_model: str | None = None,
     dry_run: bool = False,
 ) -> str | dict[str, Any]:
     """Train a model - the simplest interface for launching training jobs.
@@ -270,6 +272,7 @@ def train(
         validate_env: Whether to validate environment locally before upload. (default: True)
         validate_env_remotely: Whether to validate environment in a remote rollout server. (default: True)
         show_summary: Whether to print progress information (default: True)
+        validation_model: LLM model for remote validation rollouts (default: server default)
         dry_run: Validate everything but don't launch the training job. (default: False)
 
     Returns:
@@ -354,10 +357,14 @@ def train(
     # Smoke-test the uploaded environment on the rollout server
     if validate_env_remotely:
         rollout_client = RolloutClient(api_key=api_key)
+        validate_kwargs: dict[str, Any] = {}
+        if validation_model is not None:
+            validate_kwargs["llm_model"] = validation_model
         passed = rollout_client.validate_examples(
             examples=eval_dataset,
             env_cls_path=env_blob_path,
             env_metadata_path=env_meta_blob_path,
+            **validate_kwargs,
         )
         if not passed:
             raise RuntimeError(
