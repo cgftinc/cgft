@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, call, patch
 
+import httpx
 import pytest
 
 from cgft.traces.adapter import TraceCredentials
@@ -249,7 +250,9 @@ class TestFetchTraces:
 
         btql_resp = MagicMock()
         btql_resp.status_code = 500
-        btql_resp.raise_for_status.side_effect = Exception("BTQL error")
+        btql_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "500 Server Error", request=MagicMock(), response=btql_resp
+        )
 
         rest_resp = MagicMock()
         rest_resp.status_code = 200
