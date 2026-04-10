@@ -211,16 +211,18 @@ class PineconeChunkSource:
         for chunk in collection:
             ids.append(chunk.hash or f"chunk-{len(ids) + 1}")
             documents.append(chunk.content)
-            metadatas.append({
-                self._client._pc_field("content"): chunk.content,
-                self._client._pc_field("file_path"): chunk.get_metadata("file", ""),
-                self._client._pc_field("h1"): chunk.get_metadata("h1", ""),
-                self._client._pc_field("h2"): chunk.get_metadata("h2", ""),
-                self._client._pc_field("h3"): chunk.get_metadata("h3", ""),
-                self._client._pc_field("chunk_index"): chunk.get_metadata("index", 0),
-                self._client._pc_field("chunk_hash"): chunk.hash,
-                self._client._pc_field("char_count"): len(chunk),
-            })
+            metadatas.append(
+                {
+                    self._client._pc_field("content"): chunk.content,
+                    self._client._pc_field("file_path"): chunk.get_metadata("file", ""),
+                    self._client._pc_field("h1"): chunk.get_metadata("h1", ""),
+                    self._client._pc_field("h2"): chunk.get_metadata("h2", ""),
+                    self._client._pc_field("h3"): chunk.get_metadata("h3", ""),
+                    self._client._pc_field("chunk_index"): chunk.get_metadata("index", 0),
+                    self._client._pc_field("chunk_hash"): chunk.hash,
+                    self._client._pc_field("char_count"): len(chunk),
+                }
+            )
         self._client.upsert_raw(
             ids=ids,
             documents=documents,

@@ -156,9 +156,7 @@ class TpufChunkSource:
             max_char=max_chars,
             chunk_overlap=overlap_chars,
         )
-        collection = chunker.chunk_folder(
-            docs_path, file_extensions=file_extensions
-        )
+        collection = chunker.chunk_folder(docs_path, file_extensions=file_extensions)
 
         if show_summary:
             inspector = ChunkInspector(collection)
@@ -297,9 +295,7 @@ class TpufChunkSource:
     # Context & structure
     # ------------------------------------------------------------------
 
-    def get_chunk_with_context(
-        self, chunk: Chunk, max_chars: int = 200
-    ) -> dict:
+    def get_chunk_with_context(self, chunk: Chunk, max_chars: int = 200) -> dict:
         """Return chunk with neighboring context from the same file.
 
         When ``file_path`` and ``chunk_index`` attributes exist, previous
@@ -373,9 +369,7 @@ class TpufChunkSource:
 
         path_depths = {p: p.count("/") for p in all_paths}
         min_depth = min(path_depths.values())
-        top_level_paths = [
-            p for p, d in path_depths.items() if d == min_depth
-        ]
+        top_level_paths = [p for p, d in path_depths.items() if d == min_depth]
 
         chunks: list[Chunk] = []
         for path in top_level_paths:
@@ -413,12 +407,8 @@ class TpufChunkSource:
         related_map: dict[int, dict] = {}
 
         file_aware = self._files.check()
-        source_file = (
-            self._files.chunk_file_path(source) if file_aware else None
-        )
-        source_idx = (
-            self._files.chunk_index(source) if file_aware else None
-        )
+        source_file = self._files.chunk_file_path(source) if file_aware else None
+        source_idx = self._files.chunk_index(source) if file_aware else None
 
         effective_mode = mode or _DEFAULT_RELATED_SEARCH_MODE
 
@@ -466,10 +456,7 @@ class TpufChunkSource:
 
                     if is_same_file and source_idx is not None:
                         result_idx = self._files.chunk_index(result_chunk)
-                        if (
-                            result_idx is not None
-                            and abs(result_idx - source_idx) <= 1
-                        ):
+                        if result_idx is not None and abs(result_idx - source_idx) <= 1:
                             continue
 
                 score = getattr(row, "$dist", 0.0) or 0.0
@@ -482,9 +469,7 @@ class TpufChunkSource:
                         "max_score": score,
                     }
                 else:
-                    related_map[row.id]["max_score"] = max(
-                        related_map[row.id]["max_score"], score
-                    )
+                    related_map[row.id]["max_score"] = max(related_map[row.id]["max_score"], score)
 
                 related_map[row.id]["queries"].append(query)
 
@@ -498,9 +483,7 @@ class TpufChunkSource:
             reverse=True,
         )
 
-    def probe_rank_by_payloads(
-        self, query: str = "cgft hybrid probe"
-    ) -> dict[str, dict[str, Any]]:
+    def probe_rank_by_payloads(self, query: str = "cgft hybrid probe") -> dict[str, dict[str, Any]]:
         """Probe which rank_by payload shapes are accepted by the live namespace.
 
         This is a diagnostic tool — it fires real queries against the namespace.
@@ -579,7 +562,9 @@ class TpufChunkSource:
             # Hybrid specs that reach here have already been validated
             # by _query_rows; build native hybrid rank_by.
             rank_by = self._client.build_native_hybrid_rank_by(
-                text_query, vector_query, spec.get("hybrid")  # type: ignore[arg-type]
+                text_query,
+                vector_query,
+                spec.get("hybrid"),  # type: ignore[arg-type]
             )
 
         query_kwargs: dict[str, Any] = {
@@ -587,9 +572,7 @@ class TpufChunkSource:
             "top_k": int(spec.get("top_k", 10)),
             "include_attributes": True,
         }
-        translated_filters = to_turbopuffer_filters(
-            spec.get("filter"), self._search_capabilities
-        )
+        translated_filters = to_turbopuffer_filters(spec.get("filter"), self._search_capabilities)
         if translated_filters is not None:
             query_kwargs["filters"] = translated_filters
 
@@ -629,9 +612,7 @@ class TpufChunkSource:
         max_top_k = int(self._search_capabilities["constraints"].get("max_top_k", 10000))
         oversampled_top_k = min(max_top_k, requested_top_k * 2)
 
-        translated_filters = to_turbopuffer_filters(
-            spec.get("filter"), self._search_capabilities
-        )
+        translated_filters = to_turbopuffer_filters(spec.get("filter"), self._search_capabilities)
 
         lexical_kwargs: dict[str, Any] = {
             "rank_by": self._client.build_bm25_rank_by(text_query),

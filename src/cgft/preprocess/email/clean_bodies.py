@@ -166,7 +166,9 @@ def _candidate_quote_text(lines: list[str], quote_start: int) -> str:
     return "\n".join(cleaned).strip()
 
 
-def _looks_like_known_message(candidate_norm: str, thread_body_norms: list[str], min_chars: int) -> bool:
+def _looks_like_known_message(
+    candidate_norm: str, thread_body_norms: list[str], min_chars: int
+) -> bool:
     if len(candidate_norm) < min_chars:
         return False
     for other in thread_body_norms:
@@ -454,7 +456,9 @@ def parse_args() -> argparse.Namespace:
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--input", help="Input parsed-email JSONL path")
     group.add_argument("--folder", help="Folder with preprocessed _deduped.jsonl to clean")
-    p.add_argument("--output", default=DEFAULT_OUTPUT_PATH, help="Output cleaned JSONL path (for --input mode)")
+    p.add_argument(
+        "--output", default=DEFAULT_OUTPUT_PATH, help="Output cleaned JSONL path (for --input mode)"
+    )
     p.add_argument(
         "--quote-match-min-chars",
         type=int,

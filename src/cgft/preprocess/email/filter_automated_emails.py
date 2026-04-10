@@ -293,9 +293,14 @@ def filter_automated_emails(
         (kept_rows, report) where report contains counts and drop reasons.
     """
     empty_report = {
-        "total": 0, "kept": 0, "dropped": 0, "drop_rate": 0.0,
-        "heuristic_suspects": 0, "llm_batches": 0,
-        "llm_confirmed_drops": 0, "llm_reversed_to_keep": 0,
+        "total": 0,
+        "kept": 0,
+        "dropped": 0,
+        "drop_rate": 0.0,
+        "heuristic_suspects": 0,
+        "llm_batches": 0,
+        "llm_confirmed_drops": 0,
+        "llm_reversed_to_keep": 0,
         "parse_failures_kept": 0,
     }
     if not rows:

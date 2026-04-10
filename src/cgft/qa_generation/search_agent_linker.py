@@ -251,14 +251,10 @@ class SearchAgentLinker:
                 "linker": "search_agent_v2",
                 "confidence": confidence,
                 "confidence_fulfillment": (
-                    min(len(secondary_chunks) / n_secondaries, 1.0)
-                    if n_secondaries > 0
-                    else 1.0
+                    min(len(secondary_chunks) / n_secondaries, 1.0) if n_secondaries > 0 else 1.0
                 ),
                 "confidence_survival": (
-                    len(secondary_chunks) / pre_filter_count
-                    if pre_filter_count > 0
-                    else 0.0
+                    len(secondary_chunks) / pre_filter_count if pre_filter_count > 0 else 0.0
                 ),
                 "confidence_chain": (
                     1.0
@@ -360,12 +356,7 @@ class SearchAgentLinker:
                 continue
 
             chunk_file = _get_file(chunk)
-            if (
-                filter_same_file
-                and primary_file
-                and chunk_file
-                and chunk_file == primary_file
-            ):
+            if filter_same_file and primary_file and chunk_file and chunk_file == primary_file:
                 continue
 
             tokens = set(chunk_content.lower().split())
@@ -417,9 +408,7 @@ class SearchAgentLinker:
         if reasoning_mode == "sequential":
             primary_md = _get_metadata(primary_chunk)
             if primary_md.get("file") and primary_md.get("index") is not None:
-                selected = _rerank_by_index_proximity(
-                    primary_chunk, selected, index_range=(2, 5)
-                )
+                selected = _rerank_by_index_proximity(primary_chunk, selected, index_range=(2, 5))
 
         return selected
 
@@ -434,9 +423,7 @@ class SearchAgentLinker:
             return 1.0
 
         fulfillment = min(len(secondary_chunks) / n_secondaries, 1.0)
-        survival = (
-            len(secondary_chunks) / pre_filter_count if pre_filter_count > 0 else 0.0
-        )
+        survival = len(secondary_chunks) / pre_filter_count if pre_filter_count > 0 else 0.0
         connection = evidence_chain.get("connection", "")
         chain_raw = evidence_chain.get("raw", "")
         if connection:
@@ -473,16 +460,20 @@ class SearchAgentLinker:
 
 
 _TOOL_CALL_RE = re.compile(
-    r'<tool_call>\s*(.*?)\s*</tool_call>', re.DOTALL,
+    r"<tool_call>\s*(.*?)\s*</tool_call>",
+    re.DOTALL,
 )
 _EVIDENCE_CHAIN_RE = re.compile(
-    r"<evidence_chain>(.*?)</evidence_chain>", re.DOTALL,
+    r"<evidence_chain>(.*?)</evidence_chain>",
+    re.DOTALL,
 )
 _CHUNK_ROLE_RE = re.compile(
-    r'<chunk[^>]*role="secondary"[^>]*>(.*?)</chunk>', re.DOTALL,
+    r'<chunk[^>]*role="secondary"[^>]*>(.*?)</chunk>',
+    re.DOTALL,
 )
 _CONNECTION_RE = re.compile(
-    r"<connection>(.*?)</connection>", re.DOTALL,
+    r"<connection>(.*?)</connection>",
+    re.DOTALL,
 )
 
 
@@ -540,9 +531,7 @@ def _extract_evidence_chain(messages: list[dict[str, Any]]) -> dict[str, Any]:
             return {
                 "raw": chain_text.strip(),
                 "chunk_reasons": [r.strip() for r in chunk_reasons],
-                "connection": (
-                    connection_match.group(1).strip() if connection_match else ""
-                ),
+                "connection": (connection_match.group(1).strip() if connection_match else ""),
             }
     return {}
 

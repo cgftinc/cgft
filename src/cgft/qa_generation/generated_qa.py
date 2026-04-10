@@ -78,13 +78,10 @@ class GeneratedQA:
         qa_type = str(self.qa.get("qa_type", "")).strip().lower()
         if not qa_type:
             qa_type = (
-                str(self.generation_metadata.get("qa_type_target", "")).strip().lower()
-                or "lookup"
+                str(self.generation_metadata.get("qa_type_target", "")).strip().lower() or "lookup"
             )
         ref_chunks = list(
-            self.qa.get("verified_reference_chunks")
-            or self.qa.get("reference_chunks", [])
-            or []
+            self.qa.get("verified_reference_chunks") or self.qa.get("reference_chunks", []) or []
         )
         if qa_type == "lookup" and len(ref_chunks) >= 2:
             return "multi_hop"
@@ -105,9 +102,9 @@ class GeneratedQA:
         details: dict[str, Any] | None = None,
     ) -> None:
         """Append a normalized item-lifecycle event for later analysis."""
-        resolved_task_id = str(task_id).strip() or str(
-            self.generation_metadata.get("task_id", "")
-        ).strip()
+        resolved_task_id = (
+            str(task_id).strip() or str(self.generation_metadata.get("task_id", "")).strip()
+        )
         if refinement_count is None:
             try:
                 resolved_refinement_count = int(self.generation_metadata.get("refinement_count", 0))

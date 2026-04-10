@@ -27,11 +27,17 @@ def dsl_to_predicate(node: Any) -> FilterPredicate | None:
         return FieldPredicate(field=field_name, op=op, value=node.get("value"))
 
     if "and" in node and isinstance(node["and"], list):
-        clauses = [pred for pred in (dsl_to_predicate(clause) for clause in node["and"]) if pred is not None]
+        clauses = [
+            pred
+            for pred in (dsl_to_predicate(clause) for clause in node["and"])
+            if pred is not None
+        ]
         return AndPredicate(clauses=tuple(clauses)) if clauses else None
 
     if "or" in node and isinstance(node["or"], list):
-        clauses = [pred for pred in (dsl_to_predicate(clause) for clause in node["or"]) if pred is not None]
+        clauses = [
+            pred for pred in (dsl_to_predicate(clause) for clause in node["or"]) if pred is not None
+        ]
         return OrPredicate(clauses=tuple(clauses)) if clauses else None
 
     if "not" in node:
@@ -39,4 +45,3 @@ def dsl_to_predicate(node: Any) -> FilterPredicate | None:
         return NotPredicate(clause=clause) if clause is not None else None
 
     return None
-

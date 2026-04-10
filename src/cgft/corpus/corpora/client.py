@@ -336,7 +336,9 @@ class CorpusClient:
             chunk_ids = data.get("chunkIds", [])
             return inserted_count, chunk_ids
 
-        pbar = tqdm(total=total_batches, desc="Uploading chunks", disable=not show_progress, unit="batch")
+        pbar = tqdm(
+            total=total_batches, desc="Uploading chunks", disable=not show_progress, unit="batch"
+        )
 
         if max_workers == 1:
             for batch_index in range(total_batches):
@@ -347,7 +349,10 @@ class CorpusClient:
                 pbar.set_postfix({"inserted": total_inserted})
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(_upload_batch, batch_index) for batch_index in range(total_batches)]
+                futures = [
+                    executor.submit(_upload_batch, batch_index)
+                    for batch_index in range(total_batches)
+                ]
                 for future in as_completed(futures):
                     inserted_count, chunk_ids = future.result()
                     total_inserted += inserted_count

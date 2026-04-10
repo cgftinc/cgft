@@ -313,6 +313,7 @@ def _build_linker(
             WikiChunkLinker,
             WikiChunkLinkerConfig,
         )
+
         mcfg = cfg.linker.metadata
         return WikiChunkLinker(
             source=source,
@@ -1461,19 +1462,22 @@ class CgftPipeline:
                     chunk_count,
                 )
                 all_chunks = source.sample_chunks(
-                    chunk_count, min_chars=cfg.corpus.min_chunk_chars,
+                    chunk_count,
+                    min_chars=cfg.corpus.min_chunk_chars,
                 )
                 if all_chunks:
                     source.collection = ChunkCollection(chunks=all_chunks)  # type: ignore[attr-defined]
                     logger.info(
                         "Cached %d/%d chunks on source.collection",
-                        len(all_chunks), chunk_count,
+                        len(all_chunks),
+                        chunk_count,
                     )
             else:
                 logger.warning(
                     "Corpus too large to materialise (%d chunks > %d cap); "
                     "entity-chunk graph will use profile sample only.",
-                    chunk_count, max_materialize,
+                    chunk_count,
+                    max_materialize,
                 )
 
         profile_sample = diverse_profile_sample(
@@ -1553,6 +1557,7 @@ class CgftPipeline:
                 domain_terms=ext.domain_terms,
             )
             from cgft.qa_generation.corpus_profile import build_entity_chunk_graph  # noqa: PLC0415
+
             # Use full corpus for graph when available (denser graph = better linking)
             graph_chunks = (
                 list(source.collection.chunks)
@@ -1560,7 +1565,8 @@ class CgftPipeline:
                 else profile_sample
             )
             entity_chunk_idx, chunk_entity_idx, cooccurrence = build_entity_chunk_graph(
-                entity_patterns, graph_chunks,
+                entity_patterns,
+                graph_chunks,
             )
             n_ubiquitous = sum(1 for e in entity_patterns if e.document_frequency >= 0.80)
             if n_ubiquitous > 0:

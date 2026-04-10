@@ -29,7 +29,6 @@ MIN_TRAIN_SAMPLES = 16
 VALID_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
-
 # ---------------------------------------------------------------------------
 # Detection helpers
 # ---------------------------------------------------------------------------
@@ -345,9 +344,7 @@ def filter_by_tool_calls(
         all_excluded = all(name in exclude_set for name in tool_names)
         text_content = ex.completion_messages[0].content if ex.completion_messages else ""
         if all_excluded and len(text_content) < 50:
-            dropped.append(
-                (ex, DropReason("tool_calls", "excluded", tool_names[0]))
-            )
+            dropped.append((ex, DropReason("tool_calls", "excluded", tool_names[0])))
             continue
         kept.append(ex)
 
@@ -357,7 +354,6 @@ def filter_by_tool_calls(
 # ---------------------------------------------------------------------------
 # Tool result relay filter
 # ---------------------------------------------------------------------------
-
 
 
 def _extract_text_from_value(value: Any) -> list[str]:
@@ -410,9 +406,7 @@ def filter_tool_result_relay(
 
     for ex in examples:
         # Skip if completion has tool calls (it's making a new decision)
-        has_tool_calls = any(
-            msg.tool_calls for msg in ex.completion_messages
-        )
+        has_tool_calls = any(msg.tool_calls for msg in ex.completion_messages)
         if has_tool_calls:
             kept.append(ex)
             continue
@@ -436,11 +430,15 @@ def filter_tool_result_relay(
             continue
 
         # Max overlap against any single tool result
-        max_overlap = max(
-            len(completion_tokens & tool_tokens) / len(completion_tokens)
-            for tool_tokens in tool_token_sets
-            if tool_tokens
-        ) if any(tool_token_sets) else 0.0
+        max_overlap = (
+            max(
+                len(completion_tokens & tool_tokens) / len(completion_tokens)
+                for tool_tokens in tool_token_sets
+                if tool_tokens
+            )
+            if any(tool_token_sets)
+            else 0.0
+        )
 
         if max_overlap > overlap_threshold:
             dropped.append((ex, DropReason("tool_relay", "relay")))
@@ -531,9 +529,7 @@ def deduplicate_completions(
         if i in keep_indices:
             kept.append(ex)
         else:
-            dropped.append(
-                (ex, DropReason("dedup", "duplicate", f"cluster_{cluster_map[i]}"))
-            )
+            dropped.append((ex, DropReason("dedup", "duplicate", f"cluster_{cluster_map[i]}")))
 
     return FilterResult(kept=kept, dropped=dropped)
 
@@ -589,9 +585,7 @@ def check_outcome_balance(
     message = None
     if scored == 0:
         is_balanced = True
-        message = (
-            f"No examples have '{score_name}' scores — balance check not applicable."
-        )
+        message = f"No examples have '{score_name}' scores — balance check not applicable."
     elif fraction < min_failure_fraction:
         is_balanced = False
         message = (

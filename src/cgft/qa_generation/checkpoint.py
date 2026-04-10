@@ -164,7 +164,6 @@ class ResumeState:
     accepted_by_hop_count: dict[str, int] = field(default_factory=dict)
 
 
-
 class CheckpointManager(CheckpointBase):
     """Manages checkpoint I/O for micro-batch pipeline processing."""
 

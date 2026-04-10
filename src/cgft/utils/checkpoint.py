@@ -76,9 +76,7 @@ class CheckpointBase:
                 try:
                     items.append(json.loads(line))
                 except json.JSONDecodeError:
-                    logger.warning(
-                        "Skipping corrupted checkpoint line in %s", filename
-                    )
+                    logger.warning("Skipping corrupted checkpoint line in %s", filename)
                     break  # truncated last line from crash
         return items
 

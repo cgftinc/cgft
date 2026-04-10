@@ -226,13 +226,60 @@ class CorpusProfile:
         )
 
 
-_ENTITY_STOPWORDS = frozenset({
-    "the", "a", "an", "in", "on", "at", "to", "for", "of", "is", "it", "if",
-    "you", "your", "this", "that", "with", "from", "by", "are", "was", "were",
-    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will",
-    "can", "could", "would", "should", "may", "not", "no", "or", "and", "but",
-    "so", "as", "its", "our", "we", "re", "s", "t",
-})
+_ENTITY_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "is",
+        "it",
+        "if",
+        "you",
+        "your",
+        "this",
+        "that",
+        "with",
+        "from",
+        "by",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "can",
+        "could",
+        "would",
+        "should",
+        "may",
+        "not",
+        "no",
+        "or",
+        "and",
+        "but",
+        "so",
+        "as",
+        "its",
+        "our",
+        "we",
+        "re",
+        "s",
+        "t",
+    }
+)
 
 
 def _score_entity_quality(pattern: EntityPattern) -> float:
@@ -330,11 +377,9 @@ def build_entity_chunk_graph(
 
     # Co-occurrence from the full graph
     cooccurrence: dict[tuple[str, str], int] = {}
-    entity_names = sorted(
-        name for name, hashes in entity_chunk_idx.items() if hashes
-    )
+    entity_names = sorted(name for name, hashes in entity_chunk_idx.items() if hashes)
     for i, e1 in enumerate(entity_names):
-        for e2 in entity_names[i + 1:]:
+        for e2 in entity_names[i + 1 :]:
             overlap = len(entity_chunk_idx[e1] & entity_chunk_idx[e2])
             if overlap > 0:
                 cooccurrence[(e1, e2)] = overlap
@@ -602,9 +647,7 @@ def extract_heuristic_entities(
         idf = math.log(n / df)
         idf_terms.append((idf, token))
     idf_terms.sort(reverse=True)
-    tfidf_patterns = [
-        EntityPattern(name=token, type="domain_term") for _, token in idf_terms[:80]
-    ]
+    tfidf_patterns = [EntityPattern(name=token, type="domain_term") for _, token in idf_terms[:80]]
 
     # --- Method 2: Capitalized phrase extraction ---
     cap_phrase_re = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
@@ -618,9 +661,7 @@ def extract_heuristic_entities(
                 phrase_df[phrase] = phrase_df.get(phrase, 0) + 1
                 seen_in_chunk.add(phrase)
     cap_patterns = [
-        EntityPattern(name=phrase, type="entity")
-        for phrase, df in phrase_df.items()
-        if df >= 2
+        EntityPattern(name=phrase, type="entity") for phrase, df in phrase_df.items() if df >= 2
     ]
 
     # --- Method 3: Frequent bigrams and trigrams ---
@@ -852,8 +893,14 @@ _HEADER_KEYS: frozenset[str] = frozenset({"h1", "h2", "h3", "title", "section_he
 _DOC_ID_KEYS: frozenset[str] = frozenset({"file_name", "document_id", "source", "file", "doc_id"})
 _DATE_KEYS: frozenset[str] = frozenset(
     {
-        "date", "timestamp", "created_at", "updated_at", "published_at",
-        "modified_at", "date_start", "date_end",
+        "date",
+        "timestamp",
+        "created_at",
+        "updated_at",
+        "published_at",
+        "modified_at",
+        "date_start",
+        "date_end",
     }
 )
 _SEQ_KEYS: frozenset[str] = frozenset({"prev_chunk_id", "next_chunk_id"})
@@ -868,9 +915,7 @@ def compute_header_prevalence(pool: list[Any]) -> float:
     """
     if not pool:
         return 0.0
-    count = sum(
-        1 for chunk in pool if any(_get_metadata_dict(chunk).get(k) for k in _HEADER_KEYS)
-    )
+    count = sum(1 for chunk in pool if any(_get_metadata_dict(chunk).get(k) for k in _HEADER_KEYS))
     return count / len(pool)
 
 
@@ -1221,23 +1266,15 @@ def compute_chunk_suitability(
     # Regime-dependent weight vectors (6 signals)
     regime = census.metadata_regime
     if regime == "structured":
-        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (
-            0.20, 0.20, 0.10, 0.10, 0.15, 0.25
-        )
+        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (0.20, 0.20, 0.10, 0.10, 0.15, 0.25)
     elif regime == "mixed" and census.header_prevalence < 0.20:
         # Email-like: "mixed" via date/doc_id, not headers.
         # Answerability is likely uniform for uniform-prose corpora.
-        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (
-            0.10, 0.25, 0.20, 0.10, 0.20, 0.15
-        )
+        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (0.10, 0.25, 0.20, 0.10, 0.20, 0.15)
     elif regime == "mixed":
-        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (
-            0.10, 0.20, 0.15, 0.10, 0.15, 0.30
-        )
+        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (0.10, 0.20, 0.15, 0.10, 0.15, 0.30)
     else:  # unstructured
-        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (
-            0.00, 0.25, 0.20, 0.10, 0.20, 0.25
-        )
+        w_meta, w_ent, w_lex, w_len, w_tfidf, w_ans = (0.00, 0.25, 0.20, 0.10, 0.20, 0.25)
 
     return (
         w_meta * metadata_score

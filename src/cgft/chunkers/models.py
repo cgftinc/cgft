@@ -26,7 +26,7 @@ class Chunk(BaseModel, frozen=True):
     content: str = Field(description="The text content of the chunk")
     metadata: tuple[tuple[str, Any], ...] = Field(
         default=(),
-        description="Metadata about the chunk (headers, file, index, etc.) as frozen tuples"
+        description="Metadata about the chunk (headers, file, index, etc.) as frozen tuples",
     )
     hash: str = Field(default="", description="The hash of the chunk metadata + content")
 
@@ -36,9 +36,7 @@ class Chunk(BaseModel, frozen=True):
         if not self.hash:
             combined = self.metadata_str() + "\n" + self.content
             # Use object.__setattr__ to bypass frozen restriction during validation
-            object.__setattr__(
-                self, "hash", hashlib.sha256(combined.encode()).hexdigest()
-            )
+            object.__setattr__(self, "hash", hashlib.sha256(combined.encode()).hexdigest())
         return self
 
     @property
@@ -81,9 +79,9 @@ class Chunk(BaseModel, frozen=True):
         content = self.content
         if max_chars is not None and len(content) > max_chars:
             if truncate == "leading":
-                content = "..." + content[-(max_chars - 3):]
+                content = "..." + content[-(max_chars - 3) :]
             else:  # trailing
-                content = content[:max_chars - 3] + "..."
+                content = content[: max_chars - 3] + "..."
         return f"{self.metadata_str()}\n{content}"
 
     def to_dict(self) -> dict[str, Any]:
@@ -154,10 +152,7 @@ class ChunkCollection:
         return self._by_file.get(file, [])
 
     def get_neighboring_chunks(
-        self,
-        chunk: Chunk,
-        before: int = 1,
-        after: int = 1
+        self, chunk: Chunk, before: int = 1, after: int = 1
     ) -> tuple[list[Chunk], list[Chunk]]:
         """Get chunks before/after the given chunk in the same file.
 
@@ -175,8 +170,8 @@ class ChunkCollection:
         file, position = self._chunk_index[chunk.hash]
         file_chunks = self._by_file[file]
 
-        before_chunks = file_chunks[max(0, position - before):position]
-        after_chunks = file_chunks[position + 1:position + 1 + after]
+        before_chunks = file_chunks[max(0, position - before) : position]
+        after_chunks = file_chunks[position + 1 : position + 1 + after]
 
         return (before_chunks, after_chunks)
 

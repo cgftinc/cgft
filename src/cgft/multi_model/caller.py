@@ -129,9 +129,7 @@ async def call_model(
         if system_prompt:
             kwargs["system"] = system_prompt
 
-        response = await loop.run_in_executor(
-            None, lambda: client.messages.create(**kwargs)
-        )
+        response = await loop.run_in_executor(None, lambda: client.messages.create(**kwargs))
         latency_ms = (time.time() - start_time) * 1000
 
         answer, thinking = _extract_anthropic_response(response)
@@ -167,9 +165,7 @@ async def call_model(
                 if reasoning_config:
                     kwargs["reasoning"] = reasoning_config
 
-        response = await loop.run_in_executor(
-            None, lambda: client.responses.create(**kwargs)
-        )
+        response = await loop.run_in_executor(None, lambda: client.responses.create(**kwargs))
         latency_ms = (time.time() - start_time) * 1000
 
         answer, thinking, reasoning_summary = _extract_openai_responses_api(response)
@@ -441,7 +437,7 @@ async def call_model_batch(
     failed_count = 0
     for i, r in enumerate(results):
         if isinstance(r, Exception):
-            print(f"Warning: Request {i+1}/{len(prompts)} failed: {r}")
+            print(f"Warning: Request {i + 1}/{len(prompts)} failed: {r}")
             failed_count += 1
         else:
             successful_responses.append(r)

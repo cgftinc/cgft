@@ -41,11 +41,7 @@ class FileAwareness:
         Checks both ``file_path`` (Turbopuffer attr written during
         upload) and ``file`` (original chunker metadata key).
         """
-        return (
-            chunk.get_metadata("file_path")
-            or chunk.get_metadata("file")
-            or None
-        )
+        return chunk.get_metadata("file_path") or chunk.get_metadata("file") or None
 
     @staticmethod
     def chunk_index(chunk: Chunk) -> int | None:
