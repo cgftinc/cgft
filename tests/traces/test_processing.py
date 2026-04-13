@@ -751,6 +751,21 @@ class TestDeduplicateCompletions:
             assert reason.detail is not None
             assert reason.detail.startswith("cluster_")
 
+    def test_large_dataset_completes_quickly(self):
+        """Regression: dedup must not hang on large datasets with long completions."""
+        import time
+
+        base = "x" * 5000
+        examples = [
+            self._make_example(f"{base} unique suffix {i}", f"t{i}", 0)
+            for i in range(200)
+        ]
+        start = time.monotonic()
+        result = deduplicate_completions(examples)
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"dedup took {elapsed:.1f}s on 200 long examples"
+        assert len(result.kept) + len(result.dropped) == 200
+
 
 # ---------------------------------------------------------------------------
 # Outcome balance

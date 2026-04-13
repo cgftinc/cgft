@@ -458,23 +458,33 @@ _ENTITY_PATTERNS = [
 ]
 
 
+_DEDUP_MAX_CHARS = 500
+
+
 def _normalize_for_dedup(text: str) -> str:
-    """Normalize completion text for dedup comparison."""
-    text = text.lower()
+    """Normalize and truncate completion text for dedup comparison."""
+    text = text[:_DEDUP_MAX_CHARS].lower()
     for pattern, replacement in _ENTITY_PATTERNS:
         text = pattern.sub(replacement, text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def _trigram_jaccard(a: str, b: str) -> float:
-    """Character trigram Jaccard similarity."""
-    if len(a) < 3 or len(b) < 3:
-        return 1.0 if a == b else 0.0
-    ta = {a[i : i + 3] for i in range(len(a) - 2)}
-    tb = {b[i : i + 3] for i in range(len(b) - 2)}
-    intersection = len(ta & tb)
-    union = len(ta | tb)
+def _trigram_set(text: str) -> frozenset[str]:
+    """Build a character trigram set from already-truncated text."""
+    if len(text) < 3:
+        return frozenset()
+    return frozenset(text[i : i + 3] for i in range(len(text) - 2))
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    """Jaccard similarity between pre-computed trigram sets."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    intersection = len(a & b)
+    union = len(a | b)
     return intersection / union if union else 0.0
 
 
@@ -492,26 +502,37 @@ def deduplicate_completions(
     # Canonical sort for determinism
     sorted_examples = sorted(examples, key=lambda ex: (ex.trace_id, ex.turn_index))
 
-    # Normalize completions
-    normalized: list[tuple[int, str]] = []
+    # Pre-compute trigram sets once (capped at 500 chars each)
+    trigrams: list[tuple[int, frozenset[str]]] = []
     for i, ex in enumerate(sorted_examples):
         text = ex.completion_messages[0].content if ex.completion_messages else ""
-        normalized.append((i, _normalize_for_dedup(text)))
+        trigrams.append((i, _trigram_set(_normalize_for_dedup(text))))
 
-    # Greedy clustering
+    # Greedy clustering against pre-computed sets.
+    # Cap at 500 cluster reps to keep worst case O(n × 500) ≈ linear.
+    _MAX_CLUSTER_REPS = 500
     clusters: list[list[int]] = []
-    cluster_reps: list[str] = []  # normalized text of cluster representative
+    cluster_reps: list[frozenset[str]] = []
+    remaining_start: int | None = None
 
-    for idx, norm in normalized:
+    for pos, (idx, tri) in enumerate(trigrams):
         placed = False
         for ci, rep in enumerate(cluster_reps):
-            if _trigram_jaccard(norm, rep) > similarity_threshold:
+            if _jaccard(tri, rep) > similarity_threshold:
                 clusters[ci].append(idx)
                 placed = True
                 break
         if not placed:
             clusters.append([idx])
-            cluster_reps.append(norm)
+            cluster_reps.append(tri)
+            if len(cluster_reps) >= _MAX_CLUSTER_REPS:
+                remaining_start = pos + 1
+                break
+
+    # Past the cap: keep remaining examples as-is (assumed unique)
+    if remaining_start is not None:
+        for idx, _ in trigrams[remaining_start:]:
+            clusters.append([idx])
 
     # Keep max_per_cluster from each cluster
     keep_indices: set[int] = set()
