@@ -13,8 +13,14 @@ def _register_builtins() -> None:
     _ADAPTERS["braintrust"] = BraintrustTraceAdapter
 
 
-def get_adapter(provider: str) -> TraceAdapter:
-    """Return a fresh adapter instance for *provider*.
+def get_adapter_class(provider: str) -> type[TraceAdapter]:
+    """Return the adapter class for *provider*.
+
+    Callers are responsible for constructing the adapter with
+    provider-specific credentials::
+
+        AdapterClass = get_adapter_class("braintrust")
+        adapter = AdapterClass(api_key="sk-...")
 
     Raises ``ValueError`` for unknown providers.
     """
@@ -23,4 +29,4 @@ def get_adapter(provider: str) -> TraceAdapter:
     cls = _ADAPTERS.get(provider)
     if cls is None:
         raise ValueError(f"Unknown trace provider: {provider!r}. Available: {sorted(_ADAPTERS)}")
-    return cls()
+    return cls

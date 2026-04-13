@@ -24,20 +24,27 @@ _BTQL_COLUMNS = (
 
 
 class BraintrustTraceAdapter:
-    """Adapter for fetching and normalising traces from Braintrust."""
+    """Adapter for fetching and normalising traces from Braintrust.
 
-    def connect(self, credentials: TraceCredentials) -> dict[str, Any]:
+    Args:
+        api_key: Braintrust API key.
+    """
+
+    def __init__(self, api_key: str) -> None:
+        self._credentials = TraceCredentials(api_key=api_key)
+
+    def connect(self) -> dict[str, Any]:
         """Validate the API key by listing projects."""
-        headers = credentials.to_headers()
+        headers = self._credentials.to_headers()
         resp = request_with_retry("GET", f"{_BASE_URL}/project", headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         objects = data.get("objects", []) if isinstance(data, dict) else []
         return {"status": "ok", "projects": len(objects)}
 
-    def list_projects(self, credentials: TraceCredentials) -> list[TraceProject]:
+    def list_projects(self) -> list[TraceProject]:
         """List projects visible to the API key."""
-        headers = credentials.to_headers()
+        headers = self._credentials.to_headers()
         resp = request_with_retry("GET", f"{_BASE_URL}/project", headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -50,13 +57,9 @@ class BraintrustTraceAdapter:
             if isinstance(p, dict) and "id" in p
         ]
 
-    def count_traces(
-        self,
-        credentials: TraceCredentials,
-        project_id: str,
-    ) -> int:
+    def count_traces(self, project_id: str) -> int:
         """Return total root-span count for a project using BTQL."""
-        headers = {**credentials.to_headers(), "Content-Type": "application/json"}
+        headers = {**self._credentials.to_headers(), "Content-Type": "application/json"}
         query = (
             f"SELECT count(*) AS total FROM project_logs('{project_id}') "
             f"WHERE span_id = root_span_id"
@@ -78,7 +81,6 @@ class BraintrustTraceAdapter:
 
     def fetch_traces(
         self,
-        credentials: TraceCredentials,
         project_id: str,
         *,
         limit: int | None = None,
@@ -98,10 +100,10 @@ class BraintrustTraceAdapter:
         max_traces = min(limit, _MAX_TRACES_PER_FETCH) if limit else _MAX_TRACES_PER_FETCH
 
         try:
-            trace_trees = self._fetch_via_btql(credentials, project_id, max_traces)
+            trace_trees = self._fetch_via_btql(project_id, max_traces)
         except (httpx.HTTPError, httpx.TimeoutException, httpx.ConnectError, KeyError) as e:
             logger.warning("BTQL fetch failed, falling back to REST: %s", e)
-            trace_trees, cursor = self._fetch_via_rest(credentials, project_id, max_traces, cursor)
+            trace_trees, cursor = self._fetch_via_rest(project_id, max_traces, cursor)
 
         traces: list[NormalizedTrace] = []
         for trace_id, tree in trace_trees.items():
@@ -113,7 +115,6 @@ class BraintrustTraceAdapter:
 
     def _fetch_via_btql(
         self,
-        credentials: TraceCredentials,
         project_id: str,
         max_traces: int,
     ) -> dict[str, dict[str, Any]]:
@@ -123,7 +124,7 @@ class BraintrustTraceAdapter:
         ``WHERE created < '{last_timestamp}'`` to fetch additional pages.
         ``project_id`` is always from ``list_projects()`` — not user input.
         """
-        headers = {**credentials.to_headers(), "Content-Type": "application/json"}
+        headers = {**self._credentials.to_headers(), "Content-Type": "application/json"}
         all_rows: list[dict[str, Any]] = []
         created_before: str | None = None
         trace_trees: dict[str, dict[str, Any]] = {}
@@ -170,13 +171,12 @@ class BraintrustTraceAdapter:
 
     def _fetch_via_rest(
         self,
-        credentials: TraceCredentials,
         project_id: str,
         max_traces: int,
         cursor: str | None,
     ) -> tuple[dict[str, dict[str, Any]], str | None]:
         """Fetch spans using REST API, return grouped trace trees. Fallback."""
-        headers = {**credentials.to_headers(), "Content-Type": "application/json"}
+        headers = {**self._credentials.to_headers(), "Content-Type": "application/json"}
         all_events: list[dict[str, Any]] = []
         page_cursor = cursor
         trace_trees: dict[str, dict[str, Any]] = {}
