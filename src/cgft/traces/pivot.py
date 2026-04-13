@@ -269,14 +269,12 @@ def _build_outcome_summary(trace: NormalizedTrace) -> str:
 async def _rate_single_turn(
     client: Any,
     model: str,
-    trace: NormalizedTrace,
+    trace_context: tuple[str, str],
     ex: TrainingExample,
     semaphore: asyncio.Semaphore,
 ) -> PivotRating:
     """Rate a single turn using LLM counterfactual analysis."""
-    # Build the prompt
-    trace_text = _format_trace_messages(trace.messages)
-    outcome_summary = _build_outcome_summary(trace)
+    trace_text, outcome_summary = trace_context
 
     # Previous message context
     prev_msg = "(start of conversation)"
@@ -366,6 +364,9 @@ async def _rate_single_turn(
 # ---------------------------------------------------------------------------
 
 
+_CHECKPOINT_EVERY = 10
+
+
 async def _rate_all_turns(
     client: Any,
     model: str,
@@ -378,34 +379,52 @@ async def _rate_all_turns(
     completed_offset: int = 0,
     total_llm: int | None = None,
 ) -> list[PivotRating]:
-    """Rate all non-heuristic-trivial turns via LLM, in batches."""
+    """Rate all non-heuristic-trivial turns via LLM with streaming progress."""
     trace_map = {t.id: t for t in traces}
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    # Build work items
-    work: list[tuple[TrainingExample, NormalizedTrace]] = []
+    # Pre-compute trace context once per trace (not per turn)
+    trace_contexts: dict[str, tuple[str, str]] = {}
     for ex in examples:
-        trace = trace_map.get(ex.trace_id)
-        if trace is not None:
-            work.append((ex, trace))
+        if ex.trace_id not in trace_contexts:
+            trace = trace_map.get(ex.trace_id)
+            if trace is not None:
+                trace_contexts[ex.trace_id] = (
+                    _format_trace_messages(trace.messages),
+                    _build_outcome_summary(trace),
+                )
 
-    total = total_llm if total_llm is not None else len(work)
+    total = total_llm if total_llm is not None else len(examples)
 
-    # Process in batches of max_concurrency for visible progress
+    # Launch all tasks — semaphore controls actual concurrency
+    tasks: list[asyncio.Task[PivotRating]] = []
+    for ex in examples:
+        ctx = trace_contexts.get(ex.trace_id)
+        if ctx is not None:
+            tasks.append(
+                asyncio.create_task(_rate_single_turn(client, model, ctx, ex, semaphore))
+            )
+
+    # Stream results as they complete
     results: list[PivotRating] = []
-    batch_size = max_concurrency
-    for i in range(0, len(work), batch_size):
-        batch = work[i : i + batch_size]
-        batch_results = await asyncio.gather(
-            *[_rate_single_turn(client, model, trace, ex, semaphore) for ex, trace in batch]
-        )
-        results.extend(batch_results)
+    checkpoint_batch: list[PivotRating] = []
 
-        if checkpoint is not None:
-            checkpoint.save_batch(list(batch_results))
+    for coro in asyncio.as_completed(tasks):
+        rating = await coro
+        results.append(rating)
+        checkpoint_batch.append(rating)
+
+        if len(checkpoint_batch) >= _CHECKPOINT_EVERY:
+            if checkpoint is not None:
+                checkpoint.save_batch(checkpoint_batch)
+            checkpoint_batch = []
 
         if progress_callback is not None:
             progress_callback(completed_offset + len(results), total)
+
+    # Flush remaining checkpoint batch
+    if checkpoint_batch and checkpoint is not None:
+        checkpoint.save_batch(checkpoint_batch)
 
     return results
 
@@ -420,7 +439,7 @@ def apply_pivot_filter(
     anchor_fraction: float = 0.1,
     ratings: list[PivotRating] | None = None,
     seed: int = 42,
-    max_concurrency: int = 3,
+    max_concurrency: int = 20,
     checkpoint_dir: Path | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> PivotFilterResult:
@@ -461,7 +480,7 @@ async def apply_pivot_filter_async(
     anchor_fraction: float = 0.1,
     ratings: list[PivotRating] | None = None,
     seed: int = 42,
-    max_concurrency: int = 3,
+    max_concurrency: int = 20,
     checkpoint_dir: Path | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> PivotFilterResult:
@@ -537,8 +556,9 @@ async def apply_pivot_filter_async(
     else:
         anchors = []
 
+    anchor_keys = {(ex.trace_id, ex.turn_index) for ex in anchors}
     kept = above + anchors
-    dropped = [ex for ex in below if ex not in anchors]
+    dropped = [ex for ex in below if (ex.trace_id, ex.turn_index) not in anchor_keys]
 
     if len(kept) < MIN_TRAIN_SAMPLES:
         raise ValueError(
