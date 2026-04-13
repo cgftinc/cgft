@@ -322,6 +322,55 @@ class TestTrainingExampleSerialization:
         assert d["init_rollout_args"]["scores"] == {"quality": 0.9}
         assert d["init_rollout_args"]["raw_prompt"] == "[USER] Q"
 
+    def test_to_dict_roundtrip(self):
+        ex = TrainingExample(
+            prompt_messages=[
+                _msg("system", "Be helpful"),
+                _msg("user", "What is 2+2?"),
+            ],
+            completion_messages=[
+                TraceMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(name="calc", arguments='{"expr": "2+2"}', id="tc1")],
+                ),
+            ],
+            prompt="[USER] What is 2+2?",
+            ground_truth="[ASSISTANT] → calc(2+2)",
+            trace_id="t1",
+            turn_index=3,
+            scores={"quality": 0.9, "task_success": 1.0},
+            metadata={"env": "test"},
+        )
+        d = ex.to_dict()
+        restored = TrainingExample.from_dict(d)
+
+        assert restored.trace_id == ex.trace_id
+        assert restored.turn_index == ex.turn_index
+        assert restored.prompt == ex.prompt
+        assert restored.ground_truth == ex.ground_truth
+        assert restored.scores == ex.scores
+        assert restored.metadata == ex.metadata
+        assert len(restored.prompt_messages) == 2
+        assert restored.prompt_messages[0].role == "system"
+        assert restored.completion_messages[0].tool_calls[0].name == "calc"
+
+    def test_to_dict_json_serializable(self):
+        import json
+
+        ex = TrainingExample(
+            prompt_messages=[_msg("user", "Q")],
+            completion_messages=[_msg("assistant", "A")],
+            prompt="Q",
+            ground_truth="A",
+            trace_id="t1",
+            turn_index=0,
+        )
+        # Must not raise
+        text = json.dumps(ex.to_dict())
+        restored = TrainingExample.from_dict(json.loads(text))
+        assert restored.trace_id == "t1"
+
 
 # ---------------------------------------------------------------------------
 # Filtering

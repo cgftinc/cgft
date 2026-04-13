@@ -131,6 +131,39 @@ class TrainingExample:
     scores: dict[str, float] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Lossless serialisation for intermediate pipeline storage (blob).
+
+        Unlike ``to_jsonl_dict()`` (which is lossy and shaped for the trainer),
+        this preserves all fields for roundtripping through ``from_dict()``.
+        """
+        return {
+            "prompt_messages": [m.to_dict() for m in self.prompt_messages],
+            "completion_messages": [m.to_dict() for m in self.completion_messages],
+            "prompt": self.prompt,
+            "ground_truth": self.ground_truth,
+            "trace_id": self.trace_id,
+            "turn_index": self.turn_index,
+            "scores": self.scores,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TrainingExample:
+        """Reconstruct from a dict produced by ``to_dict()``."""
+        from cgft.traces.adapter import _message_from_dict
+
+        return cls(
+            prompt_messages=[_message_from_dict(m) for m in data["prompt_messages"]],
+            completion_messages=[_message_from_dict(m) for m in data["completion_messages"]],
+            prompt=data["prompt"],
+            ground_truth=data["ground_truth"],
+            trace_id=data["trace_id"],
+            turn_index=data["turn_index"],
+            scores=data.get("scores", {}),
+            metadata=data.get("metadata", {}),
+        )
+
     def to_jsonl_dict(self) -> dict[str, Any]:
         """Serialise to the JSONL schema consumed by ``dataset_preprocess``.
 
