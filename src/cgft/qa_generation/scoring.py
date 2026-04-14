@@ -88,7 +88,15 @@ def compute_eval_scores(item: GeneratedQA, cfg: ScoringConfig) -> dict[str, floa
 
     hop = filter_scores.get("hop_count_validity", {})
     if "hop_count_validated" in hop:
-        scores["hop_validity"] = 1.0 if hop["hop_count_validated"] else 0.5
+        if hop["hop_count_validated"]:
+            scores["hop_validity"] = 1.0
+        elif hop.get("demoted"):
+            # Demoted: redundant chunks were removed but ≥2 essential remain.
+            # Score higher than unvalidated (0.5) since the remaining chunks
+            # were confirmed essential by the filter.
+            scores["hop_validity"] = 0.75
+        else:
+            scores["hop_validity"] = 0.5
     if "difficulty_score" in hop:
         scores["hop_difficulty"] = float(hop["difficulty_score"])
 

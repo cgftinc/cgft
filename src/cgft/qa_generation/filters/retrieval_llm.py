@@ -588,6 +588,14 @@ class RetrievalLLMFilter:
         )
         too_easy_high_confidence = confidence >= self.cfg.too_easy_confidence_threshold
         too_easy_due_to_judge = judge_reason_tag == _JUDGE_TAG_TOO_EASY and too_easy_high_confidence
+
+        # Discount the judge verdict when reference chunks weren't retrieved.
+        # If BM25 couldn't find the reference chunks (overlap=0), the question
+        # isn't "too easy" regardless of surface keyword overlap in other chunks.
+        discounted_no_ref_overlap = too_easy_due_to_judge and overlap_ratio == 0.0
+        if discounted_no_ref_overlap:
+            too_easy_due_to_judge = False
+
         too_easy_calibrated_out = (
             judge_reason_tag == _JUDGE_TAG_TOO_EASY and not too_easy_due_to_judge
         )
@@ -617,15 +625,27 @@ class RetrievalLLMFilter:
                 max_refinements=max_refinements,
             )
 
+        if discounted_no_ref_overlap:
+            reasoning = (
+                "Judge flagged too_easy_lexical but reference chunks were not in "
+                f"BM25 results (overlap={overlap_ratio:.2f}); verdict discounted. "
+                f"(confidence={confidence:.2f})."
+            )
+        elif too_easy_calibrated_out:
+            reasoning = (
+                "Borderline too-easy signal did not meet confidence threshold. "
+                f"(overlap={overlap_ratio:.2f}, confidence={confidence:.2f})."
+            )
+        else:
+            reasoning = (
+                "Not classified as too easy by overlap gate or judge. "
+                f"(overlap={overlap_ratio:.2f}, confidence={confidence:.2f})."
+            )
+
         return FilterVerdict(
             status="passed",
             reason="retrieval_filter_passed",
-            reasoning=(
-                "Borderline too-easy signal did not meet confidence threshold. "
-                if too_easy_calibrated_out
-                else "Not classified as too easy by overlap gate or judge. "
-            )
-            + f"(overlap={overlap_ratio:.2f}, confidence={confidence:.2f}).",
+            reasoning=reasoning,
             metadata={
                 **shared_metadata,
                 "reason_code": "retrieval_difficulty_passed",
@@ -641,6 +661,7 @@ class RetrievalLLMFilter:
                 "judge_lexical_anchor_evidence": lexical_anchor_evidence,
                 "too_easy_high_confidence": too_easy_high_confidence,
                 "too_easy_calibrated_out": too_easy_calibrated_out,
+                "discounted_no_ref_overlap": discounted_no_ref_overlap,
                 "too_easy_source": "none",
             },
         )

@@ -213,13 +213,21 @@ def should_early_stop(
     batch_history: list[Any],
     early_stop_rejection_rate: float = 0.85,
     early_stop_window: int = 3,
+    min_generated_mass: int = 20,
 ) -> bool:
-    """Check if recent batches indicate the pipeline is spinning."""
+    """Check if recent batches indicate the pipeline is spinning.
+
+    Uses sample-weighted acceptance over the window so tiny tail batches and
+    infrastructure-failure batches (0 generated) don't dominate the signal.
+    """
     if len(batch_history) < early_stop_window:
         return False
     recent = batch_history[-early_stop_window:]
-    avg_acceptance = sum(b.acceptance_rate for b in recent) / len(recent)
-    return avg_acceptance < (1.0 - early_stop_rejection_rate)
+    total_generated = sum(b.generated_count for b in recent)
+    if total_generated < min_generated_mass:
+        return False
+    total_accepted = sum(b.accepted_count for b in recent)
+    return (total_accepted / total_generated) < (1.0 - early_stop_rejection_rate)
 
 
 def compute_batch_heuristics(
@@ -227,26 +235,21 @@ def compute_batch_heuristics(
 ) -> tuple[int, int]:
     """Return (batch_size, max_parallel_batches) from total_samples.
 
-    Lookup table:
+    Lookup table (tuned via parallelism probing — Corpora API ceiling ~20):
     total_samples  | batch_size | max_parallel
-    <= 25          | 5          | 1
-    26-50          | 10         | 1
-    51-100         | 20         | 1
-    101-200        | 40         | 1
-    201-500        | 50         | 1
-    501-1000       | 100        | 2
-    > 1000         | 100        | min(4, total // 250)
+    <= 25          | 5          | 5
+    26-50          | 10         | 5
+    51-100         | 10         | 10
+    101-500        | 50         | 10
+    501-1000       | 50         | 20
+    > 1000         | 50         | 20
     """
     if total_samples <= 25:
-        return 5, 1
+        return 5, 5
     if total_samples <= 50:
-        return 10, 1
+        return 10, 5
     if total_samples <= 100:
-        return 20, 1
-    if total_samples <= 200:
-        return 40, 1
+        return 10, 10
     if total_samples <= 500:
-        return 50, 1
-    if total_samples <= 1000:
-        return 100, 2
-    return 100, min(4, total_samples // 250)
+        return 50, 10
+    return 50, 20

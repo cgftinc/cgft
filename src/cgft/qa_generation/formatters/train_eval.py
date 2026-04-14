@@ -61,9 +61,7 @@ class TrainEvalFormatter:
             "question": item.qa.get("question", ""),
             "answer": item.qa.get("answer", ""),
             "qa_type": qa_type,
-            "reference_chunks": (
-                item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", [])
-            ),
+            "reference_chunks": item.qa.get("reference_chunks", []),
         }
         # Include reasoning_mode if present.
         reasoning_mode = item.generation_metadata.get("reasoning_mode", "")

@@ -80,9 +80,7 @@ class GeneratedQA:
             qa_type = (
                 str(self.generation_metadata.get("qa_type_target", "")).strip().lower() or "lookup"
             )
-        ref_chunks = list(
-            self.qa.get("verified_reference_chunks") or self.qa.get("reference_chunks", []) or []
-        )
+        ref_chunks = list(self.qa.get("reference_chunks", []) or [])
         if qa_type == "lookup" and len(ref_chunks) >= 2:
             return "multi_hop"
         if qa_type == "multi_hop" and len(ref_chunks) <= 1:

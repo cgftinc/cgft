@@ -8,6 +8,14 @@ from typing import Any
 from cgft.qa_generation.cgft_models import CgftContext, DeterministicGuardsConfig
 from cgft.qa_generation.generated_qa import FilterVerdict, GeneratedQA
 
+_STYLE_LABELS = frozenset({"natural", "keyword", "expert"})
+
+# Languages where characters encode more meaning — answer length thresholds
+# are divided by 3 for these to avoid over-rejecting concise but complete answers.
+_HIGH_DENSITY_LANGUAGES = frozenset({
+    "korean", "ko", "chinese", "zh", "japanese", "ja",
+})
+
 # Patterns indicating a meta-question about generation failure rather than a real domain question
 _META_QUESTION_PATTERNS = [
     re.compile(
@@ -186,7 +194,17 @@ class DeterministicGuardsFilter:
     ) -> str | None:
         if len(question) < self.cfg.min_question_chars:
             return "question_too_short"
-        if len(answer) < self.cfg.min_answer_chars:
+        if question.strip().lower() in _STYLE_LABELS:
+            return "question_is_style_label"
+        min_chars = (
+            self.cfg.min_answer_chars_multi_hop
+            if qa_type == "multi_hop"
+            else self.cfg.min_answer_chars
+        )
+        # CJK languages pack ~2-3x more meaning per character.
+        if corpus_language and corpus_language.lower() in _HIGH_DENSITY_LANGUAGES:
+            min_chars = max(1, min_chars // 3)
+        if len(answer) < min_chars:
             return "answer_too_short"
         if corpus_language and not _check_language(question, corpus_language):
             return "wrong_language"
