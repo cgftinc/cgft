@@ -49,6 +49,28 @@ class TestBraintrustE2E:
         count = adapter.count_traces(_PROJECT_ID)
         assert count >= 0
 
+    def test_count_traces_matches_fetch(self):
+        """count_traces() must match the actual number of fetched traces.
+
+        This catches the BTQL scan-limit bug where a single-query count
+        undercounts when > 1000 spans exist.
+        """
+        _skip_if_no_creds()
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
+
+        count = adapter.count_traces(_PROJECT_ID)
+        if count < 100:
+            pytest.skip("Need at least 100 traces to validate count accuracy")
+
+        traces, _ = adapter.fetch_traces(_PROJECT_ID, limit=count)
+        fetched = len(traces)
+
+        # Allow small delta: new traces may arrive between count and fetch
+        assert abs(count - fetched) <= max(5, int(count * 0.02)), (
+            f"count_traces()={count} but fetch_traces() returned {fetched} — "
+            f"count is likely truncated to first BTQL page"
+        )
+
     def test_fetch_traces_btql(self):
         """Verify BTQL fetch works against real Braintrust API."""
         _skip_if_no_creds()
