@@ -145,6 +145,17 @@ class BraintrustTraceAdapter:
                 json={"query": query, "fmt": "json"},
                 timeout=60,
             )
+            if resp.status_code in (429, 502, 503, 504):
+                # Retries exhausted — return what we have so far
+                if all_rows:
+                    logger.warning(
+                        "BTQL pagination stopped at HTTP %d after %d rows",
+                        resp.status_code,
+                        len(all_rows),
+                    )
+                    break
+                # First page failed — let caller handle the error
+                resp.raise_for_status()
             resp.raise_for_status()
             data = resp.json()
 

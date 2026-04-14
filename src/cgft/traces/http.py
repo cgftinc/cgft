@@ -26,11 +26,15 @@ def request_with_retry(
     """HTTP request with exponential backoff + jitter on transient errors.
 
     Retries on 429/502/503/504 status codes and on network-level failures
-    (timeouts, connection errors).  Jitter prevents thundering herd when
-    multiple workers hit the same API concurrently.
+    (timeouts, connection errors).  Respects ``Retry-After`` headers on 429
+    responses.  Jitter prevents thundering herd when multiple workers hit
+    the same API concurrently.
+
+    ``max_retries`` is the number of *retries* after the initial attempt,
+    so total attempts = max_retries + 1.
     """
     resp: httpx.Response | None = None
-    for attempt in range(max_retries):
+    for attempt in range(max_retries + 1):
         try:
             resp = httpx.request(
                 method,
@@ -41,7 +45,7 @@ def request_with_retry(
                 follow_redirects=True,
             )
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
-            if attempt == max_retries - 1:
+            if attempt == max_retries:
                 raise
             wait = (2**attempt) + random.uniform(0, 1)
             logger.warning(
@@ -55,7 +59,9 @@ def request_with_retry(
             time.sleep(wait)
             continue
         if resp.status_code in _RETRYABLE_STATUS:
-            wait = (2**attempt) + random.uniform(0, 1)
+            if attempt == max_retries:
+                break
+            wait = _get_retry_wait(resp, attempt)
             logger.warning(
                 "HTTP %d, retry %d/%d in %.1fs: %s",
                 resp.status_code,
@@ -68,5 +74,17 @@ def request_with_retry(
             continue
         break
     if resp is None:
-        raise RuntimeError(f"No response after {max_retries} retries: {url}")
+        raise RuntimeError(f"No response after {max_retries + 1} attempts: {url}")
     return resp
+
+
+def _get_retry_wait(resp: httpx.Response, attempt: int) -> float:
+    """Compute wait time, respecting Retry-After header for 429s."""
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(float(retry_after), 1.0)
+            except ValueError:
+                pass
+    return (2**attempt) + random.uniform(0, 1)
