@@ -58,26 +58,47 @@ class BraintrustTraceAdapter:
         ]
 
     def count_traces(self, project_id: str) -> int:
-        """Return total root-span count for a project using BTQL."""
+        """Return total root-span count for a project using BTQL.
+
+        BTQL scans at most 1000 rows per query, so a single
+        ``SELECT count(*)`` undercounts when > 1000 spans exist.
+        We paginate through root spans using timestamp ordering
+        and sum across pages.
+        """
         headers = {**self._credentials.to_headers(), "Content-Type": "application/json"}
-        query = (
-            f"SELECT count(*) AS total FROM project_logs('{project_id}') "
-            f"WHERE span_id = root_span_id"
-        )
-        resp = request_with_retry(
-            "POST",
-            _BTQL_URL,
-            headers=headers,
-            json={"query": query, "fmt": "json"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        # BTQL returns { data: [...] } or just an array
-        rows = data.get("data", data) if isinstance(data, dict) else data
-        if rows and isinstance(rows, list) and isinstance(rows[0], dict):
-            return int(rows[0].get("total", 0))
-        return 0
+        total = 0
+        created_before: str | None = None
+
+        while True:
+            where = "WHERE span_id = root_span_id"
+            if created_before:
+                where += f" AND created < '{created_before}'"
+            query = (
+                f"SELECT created FROM project_logs('{project_id}') "
+                f"{where} "
+                f"ORDER BY created DESC "
+                f"LIMIT 1000"
+            )
+            resp = request_with_retry(
+                "POST",
+                _BTQL_URL,
+                headers=headers,
+                json={"query": query, "fmt": "json"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rows = data.get("data", data) if isinstance(data, dict) else data
+            if not isinstance(rows, list) or not rows:
+                break
+
+            total += len(rows)
+            created_before = rows[-1].get("created")
+
+            if len(rows) < 1000:
+                break
+
+        return total
 
     def fetch_traces(
         self,

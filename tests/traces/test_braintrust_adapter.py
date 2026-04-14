@@ -141,12 +141,14 @@ class TestNormalizeTrace:
 
 
 class TestCountTraces:
-    def test_count_traces_parses_btql_response(self):
+    def test_count_traces_single_page(self):
+        """< 1000 root spans — single BTQL page, returns row count."""
         adapter = BraintrustTraceAdapter(api_key="test-key")
 
+        rows = [{"created": f"2024-01-01T00:{i:02d}:00Z"} for i in range(142)]
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"data": [{"total": 142}]}
+        mock_resp.json.return_value = {"data": rows}
         mock_resp.raise_for_status = MagicMock()
 
         with patch("httpx.request", return_value=mock_resp) as mock_req:
@@ -155,18 +157,45 @@ class TestCountTraces:
         assert count == 142
         mock_req.assert_called_once()
         call_args = mock_req.call_args
-        # httpx.request(method, url, ...)
         assert call_args.args[0] == "POST"
         assert "/btql" in call_args.args[1]
         body = call_args.kwargs["json"]
         assert "project_logs('proj-123')" in body["query"]
+        assert "span_id = root_span_id" in body["query"]
         assert body["fmt"] == "json"
+
+    def test_count_traces_paginates_beyond_1000(self):
+        """> 1000 root spans — must paginate and sum across pages."""
+        adapter = BraintrustTraceAdapter(api_key="test-key")
+
+        page1 = [{"created": f"2024-01-02T00:{i:02d}:00Z"} for i in range(1000)]
+        page2 = [{"created": f"2024-01-01T00:{i:02d}:00Z"} for i in range(300)]
+
+        resp1 = MagicMock()
+        resp1.status_code = 200
+        resp1.json.return_value = {"data": page1}
+        resp1.raise_for_status = MagicMock()
+
+        resp2 = MagicMock()
+        resp2.status_code = 200
+        resp2.json.return_value = {"data": page2}
+        resp2.raise_for_status = MagicMock()
+
+        with patch("httpx.request", side_effect=[resp1, resp2]) as mock_req:
+            count = adapter.count_traces("proj-big")
+
+        assert count == 1300
+        assert mock_req.call_count == 2
+        # Second query should include timestamp filter
+        body2 = mock_req.call_args_list[1].kwargs["json"]
+        assert "created <" in body2["query"]
 
     def test_count_traces_handles_array_response(self):
         adapter = BraintrustTraceAdapter(api_key="test-key")
 
         mock_resp = MagicMock()
-        mock_resp.json.return_value = [{"total": 55}]
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [{"created": "2024-01-01T00:00:00Z"}] * 55
         mock_resp.raise_for_status = MagicMock()
 
         with patch("httpx.request", return_value=mock_resp):
@@ -178,6 +207,7 @@ class TestCountTraces:
         adapter = BraintrustTraceAdapter(api_key="test-key")
 
         mock_resp = MagicMock()
+        mock_resp.status_code = 200
         mock_resp.json.return_value = {"data": []}
         mock_resp.raise_for_status = MagicMock()
 
