@@ -133,16 +133,20 @@ class TraceMessage:
     name: str | None = None  # tool name for role="tool"
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialise to a JSON-compatible dict."""
+        """Serialise to a JSON-compatible dict.
+
+        Always includes all fields (even when None) so that JSONL output
+        has a consistent schema — HuggingFace ``load_dataset`` fails on
+        rows with inconsistent keys.
+        """
         d: dict[str, Any] = {"role": self.role, "content": self.content}
-        if self.tool_calls:
-            d["tool_calls"] = [
-                {"name": tc.name, "arguments": tc.arguments, "id": tc.id} for tc in self.tool_calls
-            ]
-        if self.tool_call_id is not None:
-            d["tool_call_id"] = self.tool_call_id
-        if self.name is not None:
-            d["name"] = self.name
+        d["tool_calls"] = (
+            [{"name": tc.name, "arguments": tc.arguments, "id": tc.id} for tc in self.tool_calls]
+            if self.tool_calls
+            else None
+        )
+        d["tool_call_id"] = self.tool_call_id
+        d["name"] = self.name
         return d
 
 
@@ -229,31 +233,30 @@ class DetectedSystemPrompt:
 class TraceAdapter(Protocol):
     """Protocol for trace provider backends.
 
+    Credentials are passed to ``__init__`` (provider-specific), not to
+    individual methods.  This matches the ``ChunkSource`` pattern used
+    by corpus backends.
+
     Implementations:
         BraintrustTraceAdapter
         LangfuseTraceAdapter
         OTelTraceAdapter
     """
 
-    def connect(self, credentials: TraceCredentials) -> dict[str, Any]:
+    def connect(self) -> dict[str, Any]:
         """Validate credentials and return connection info."""
         ...
 
-    def list_projects(self, credentials: TraceCredentials) -> list[TraceProject]:
+    def list_projects(self) -> list[TraceProject]:
         """List available projects/workspaces."""
         ...
 
-    def count_traces(
-        self,
-        credentials: TraceCredentials,
-        project_id: str,
-    ) -> int:
+    def count_traces(self, project_id: str) -> int:
         """Return the total number of traces for a project."""
         ...
 
     def fetch_traces(
         self,
-        credentials: TraceCredentials,
         project_id: str,
         *,
         limit: int | None = None,

@@ -2,20 +2,26 @@
 
 import pytest
 
-from cgft.traces.registry import get_adapter
+from cgft.traces.braintrust.adapter import BraintrustTraceAdapter
+from cgft.traces.registry import get_adapter_class
 
 
-class TestGetAdapter:
-    def test_braintrust_returns_adapter(self):
-        adapter = get_adapter("braintrust")
+class TestGetAdapterClass:
+    def test_braintrust_returns_class(self):
+        cls = get_adapter_class("braintrust")
+        assert cls is BraintrustTraceAdapter
+
+    def test_returned_class_is_constructable(self):
+        cls = get_adapter_class("braintrust")
+        adapter = cls(api_key="test-key")
         assert hasattr(adapter, "connect")
         assert hasattr(adapter, "list_projects")
         assert hasattr(adapter, "fetch_traces")
 
     def test_unknown_provider_raises(self):
         with pytest.raises(ValueError, match="Unknown trace provider"):
-            get_adapter("nonexistent")
+            get_adapter_class("nonexistent")
 
     def test_error_lists_available_providers(self):
         with pytest.raises(ValueError, match="braintrust"):
-            get_adapter("nonexistent")
+            get_adapter_class("nonexistent")

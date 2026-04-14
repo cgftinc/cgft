@@ -31,34 +31,30 @@ def _skip_if_no_creds():
 class TestBraintrustE2E:
     def test_connect(self):
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
-        result = adapter.connect(creds)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
+        result = adapter.connect()
         assert result["status"] == "ok"
         assert result["projects"] > 0
 
     def test_list_projects(self):
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
-        projects = adapter.list_projects(creds)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
+        projects = adapter.list_projects()
         assert len(projects) > 0
         assert all(p.id and p.name for p in projects)
 
     def test_count_traces(self):
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
-        count = adapter.count_traces(creds, _PROJECT_ID)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
+        count = adapter.count_traces(_PROJECT_ID)
         assert count >= 0
 
     def test_fetch_traces_btql(self):
         """Verify BTQL fetch works against real Braintrust API."""
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
 
-        traces, cursor = adapter.fetch_traces(creds, _PROJECT_ID, limit=5)
+        traces, cursor = adapter.fetch_traces(_PROJECT_ID, limit=5)
         assert len(traces) > 0
         assert len(traces) <= 5
 
@@ -96,35 +92,26 @@ class TestBraintrustE2E:
     def test_fetch_traces_produces_valid_messages(self):
         """Verify extracted messages have expected structure."""
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
 
-        traces, _ = adapter.fetch_traces(creds, _PROJECT_ID, limit=3)
+        traces, _ = adapter.fetch_traces(_PROJECT_ID, limit=3)
         for trace in traces:
             for msg in trace.messages:
                 assert msg.role in ("system", "user", "assistant", "tool")
                 assert isinstance(msg.content, str)
 
     def test_fetch_traces_default_limit(self):
-        """Fetch with no limit — matches the wizard Modal worker usage.
-
-        The Modal worker calls ``fetch_traces(creds, project_id)`` with
-        no limit, which defaults to 1000. This exercises the BTQL
-        ``span_limit = max_traces * 20`` heuristic at real scale.
-        """
+        """Fetch with no limit — matches the wizard Modal worker usage."""
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
 
-        count = adapter.count_traces(creds, _PROJECT_ID)
+        count = adapter.count_traces(_PROJECT_ID)
         if count < 50:
             pytest.skip("Need at least 50 traces for bulk fetch test")
 
-        # No limit — matches actual wizard usage
-        traces, _ = adapter.fetch_traces(creds, _PROJECT_ID)
+        traces, _ = adapter.fetch_traces(_PROJECT_ID)
         assert len(traces) >= 50
 
-        # Every trace should have an id and at least one message
         for trace in traces:
             assert trace.id
             assert len(trace.messages) > 0
@@ -136,11 +123,9 @@ class TestBraintrustE2E:
     def test_btql_direct_no_fallback(self):
         """Call _fetch_via_btql directly — proves BTQL works without REST fallback."""
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
 
-        # Call BTQL directly — any BTQL error will raise, not silently fall back
-        trace_trees = adapter._fetch_via_btql(creds, _PROJECT_ID, max_traces=100)
+        trace_trees = adapter._fetch_via_btql(_PROJECT_ID, max_traces=100)
         assert len(trace_trees) > 0
         for trace_id, tree in trace_trees.items():
             assert "root" in tree
@@ -149,17 +134,14 @@ class TestBraintrustE2E:
     def test_btql_pagination_fetches_beyond_1000_rows(self):
         """BTQL paginates via timestamp to fetch more than 1000 spans."""
         _skip_if_no_creds()
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key=_API_KEY)
+        adapter = BraintrustTraceAdapter(api_key=_API_KEY)
 
-        count = adapter.count_traces(creds, _PROJECT_ID)
+        count = adapter.count_traces(_PROJECT_ID)
         if count < 100:
             pytest.skip("Need at least 100 traces to test pagination")
 
-        # Request enough traces that BTQL needs multiple 1000-row pages
-        # (100 traces * ~10-20 spans each = 1000-2000 spans)
-        trace_trees = adapter._fetch_via_btql(creds, _PROJECT_ID, max_traces=500)
-        assert len(trace_trees) > 50  # should get many traces across pages
+        trace_trees = adapter._fetch_via_btql(_PROJECT_ID, max_traces=500)
+        assert len(trace_trees) > 50
 
         # No duplicate trace IDs
         assert len(trace_trees) == len(set(trace_trees.keys()))

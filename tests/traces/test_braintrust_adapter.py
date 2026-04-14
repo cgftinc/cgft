@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, call, patch
 import httpx
 import pytest
 
-from cgft.traces.adapter import TraceCredentials
 from cgft.traces.braintrust.adapter import BraintrustTraceAdapter, _group_into_traces, _normalize_trace
 
 
@@ -143,8 +142,7 @@ class TestNormalizeTrace:
 
 class TestCountTraces:
     def test_count_traces_parses_btql_response(self):
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key="test-key")
+        adapter = BraintrustTraceAdapter(api_key="test-key")
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -152,7 +150,7 @@ class TestCountTraces:
         mock_resp.raise_for_status = MagicMock()
 
         with patch("httpx.request", return_value=mock_resp) as mock_req:
-            count = adapter.count_traces(creds, "proj-123")
+            count = adapter.count_traces("proj-123")
 
         assert count == 142
         mock_req.assert_called_once()
@@ -165,28 +163,26 @@ class TestCountTraces:
         assert body["fmt"] == "json"
 
     def test_count_traces_handles_array_response(self):
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key="test-key")
+        adapter = BraintrustTraceAdapter(api_key="test-key")
 
         mock_resp = MagicMock()
         mock_resp.json.return_value = [{"total": 55}]
         mock_resp.raise_for_status = MagicMock()
 
         with patch("httpx.request", return_value=mock_resp):
-            count = adapter.count_traces(creds, "proj-456")
+            count = adapter.count_traces("proj-456")
 
         assert count == 55
 
     def test_count_traces_returns_zero_on_empty(self):
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key="test-key")
+        adapter = BraintrustTraceAdapter(api_key="test-key")
 
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"data": []}
         mock_resp.raise_for_status = MagicMock()
 
         with patch("httpx.request", return_value=mock_resp):
-            count = adapter.count_traces(creds, "proj-789")
+            count = adapter.count_traces("proj-789")
 
         assert count == 0
 
@@ -214,8 +210,7 @@ class TestFetchTraces:
         }
 
     def test_btql_fetch_returns_traces(self):
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key="test-key")
+        adapter = BraintrustTraceAdapter(api_key="test-key")
 
         spans = [
             self._make_span("t1", "t1", is_root=True),
@@ -225,28 +220,26 @@ class TestFetchTraces:
         resp = self._make_btql_response(spans)
 
         with patch("httpx.request", return_value=resp):
-            traces, cursor = adapter.fetch_traces(creds, "proj-123", limit=10)
+            traces, cursor = adapter.fetch_traces("proj-123", limit=10)
 
         assert len(traces) == 2
         assert {t.id for t in traces} == {"t1", "t2"}
 
     def test_btql_request_uses_btql_url(self):
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key="test-key")
+        adapter = BraintrustTraceAdapter(api_key="test-key")
 
         spans = [self._make_span("t1", "t1", is_root=True)]
         resp = self._make_btql_response(spans)
 
         with patch("httpx.request", return_value=resp) as mock_req:
-            adapter.fetch_traces(creds, "proj-123", limit=10)
+            adapter.fetch_traces("proj-123", limit=10)
 
         # Should use BTQL URL, not REST
         url = mock_req.call_args.args[1]
         assert "/btql" in url
 
     def test_falls_back_to_rest_on_btql_failure(self):
-        adapter = BraintrustTraceAdapter()
-        creds = TraceCredentials(api_key="test-key")
+        adapter = BraintrustTraceAdapter(api_key="test-key")
 
         btql_resp = MagicMock()
         btql_resp.status_code = 500
@@ -268,7 +261,7 @@ class TestFetchTraces:
             return rest_resp
 
         with patch("httpx.request", side_effect=side_effect):
-            traces, cursor = adapter.fetch_traces(creds, "proj-123", limit=10)
+            traces, cursor = adapter.fetch_traces("proj-123", limit=10)
 
         assert len(traces) == 1
         assert traces[0].id == "t1"
