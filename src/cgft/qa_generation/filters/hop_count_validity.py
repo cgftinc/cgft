@@ -180,9 +180,7 @@ class HopCountValidityFilter:
                 stats["skipped_single_hop"] = stats.get("skipped_single_hop", 0) + 1
                 continue
 
-            ref_chunks = (
-                item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", [])
-            )
+            ref_chunks = item.qa.get("reference_chunks", [])
             if len(ref_chunks) <= 1:
                 stats["skipped_single_hop"] = stats.get("skipped_single_hop", 0) + 1
                 continue
@@ -383,9 +381,16 @@ class HopCountValidityFilter:
         essential_count = hop_count_claimed - len(redundant_chunks)
         if essential_count >= 2:
             redundant_set = set(redundant_chunks)
-            item.qa["reference_chunks"] = [
-                c for c in ref_chunks if str(c.get("id", "")) not in redundant_set
-            ]
+            essential_chunks = [c for c in ref_chunks if str(c.get("id", "")) not in redundant_set]
+            removed_chunks = [c for c in ref_chunks if str(c.get("id", "")) in redundant_set]
+            item.qa["reference_chunks"] = essential_chunks
+            if removed_chunks:
+                existing = list(item.qa.get("removed_reference_chunks", []))
+                existing.extend(
+                    {"chunk": c, "reason": "redundant", "filter": "hop_count_validity"}
+                    for c in removed_chunks
+                )
+                item.qa["removed_reference_chunks"] = existing
             item.qa["min_hop_count"] = essential_count
             stats["demoted"] = stats.get("demoted", 0) + 1
             return FilterVerdict(
@@ -639,9 +644,16 @@ class HopCountValidityFilter:
         essential_count = hop_count_claimed - len(redundant_chunks)
         if essential_count >= 2:
             redundant_set = set(redundant_chunks)
-            item.qa["reference_chunks"] = [
-                c for c in ref_chunks if str(c.get("id", "")) not in redundant_set
-            ]
+            essential_chunks = [c for c in ref_chunks if str(c.get("id", "")) not in redundant_set]
+            removed_chunks = [c for c in ref_chunks if str(c.get("id", "")) in redundant_set]
+            item.qa["reference_chunks"] = essential_chunks
+            if removed_chunks:
+                existing = list(item.qa.get("removed_reference_chunks", []))
+                existing.extend(
+                    {"chunk": c, "reason": "redundant", "filter": "hop_count_validity"}
+                    for c in removed_chunks
+                )
+                item.qa["removed_reference_chunks"] = existing
             item.qa["min_hop_count"] = essential_count
             stats["demoted"] = stats.get("demoted", 0) + 1
             return FilterVerdict(

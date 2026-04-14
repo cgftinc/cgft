@@ -343,12 +343,13 @@ class DeterministicGuardsConfig:
 
     enabled: bool = True
     min_question_chars: int = 12
-    min_answer_chars: int = 24
+    min_answer_chars: int = 50
+    min_answer_chars_multi_hop: int = 100
     min_reference_chunks: int = 1
     # Jaccard similarity threshold for chunk-to-chunk overlap.
     # If any pair of reference chunks exceeds this, the multi-hop label is
     # suspect because both chunks contain largely the same information.
-    chunk_overlap_threshold: float = 0.60
+    chunk_overlap_threshold: float = 0.75
 
 
 @dataclass
@@ -463,7 +464,7 @@ class RefinementConfig:
     model: str = "gpt-5.4"
     api_key: str = ""
     base_url: str = ""
-    max_refinements_per_item: int = 3
+    max_refinements_per_item: int = 2
     max_same_seed_attempts_before_reanchor: int = 2
     max_rounds: int = 4
     prompt_template: str = (
@@ -938,11 +939,14 @@ def load_cgft_config(path: str | Path) -> CgftPipelineConfig:
         deterministic_guards=DeterministicGuardsConfig(
             enabled=bool(guards_raw.get("enabled", True)),
             min_question_chars=max(1, int(guards_raw.get("min_question_chars", 12))),
-            min_answer_chars=max(1, int(guards_raw.get("min_answer_chars", 24))),
+            min_answer_chars=max(1, int(guards_raw.get("min_answer_chars", 50))),
+            min_answer_chars_multi_hop=max(
+                1, int(guards_raw.get("min_answer_chars_multi_hop", 100))
+            ),
             min_reference_chunks=max(0, int(guards_raw.get("min_reference_chunks", 1))),
             chunk_overlap_threshold=max(
                 0.0,
-                min(1.0, float(guards_raw.get("chunk_overlap_threshold", 0.60))),
+                min(1.0, float(guards_raw.get("chunk_overlap_threshold", 0.75))),
             ),
         ),
         filters=chain_filters,

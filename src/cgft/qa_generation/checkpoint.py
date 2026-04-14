@@ -222,11 +222,7 @@ class CheckpointManager(CheckpointBase):
                 )
                 if mode:
                     by_mode[mode] = by_mode.get(mode, 0) + 1
-                ref_chunks = list(
-                    item.qa.get("verified_reference_chunks")
-                    or item.qa.get("reference_chunks", [])
-                    or []
-                )
+                ref_chunks = list(item.qa.get("reference_chunks", []) or [])
                 hop_key = str(len(ref_chunks))
                 by_hop[hop_key] = by_hop.get(hop_key, 0) + 1
 

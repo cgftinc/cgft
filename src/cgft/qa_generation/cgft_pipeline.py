@@ -935,11 +935,7 @@ def _build_regeneration_tasks(
 
         seed_chunk_id = str(meta.get("seed_chunk_id", "")).strip()
         if not seed_chunk_id:
-            reference_chunks = list(
-                item.qa.get("verified_reference_chunks")
-                or item.qa.get("reference_chunks", [])
-                or []
-            )
+            reference_chunks = list(item.qa.get("reference_chunks", []) or [])
             if reference_chunks:
                 seed_chunk_id = str((reference_chunks[0] or {}).get("id", "")).strip()
         if not seed_chunk_id and fallback_seed_ids:
@@ -2003,7 +1999,10 @@ class CgftPipeline:
                     )
                     pipeline_metrics.batch_history.append(batch_m)
 
-                    if should_early_stop(pipeline_metrics.batch_history):
+                    remaining = target - cum_acc
+                    if remaining > batch_size and should_early_stop(
+                        pipeline_metrics.batch_history
+                    ):
                         logger.warning(
                             "Acceptance rate below threshold for recent batches, stopping early"
                         )
@@ -2036,14 +2035,25 @@ class CgftPipeline:
                 )
 
             with ThreadPoolExecutor(max_workers=max_parallel) as pool:
-                futures: dict[Any, tuple[int, CgftContext]] = {}
+                # futures[fut] = (batch_idx, batch_context, in_flight_types)
+                # in_flight_types lets us decrement the shared in-flight counters
+                # on collection without recomputing from the task list.
+                futures: dict[Any, tuple[int, CgftContext, dict[str, int]]] = {}
+                in_flight_type_counts: dict[str, int] = {t: 0 for t in target_type_counts}
 
                 def _submit_next() -> None:
                     nonlocal batch_idx, iteration_count
                     while len(futures) < max_parallel and iteration_count < max_iterations:
+                        # Subtract in-flight work from remaining quota so concurrent
+                        # batches don't collectively overshoot a type's target.
+                        effective_accepted_types = {
+                            t: accepted_type_counts.get(t, 0)
+                            + in_flight_type_counts.get(t, 0)
+                            for t in target_type_counts
+                        }
                         tasks = compute_next_batch(
                             target_type_counts=target_type_counts,
-                            accepted_type_counts=accepted_type_counts,
+                            accepted_type_counts=effective_accepted_types,
                             target_mode_counts=target_mode_counts,
                             accepted_mode_counts=accepted_mode_counts,
                             target_hop_counts=target_hop_counts,
@@ -2056,12 +2066,17 @@ class CgftPipeline:
                         )
                         if not tasks:
                             break
+                        batch_in_flight: dict[str, int] = {}
+                        for t in tasks:
+                            batch_in_flight[t.qa_type] = batch_in_flight.get(t.qa_type, 0) + 1
+                        for k, v in batch_in_flight.items():
+                            in_flight_type_counts[k] = in_flight_type_counts.get(k, 0) + v
                         batch_context = copy.copy(context)
                         batch_context.state = dict(context.state)
                         if context.metrics is not None:
                             batch_context.metrics = PipelineMetrics()
                         fut = pool.submit(_run_one_batch, tasks, batch_context)
-                        futures[fut] = (batch_idx, batch_context)
+                        futures[fut] = (batch_idx, batch_context, batch_in_flight)
                         batch_idx += 1
                         iteration_count += 1
 
@@ -2150,13 +2165,20 @@ class CgftPipeline:
                         )
 
                     for fut in done:
-                        b_idx, batch_ctx = futures.pop(fut)
+                        b_idx, batch_ctx, in_flight_types = futures.pop(fut)
+                        with lock:
+                            for k, v in in_flight_types.items():
+                                in_flight_type_counts[k] = max(
+                                    0, in_flight_type_counts.get(k, 0) - v
+                                )
                         _collect_result(fut, b_idx, batch_ctx)
 
                     with lock:
                         _should_stop = consecutive_empty >= 5
+                        remaining_count = target - len(all_passed)
                         if (
                             not _should_stop
+                            and remaining_count > batch_size
                             and context.metrics is not None
                             and should_early_stop(context.metrics.batch_history)
                         ):
@@ -2164,7 +2186,7 @@ class CgftPipeline:
 
                     if _should_stop:
                         # Drain remaining in-flight futures.
-                        for fut, (b_idx, batch_ctx) in list(futures.items()):
+                        for fut, (b_idx, batch_ctx, _in_flight) in list(futures.items()):
                             fut.result()  # wait
                             _collect_result(fut, b_idx, batch_ctx)
                         futures.clear()
@@ -2291,16 +2313,55 @@ def compute_next_batch(
 
     n = min(batch_size, total_remaining)
 
-    # Multi-hop priority: allocate multi_hop first, fill rest with lookup.
-    n_multi_hop = min(n, remaining.get("multi_hop", 0))
-    n_lookup = min(n - n_multi_hop, remaining.get("lookup", 0))
-    # If there's still room (e.g. one type is full), fill from the other.
-    leftover = n - n_multi_hop - n_lookup
-    if leftover > 0:
-        if remaining.get("multi_hop", 0) > n_multi_hop:
-            n_multi_hop += min(leftover, remaining["multi_hop"] - n_multi_hop)
-        elif remaining.get("lookup", 0) > n_lookup:
-            n_lookup += min(leftover, remaining["lookup"] - n_lookup)
+    # Proportional allocation by target type distribution. A greedy "fill
+    # multi_hop first" policy overshoots under parallel submission because
+    # in-flight batches all compute against a stale accepted_type_counts — each
+    # wave of k parallel batches would launch k*batch_size multi_hop tasks and
+    # starve lookup entirely until multi_hop is saturated.
+    type_dist = {
+        t: w
+        for t, w in cfg.targets.primary_type_distribution.items()
+        if t in target_type_counts
+    }
+    if not type_dist:
+        type_dist = {t: 1.0 for t in target_type_counts}
+
+    raw_alloc = allocate_largest_remainder_generic(n, type_dist)
+
+    # Cap each type by its remaining quota; redistribute any overflow to types
+    # that still have room so the batch stays at size n when possible.
+    allocated: dict[str, int] = {}
+    overflow = 0
+    for t, count in raw_alloc.items():
+        cap = remaining.get(t, 0)
+        if count > cap:
+            overflow += count - cap
+            allocated[t] = cap
+        else:
+            allocated[t] = count
+
+    while overflow > 0:
+        room = {
+            t: max(0, remaining.get(t, 0) - allocated.get(t, 0)) for t in type_dist
+        }
+        available = {t: float(v) for t, v in room.items() if v > 0}
+        if not available:
+            break
+        give = min(overflow, int(sum(available.values())))
+        if give <= 0:
+            break
+        extra = allocate_largest_remainder_generic(give, available)
+        given = 0
+        for t, c in extra.items():
+            if c > 0:
+                allocated[t] = allocated.get(t, 0) + c
+                given += c
+        if given == 0:
+            break
+        overflow -= given
+
+    n_lookup = allocated.get("lookup", 0)
+    n_multi_hop = allocated.get("multi_hop", 0)
 
     # For multi_hop: allocate reasoning_mode and hop_count proportionally
     # to remaining sub-distribution counts.
@@ -2404,9 +2465,7 @@ def _update_subdistribution_counts(
         )
         if mode:
             accepted_mode_counts[mode] = accepted_mode_counts.get(mode, 0) + 1
-        ref_chunks = list(
-            item.qa.get("verified_reference_chunks") or item.qa.get("reference_chunks", []) or []
-        )
+        ref_chunks = list(item.qa.get("reference_chunks", []) or [])
         hop_key = str(len(ref_chunks))
         accepted_hop_counts[hop_key] = accepted_hop_counts.get(hop_key, 0) + 1
 

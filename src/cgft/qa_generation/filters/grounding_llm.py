@@ -349,20 +349,29 @@ class GroundingLLMFilter:
         judge_reasoning = str(judge_result.get("reasoning", "")).strip()
         refinements = int(item.generation_metadata.get("refinement_count", 0))
 
-        # Build verified_reference_chunks from judge's supporting_chunk_ids
+        # Update reference_chunks from judge's supporting_chunk_ids; track removed chunks.
         raw_supporting_ids = judge_result.get("supporting_chunk_ids")
         supporting_ids: set[str] = set()
         if isinstance(raw_supporting_ids, list):
             supporting_ids = {str(sid) for sid in raw_supporting_ids if sid}
         if answerable and supporting_ids:
             verified_chunks = [c for c in ref_chunks if str(c.get("id", "")) in supporting_ids]
+            removed_chunks = [c for c in ref_chunks if str(c.get("id", "")) not in supporting_ids]
             # Fall back to all ref_chunks if judge cited IDs we can't match
-            item.qa["verified_reference_chunks"] = cast(
-                list[ReferenceChunk], verified_chunks if verified_chunks else list(ref_chunks)
-            )
+            if verified_chunks:
+                item.qa["reference_chunks"] = cast(list[ReferenceChunk], verified_chunks)
+                if removed_chunks:
+                    existing = list(item.qa.get("removed_reference_chunks", []))
+                    existing.extend(
+                        {"chunk": c, "reason": "not_supporting", "filter": "grounding_llm"}
+                        for c in removed_chunks
+                    )
+                    item.qa["removed_reference_chunks"] = existing
+            else:
+                item.qa["reference_chunks"] = cast(list[ReferenceChunk], list(ref_chunks))
         elif answerable:
-            # Judge said answerable but gave no IDs — keep all ref_chunks
-            item.qa["verified_reference_chunks"] = cast(list[ReferenceChunk], list(ref_chunks))
+            # Judge said answerable but gave no IDs — keep all ref_chunks unchanged
+            pass
 
         is_unsupported = not answerable
         failure_type = _FAILURE_TYPE_UNSUPPORTED if is_unsupported else _FAILURE_TYPE_NONE

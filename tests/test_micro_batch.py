@@ -461,6 +461,136 @@ class TestComputeNextBatch:
         )
         assert len(tasks) == 5
 
+    def test_parallel_waves_respect_proportional_allocation(self) -> None:
+        """Simulate parallel batch submission: 5 batches computed against
+        accepted_type_counts=0 should collectively match the target distribution,
+        not starve one type by overallocating the other."""
+        from cgft.qa_generation.cgft_pipeline import compute_next_batch
+
+        source = MagicMock()
+        chunk_mock = MagicMock()
+        chunk_mock.hash = "seed_parallel"
+        source.sample_chunks.return_value = [chunk_mock] * 50
+
+        cfg = CgftPipelineConfig(
+            platform=PlatformConfig(api_key="test"),
+            targets=TargetsConfig(
+                total_samples=250,
+                primary_type_distribution={"lookup": 0.30, "multi_hop": 0.70},
+            ),
+        )
+
+        # 5 concurrent batches, all computed before any have returned.
+        combined: list = []
+        for i in range(5):
+            tasks = compute_next_batch(
+                target_type_counts={"lookup": 75, "multi_hop": 175},
+                accepted_type_counts={"lookup": 0, "multi_hop": 0},
+                target_mode_counts={"factual": 88, "inference": 87},
+                accepted_mode_counts={},
+                target_hop_counts={"2": 88, "3": 61, "4": 26},
+                accepted_hop_counts={},
+                batch_size=50,
+                source=source,
+                cfg=cfg,
+                iteration_count=i,
+            )
+            combined.extend(tasks)
+
+        lookups = sum(1 for t in combined if t.qa_type == "lookup")
+        multi_hops = sum(1 for t in combined if t.qa_type == "multi_hop")
+
+        # Per-batch should be ~15 lookup / ~35 multi_hop (30/70 of 50).
+        # Across 5 parallel waves: exactly 75 lookup and 175 multi_hop — the target.
+        assert lookups == 75, f"expected 75 lookup tasks across 5 parallel batches, got {lookups}"
+        assert multi_hops == 175, (
+            f"expected 175 multi_hop tasks across 5 parallel batches, got {multi_hops}"
+        )
+
+    def test_overflow_redistributes_when_one_type_capped(self) -> None:
+        """When one type is near its quota, the overflow should go to the other
+        type (which still has room) instead of being dropped."""
+        from cgft.qa_generation.cgft_pipeline import compute_next_batch
+
+        source = MagicMock()
+        chunk_mock = MagicMock()
+        chunk_mock.hash = "seed_overflow"
+        source.sample_chunks.return_value = [chunk_mock] * 20
+
+        cfg = CgftPipelineConfig(
+            platform=PlatformConfig(api_key="test"),
+            targets=TargetsConfig(
+                total_samples=100,
+                primary_type_distribution={"lookup": 0.30, "multi_hop": 0.70},
+            ),
+        )
+
+        # Remaining: lookup=1, multi_hop=19. Batch=10. Proportional would give
+        # 3 lookup / 7 multi_hop, but lookup cap is 1 → overflow 2 → all to multi_hop.
+        tasks = compute_next_batch(
+            target_type_counts={"lookup": 30, "multi_hop": 70},
+            accepted_type_counts={"lookup": 29, "multi_hop": 51},
+            target_mode_counts={"factual": 35, "inference": 35},
+            accepted_mode_counts={"factual": 25, "inference": 26},
+            target_hop_counts={"2": 35, "3": 35},
+            accepted_hop_counts={"2": 25, "3": 26},
+            batch_size=10,
+            source=source,
+            cfg=cfg,
+            iteration_count=0,
+        )
+        lookups = sum(1 for t in tasks if t.qa_type == "lookup")
+        multi_hops = sum(1 for t in tasks if t.qa_type == "multi_hop")
+        assert lookups == 1
+        assert multi_hops == 9
+        assert len(tasks) == 10
+
+    def test_sequential_run_respects_distribution_over_iterations(self) -> None:
+        """Sequential run (parallel=1) should also converge on the target
+        distribution: simulate iterative batches, updating accepted counts
+        after each, and check totals match target proportions."""
+        from cgft.qa_generation.cgft_pipeline import compute_next_batch
+
+        source = MagicMock()
+        chunk_mock = MagicMock()
+        chunk_mock.hash = "seed_seq"
+        source.sample_chunks.return_value = [chunk_mock] * 50
+
+        cfg = CgftPipelineConfig(
+            platform=PlatformConfig(api_key="test"),
+            targets=TargetsConfig(
+                total_samples=100,
+                primary_type_distribution={"lookup": 0.30, "multi_hop": 0.70},
+            ),
+        )
+
+        accepted = {"lookup": 0, "multi_hop": 0}
+        total_lookups = 0
+        total_multi_hops = 0
+        for i in range(10):
+            tasks = compute_next_batch(
+                target_type_counts={"lookup": 30, "multi_hop": 70},
+                accepted_type_counts=dict(accepted),
+                target_mode_counts={"factual": 35, "inference": 35},
+                accepted_mode_counts={},
+                target_hop_counts={"2": 35, "3": 35},
+                accepted_hop_counts={},
+                batch_size=10,
+                source=source,
+                cfg=cfg,
+                iteration_count=i,
+            )
+            for t in tasks:
+                if t.qa_type == "lookup":
+                    total_lookups += 1
+                    accepted["lookup"] += 1
+                else:
+                    total_multi_hops += 1
+                    accepted["multi_hop"] += 1
+
+        assert total_lookups == 30
+        assert total_multi_hops == 70
+
 
 class TestQuotaAcceptance:
     def test_acceptance_uses_effective_type_and_respects_quota(self) -> None:

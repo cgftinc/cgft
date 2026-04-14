@@ -32,5 +32,5 @@ class QADataPoint(TypedDict):
     no_context_answer: str | None
     eval_scores: dict
 
-    # Populated by grounding filter: subset of reference_chunks verified as supporting the answer
-    verified_reference_chunks: NotRequired[list[ReferenceChunk]]
+    # Chunks removed by filters (grounding_llm, hop_count_validity) with reason and filter name
+    removed_reference_chunks: NotRequired[list[dict]]

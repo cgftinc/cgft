@@ -426,3 +426,71 @@ class TestDifficultyScoring:
         score_2hop = run_with_chunks(2)
         score_3hop = run_with_chunks(3)
         assert score_3hop > score_2hop
+
+
+class TestRemovedReferenceChunksTracking:
+    """Verify that demotion writes removed chunks to removed_reference_chunks."""
+
+    def _make_filter_leave_one_out(self) -> HopCountValidityFilter:
+        return HopCountValidityFilter(
+            cfg=HopCountValidityConfig(
+                enabled=True,
+                mode="leave_one_out",
+                judge_model="test-model",
+                judge_api_key="test-key",
+                judge_base_url="http://test",
+                batch_enabled=False,
+            )
+        )
+
+    @patch.object(HopCountValidityFilter, "_judge_subset")
+    def test_demotion_populates_removed_reference_chunks(self, mock_judge):
+        """When a redundant chunk is stripped, it appears in removed_reference_chunks."""
+
+        def side_effect(question, answer, subset, stats):
+            # subset contains the chunks being tested (omitting one at a time)
+            subset_ids = {c["id"] for c in subset}
+            # c3 is redundant: answerable even when c3 is absent (subset = [c1, c2])
+            if subset_ids == {"c1", "c2"}:
+                return {"answerable": True, "confidence": 0.9, "reasoning": "c3 redundant", "missing_facts": []}
+            return {"answerable": False, "confidence": 0.9, "reasoning": "Essential", "missing_facts": ["X"]}
+
+        mock_judge.side_effect = side_effect
+        filt = self._make_filter_leave_one_out()
+        item = _make_item(
+            chunks=[
+                {"id": "c1", "metadata": {}, "content": "Chunk A."},
+                {"id": "c2", "metadata": {}, "content": "Chunk B."},
+                {"id": "c3", "metadata": {}, "content": "Chunk C — redundant."},
+            ]
+        )
+        ctx = _make_context()
+
+        result = filt.evaluate([item], ctx)
+        assert result[0].is_passed
+        # reference_chunks should only contain the 2 essential chunks
+        ref_ids = {c["id"] for c in result[0].qa["reference_chunks"]}
+        assert ref_ids == {"c1", "c2"}
+        # removed_reference_chunks must track the stripped chunk
+        removed = result[0].qa.get("removed_reference_chunks", [])
+        assert len(removed) == 1
+        assert removed[0]["chunk"]["id"] == "c3"
+        assert removed[0]["reason"] == "redundant"
+        assert removed[0]["filter"] == "hop_count_validity"
+
+    @patch.object(HopCountValidityFilter, "_judge_subset")
+    def test_no_removed_chunks_when_all_essential(self, mock_judge):
+        """When no chunks are redundant, removed_reference_chunks is not populated."""
+        mock_judge.return_value = {
+            "answerable": False,
+            "confidence": 0.9,
+            "reasoning": "Essential",
+            "missing_facts": ["X"],
+        }
+        filt = self._make_filter_leave_one_out()
+        item = _make_item()
+        ctx = _make_context()
+
+        result = filt.evaluate([item], ctx)
+        assert result[0].is_passed
+        assert result[0].qa.get("removed_reference_chunks") is None
