@@ -271,6 +271,7 @@ class TrainerClient:
         train_dataset_path: str,
         eval_dataset_path: str,
         name: str | None = None,
+        launcher_args: dict[str, Any] | None = None,
     ) -> str:
         """Launch a new experiment from a job template.
         Args:
@@ -280,6 +281,9 @@ class TrainerClient:
             train_dataset_path: Path to the training dataset
             eval_dataset_path: Path to the evaluation dataset
             name: Optional name for the experiment
+            launcher_args: Extra launcher args forwarded to the server
+                (e.g. {"max_response_len": 4000}). The 4 required paths
+                above always take precedence.
         Returns:
             The experiment ID.
         Raises:
@@ -287,6 +291,7 @@ class TrainerClient:
             JobLaunchError: If experiment launch fails
         """
         args: dict[str, Any] = {
+            **(launcher_args or {}),
             "env_cls_path": env_cls_path,
             "env_metadata_path": env_metadata_path,
             "train_dataset_path": train_dataset_path,

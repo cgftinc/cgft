@@ -243,6 +243,7 @@ def train(
     show_summary: bool = True,
     # Rollout / training configuration
     validation_model: str | None = None,
+    launcher_args: dict[str, Any] | None = None,
     dry_run: bool = False,
 ) -> str | dict[str, Any]:
     """Train a model - the simplest interface for launching training jobs.
@@ -273,6 +274,9 @@ def train(
         validate_env_remotely: Whether to validate environment in a remote rollout server. (default: True)
         show_summary: Whether to print progress information (default: True)
         validation_model: LLM model for remote validation rollouts (default: server default)
+        launcher_args: Extra launcher args forwarded to the server (e.g.
+            {"max_response_len": 4000}). See expt-platform job-templates
+            for supported keys.
         dry_run: Validate everything but don't launch the training job. (default: False)
 
     Returns:
@@ -396,6 +400,7 @@ def train(
         train_dataset_path=train_blob_path,
         eval_dataset_path=eval_blob_path,
         name=experiment_name,
+        launcher_args=launcher_args,
     )
 
     if show_summary:
