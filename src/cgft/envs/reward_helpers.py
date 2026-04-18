@@ -111,3 +111,71 @@ def count_search_calls(completion: str | list[dict[str, Any]]) -> int:
 def search_within_budget(calls: int, max_calls: int) -> bool:
     """Check if the number of search calls is within budget."""
     return calls <= max_calls
+
+
+_SOURCE_CITE_RE = re.compile(r"\[Source:\s*([^\]]+)\]")
+
+_DEFAULT_EFFICIENCY_RANGES: list[tuple[int, int | None, float]] = [
+    (1, 3, 1.0),
+    (4, 6, 0.5),
+    (7, None, 0.0),
+]
+
+
+def citation_score(
+    completion: str | list[dict[str, Any]],
+    reference_chunks: list[dict[str, Any]],
+    *,
+    source_field: str = "source_id",
+) -> dict[str, float]:
+    """Score citation precision and recall against reference chunks.
+
+    Parses ``[Source: id]`` patterns from the completion text and compares
+    against source IDs found in each reference chunk's ``metadata[source_field]``.
+
+    Returns ``{"precision": float, "recall": float}``.
+    """
+    text = extract_completion_text(completion)
+    cited = set(_SOURCE_CITE_RE.findall(text))
+    cited = {c.strip() for c in cited}
+
+    ref_ids: set[str] = set()
+    for chunk in reference_chunks:
+        meta = chunk.get("metadata", {})
+        if isinstance(meta, dict):
+            sid = meta.get(source_field)
+            if sid is not None:
+                ref_ids.add(str(sid))
+
+    if not cited and not ref_ids:
+        return {"precision": 0.0, "recall": 0.0}
+    if not cited:
+        return {"precision": 0.0, "recall": 0.0}
+    if not ref_ids:
+        return {"precision": 1.0, "recall": 0.0}
+
+    precision = len(cited & ref_ids) / len(cited)
+    recall = len(cited & ref_ids) / len(ref_ids)
+    return {"precision": precision, "recall": recall}
+
+
+def tool_call_efficiency(
+    completion: str | list[dict[str, Any]],
+    ranges: list[tuple[int, int | None, float]] | None = None,
+) -> float:
+    """Score tool call efficiency based on call count ranges.
+
+    Each range is ``(min_calls, max_calls, score)``.  ``None`` for
+    ``max_calls`` means unbounded.  Returns the score of the first
+    matching range, or ``0.0`` if no range matches.  Zero tool calls
+    always return ``0.0``.
+    """
+    calls = count_search_calls(completion)
+    if calls == 0:
+        return 0.0
+    if ranges is None:
+        ranges = _DEFAULT_EFFICIENCY_RANGES
+    for lo, hi, score in ranges:
+        if calls >= lo and (hi is None or calls <= hi):
+            return score
+    return 0.0

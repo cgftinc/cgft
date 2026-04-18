@@ -1229,15 +1229,15 @@ class CgftPipeline:
 
     def run(self) -> dict[str, Any]:
         t_prep = time.monotonic()
-        context = self._prepare_context()
+        context = self.prepare_context()
         context["prepare_context_seconds"] = time.monotonic() - t_prep
-        return self._run_from_context(context)
+        return self.run_from_context(context)
 
-    def _prepare_context(self) -> CgftContext:
+    def prepare_context(self) -> CgftContext:
         """Run stages 1-3: load source, build corpus profile, extract entities.
 
         Returns a fully populated CgftContext with ``profile`` set, ready for
-        ``_run_from_context``.  Resolves API keys as a side-effect.
+        ``run_from_context``.  Resolves API keys as a side-effect.
         """
         cfg = self.cfg
         cfg.resolve_api_keys()
@@ -1462,8 +1462,8 @@ class CgftPipeline:
 
         return context
 
-    def _run_from_context(self, context: CgftContext) -> dict[str, Any]:
-        """Run stages 4-8 given a context already populated by ``_prepare_context``.
+    def run_from_context(self, context: CgftContext) -> dict[str, Any]:
+        """Run stages 4-8 given a context already populated by ``prepare_context``.
 
         This is the compute-heavy phase: task creation, generation, filtering,
         refinement, dedup, and formatting.  The method also drives the micro-batch
