@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from cgft.envs.reward_helpers import (
+    citation_score,
     extract_answer_block,
     extract_completion_text,
     overlap_reward,
+    tool_call_efficiency,
 )
 
 
@@ -73,3 +75,109 @@ class TestOverlapReward:
 
     def test_empty_reference(self):
         assert overlap_reward("text", "", reference_chunks=[]) == 0.0
+
+
+class TestCitationScore:
+    def test_perfect_match(self):
+        completion = "According to [Source: doc1] and [Source: doc2], the answer is yes."
+        chunks = [
+            {"metadata": {"source_id": "doc1"}},
+            {"metadata": {"source_id": "doc2"}},
+        ]
+        result = citation_score(completion, chunks)
+        assert result["precision"] == 1.0
+        assert result["recall"] == 1.0
+
+    def test_partial_recall(self):
+        completion = "According to [Source: doc1], the answer is yes."
+        chunks = [
+            {"metadata": {"source_id": "doc1"}},
+            {"metadata": {"source_id": "doc2"}},
+        ]
+        result = citation_score(completion, chunks)
+        assert result["precision"] == 1.0
+        assert result["recall"] == 0.5
+
+    def test_partial_precision(self):
+        completion = "According to [Source: doc1] and [Source: doc99], yes."
+        chunks = [{"metadata": {"source_id": "doc1"}}]
+        result = citation_score(completion, chunks)
+        assert result["precision"] == 0.5
+        assert result["recall"] == 1.0
+
+    def test_no_citations(self):
+        result = citation_score("No citations here.", [{"metadata": {"source_id": "doc1"}}])
+        assert result["precision"] == 0.0
+        assert result["recall"] == 0.0
+
+    def test_no_reference_chunks(self):
+        result = citation_score("See [Source: doc1].", [])
+        assert result["precision"] == 1.0
+        assert result["recall"] == 0.0
+
+    def test_empty_both(self):
+        result = citation_score("No citations.", [])
+        assert result["precision"] == 0.0
+        assert result["recall"] == 0.0
+
+    def test_custom_source_field(self):
+        completion = "See [Source: abc]."
+        chunks = [{"metadata": {"doc_id": "abc"}}]
+        result = citation_score(completion, chunks, source_field="doc_id")
+        assert result["precision"] == 1.0
+        assert result["recall"] == 1.0
+
+    def test_message_list_input(self):
+        msgs = [{"role": "assistant", "content": "See [Source: doc1]."}]
+        chunks = [{"metadata": {"source_id": "doc1"}}]
+        result = citation_score(msgs, chunks)
+        assert result["precision"] == 1.0
+
+    def test_missing_metadata(self):
+        completion = "See [Source: doc1]."
+        chunks = [{"content": "no metadata key"}]
+        result = citation_score(completion, chunks)
+        assert result["precision"] == 1.0
+        assert result["recall"] == 0.0
+
+
+class TestToolCallEfficiency:
+    def test_zero_calls(self):
+        assert tool_call_efficiency("no tool calls here") == 0.0
+
+    def test_default_ranges_low(self):
+        completion = "<tool_call>" * 2
+        assert tool_call_efficiency(completion) == 1.0
+
+    def test_default_ranges_mid(self):
+        completion = "<tool_call>" * 5
+        assert tool_call_efficiency(completion) == 0.5
+
+    def test_default_ranges_high(self):
+        completion = "<tool_call>" * 10
+        assert tool_call_efficiency(completion) == 0.0
+
+    def test_boundary_1(self):
+        assert tool_call_efficiency("<tool_call>" * 1) == 1.0
+
+    def test_boundary_3(self):
+        assert tool_call_efficiency("<tool_call>" * 3) == 1.0
+
+    def test_boundary_4(self):
+        assert tool_call_efficiency("<tool_call>" * 4) == 0.5
+
+    def test_boundary_6(self):
+        assert tool_call_efficiency("<tool_call>" * 6) == 0.5
+
+    def test_boundary_7(self):
+        assert tool_call_efficiency("<tool_call>" * 7) == 0.0
+
+    def test_custom_ranges(self):
+        ranges = [(1, 2, 1.0), (3, 5, 0.3)]
+        assert tool_call_efficiency("<tool_call>" * 2, ranges=ranges) == 1.0
+        assert tool_call_efficiency("<tool_call>" * 4, ranges=ranges) == 0.3
+        assert tool_call_efficiency("<tool_call>" * 6, ranges=ranges) == 0.0
+
+    def test_message_list_input(self):
+        msgs = [{"role": "assistant", "content": "<tool_call>" * 2}]
+        assert tool_call_efficiency(msgs) == 1.0
