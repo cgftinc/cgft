@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from cgft.envs.reward_helpers import (
     citation_score,
     extract_answer_block,
@@ -182,42 +184,86 @@ class TestCitationScore:
 
 
 class TestToolCallEfficiency:
-    def test_zero_calls(self):
-        assert tool_call_efficiency("no tool calls here") == 0.0
+    def test_wrong_answer_returns_zero(self):
+        # correctness_raw <= 0 → no reward regardless of call count.
+        # Efficiency is only meaningful when the model got the answer right.
+        assert (
+            tool_call_efficiency("<tool_call>" * 2, correctness_raw=0.0) == 0.0
+        )
+        assert (
+            tool_call_efficiency("<tool_call>" * 2, correctness_raw=-0.1) == 0.0
+        )
 
-    def test_default_ranges_low(self):
-        completion = "<tool_call>" * 2
-        assert tool_call_efficiency(completion) == 1.0
+    def test_within_baseline_no_decay(self):
+        # baseline = reference_chunk_count + 2. With 2 ref chunks, 4 calls
+        # is exactly at baseline → excess=0 → full correctness_raw.
+        score = tool_call_efficiency(
+            "<tool_call>" * 4, correctness_raw=1.0, reference_chunk_count=2
+        )
+        assert score == 1.0
 
-    def test_default_ranges_mid(self):
-        completion = "<tool_call>" * 5
-        assert tool_call_efficiency(completion) == 0.5
+    def test_excess_decays(self):
+        # 6 calls, 2 ref chunks → baseline 4, excess 2 → exp(-0.2*2) ≈ 0.67
+        score = tool_call_efficiency(
+            "<tool_call>" * 6, correctness_raw=1.0, reference_chunk_count=2
+        )
+        assert 0.6 < score < 0.7
 
-    def test_default_ranges_high(self):
-        completion = "<tool_call>" * 10
-        assert tool_call_efficiency(completion) == 0.0
+    def test_correctness_scales_score(self):
+        # Partial correctness (0.5) → score is halved vs. full correctness.
+        full = tool_call_efficiency(
+            "<tool_call>" * 4, correctness_raw=1.0, reference_chunk_count=2
+        )
+        partial = tool_call_efficiency(
+            "<tool_call>" * 4, correctness_raw=0.5, reference_chunk_count=2
+        )
+        assert partial == pytest.approx(full * 0.5)
 
-    def test_boundary_1(self):
-        assert tool_call_efficiency("<tool_call>" * 1) == 1.0
+    def test_max_calls_cliff(self):
+        # Hard cliff — even with perfect correctness, calls > max_calls → 0.
+        assert (
+            tool_call_efficiency(
+                "<tool_call>" * 11, correctness_raw=1.0, max_calls=10
+            )
+            == 0.0
+        )
+        # Boundary: exactly at max_calls is still allowed.
+        assert (
+            tool_call_efficiency(
+                "<tool_call>" * 10, correctness_raw=1.0, reference_chunk_count=10
+            )
+            == 1.0
+        )
 
-    def test_boundary_3(self):
-        assert tool_call_efficiency("<tool_call>" * 3) == 1.0
+    def test_zero_calls_full_score(self):
+        # 0 calls with correct answer earns full reward — baseline headroom
+        # means "didn't need to search" is not penalized.
+        assert (
+            tool_call_efficiency(
+                "no tool calls", correctness_raw=1.0, reference_chunk_count=0
+            )
+            == 1.0
+        )
 
-    def test_boundary_4(self):
-        assert tool_call_efficiency("<tool_call>" * 4) == 0.5
-
-    def test_boundary_6(self):
-        assert tool_call_efficiency("<tool_call>" * 6) == 0.5
-
-    def test_boundary_7(self):
-        assert tool_call_efficiency("<tool_call>" * 7) == 0.0
-
-    def test_custom_ranges(self):
-        ranges = [(1, 2, 1.0), (3, 5, 0.3)]
-        assert tool_call_efficiency("<tool_call>" * 2, ranges=ranges) == 1.0
-        assert tool_call_efficiency("<tool_call>" * 4, ranges=ranges) == 0.3
-        assert tool_call_efficiency("<tool_call>" * 6, ranges=ranges) == 0.0
+    def test_custom_decay_rate(self):
+        # Tighter decay → steeper drop-off past baseline.
+        slow = tool_call_efficiency(
+            "<tool_call>" * 6,
+            correctness_raw=1.0,
+            reference_chunk_count=2,
+            decay_rate=0.1,
+        )
+        fast = tool_call_efficiency(
+            "<tool_call>" * 6,
+            correctness_raw=1.0,
+            reference_chunk_count=2,
+            decay_rate=0.5,
+        )
+        assert slow > fast
 
     def test_message_list_input(self):
         msgs = [{"role": "assistant", "content": "<tool_call>" * 2}]
-        assert tool_call_efficiency(msgs) == 1.0
+        assert (
+            tool_call_efficiency(msgs, correctness_raw=1.0, reference_chunk_count=2)
+            == 1.0
+        )

@@ -5,6 +5,7 @@ No Chunk or Pydantic dependency — uses only plain strings and dicts.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from difflib import SequenceMatcher
@@ -116,11 +117,10 @@ def search_within_budget(calls: int, max_calls: int) -> bool:
 
 _SOURCE_CITE_RE = re.compile(r"\[Source:\s*([^\]]+)\]", re.IGNORECASE)
 
-_DEFAULT_EFFICIENCY_RANGES: list[tuple[int, int | None, float]] = [
-    (1, 3, 1.0),
-    (4, 6, 0.5),
-    (7, None, 0.0),
-]
+# Default exp-decay constant for tool_call_efficiency. Mirrors SearchEnv's
+# SEARCH_EFFICIENCY_DECAY_RATE so wizard rewards and SearchEnv's built-in
+# reward produce the same gradient shape by default.
+_DEFAULT_DECAY_RATE = 0.2
 
 
 def citation_score(
@@ -179,21 +179,43 @@ def citation_score(
 
 def tool_call_efficiency(
     completion: str | list[dict[str, Any]],
-    ranges: list[tuple[int, int | None, float]] | None = None,
+    *,
+    correctness_raw: float = 1.0,
+    reference_chunk_count: int = 0,
+    max_calls: int = 10,
+    decay_rate: float = _DEFAULT_DECAY_RATE,
 ) -> float:
-    """Score tool call efficiency based on call count ranges.
+    """Score tool call efficiency via correctness-scaled exp decay over an
+    adaptive baseline. Mirrors ``SearchEnv._score_search_efficiency`` — the
+    single source of truth for both the SearchEnv built-in reward and
+    wizard-configured tool-call-efficiency components.
 
-    Each range is ``(min_calls, max_calls, score)``.  ``None`` for
-    ``max_calls`` means unbounded.  Returns the score of the first
-    matching range, or ``0.0`` if no range matches.  Zero tool calls
-    always return ``0.0``.
+    Rollouts that answered incorrectly (``correctness_raw <= 0``) return 0:
+    efficiency is only meaningful conditional on getting the answer right.
+    Rollouts exceeding ``max_calls`` return 0 — hard cliff so the model
+    can't trade unbounded exploration for marginal correctness.
+
+    Otherwise the score is ``correctness_raw * exp(-decay_rate * excess)``
+    where ``excess = max(0, calls - (reference_chunk_count + 2))``. Calls
+    up to the baseline (ref_chunk_count + 2 headroom) earn full reward;
+    additional calls decay smoothly.
+
+    Args:
+        correctness_raw: Correctness score from the judge in [0, 1]. Acts
+            as both a hard gate (``<= 0`` → 0) and a soft multiplier on
+            the efficiency score — wrong answers get no efficiency reward,
+            partially correct answers get partial.
+        reference_chunk_count: Number of gold chunks for this prompt — the
+            baseline scales per-prompt instead of being fixed. Wizard
+            callers typically pass ``len(kwargs.get("reference_chunks", []))``.
+        max_calls: Hard cliff — returns 0 above this count.
+        decay_rate: Exp-decay constant for excess calls beyond baseline.
     """
-    calls = count_search_calls(completion)
-    if calls == 0:
+    if correctness_raw <= 0:
         return 0.0
-    if ranges is None:
-        ranges = _DEFAULT_EFFICIENCY_RANGES
-    for lo, hi, score in ranges:
-        if calls >= lo and (hi is None or calls <= hi):
-            return score
-    return 0.0
+    calls = count_search_calls(completion)
+    if calls > max_calls:
+        return 0.0
+    baseline = reference_chunk_count + 2
+    excess = max(0, calls - baseline)
+    return correctness_raw * math.exp(-decay_rate * excess)

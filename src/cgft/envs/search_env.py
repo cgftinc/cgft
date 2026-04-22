@@ -11,7 +11,6 @@ Provides 5 reward components:
 from __future__ import annotations
 
 import asyncio
-import math
 import traceback
 from collections.abc import Callable
 from typing import Any
@@ -24,10 +23,9 @@ from cgft.corpus.search_client import SearchClient
 from cgft.envs.reward_helpers import (
     citation_score,
     clip01,
-    count_search_calls,
     extract_answer_block,
     extract_completion_text,
-    search_within_budget,
+    tool_call_efficiency,
 )
 from cgft.rubrics.rubric import Rubric, evaluate_single_rubric
 
@@ -81,7 +79,6 @@ return your final answer inside <answer>...</answer> and cite supporting sources
 
 MAX_TOOL_OUTPUT_CHARS = 10000
 TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated due to character limit]"
-SEARCH_EFFICIENCY_DECAY_RATE = 0.2
 
 
 class SearchEnv(BaseEnv):
@@ -258,12 +255,15 @@ class SearchEnv(BaseEnv):
             rewards["citation_recall"] = self._w_citation_recall * recall
             rewards["citation_precision"] = self._w_citation_precision * precision
 
-            # 3. Search efficiency (shaped by search count vs. gold chunk baseline)
-            calls = count_search_calls(completion)
-            rewards["search_efficiency"] = self._score_search_efficiency(
-                calls=calls,
+            # 3. Search efficiency — correctness-scaled exp decay over
+            # an adaptive baseline of (reference_chunk_count + 2) calls.
+            # Shared with wizard reward codegen via the helper, so both
+            # paths produce identical gradient shape.
+            rewards["search_efficiency"] = self._w_search_efficiency * tool_call_efficiency(
+                completion,
                 correctness_raw=correctness_raw,
                 reference_chunk_count=reference_chunk_count,
+                max_calls=self._max_search_calls,
             )
 
             log_env(rollout_id, f"[SearchEnv] rewards={rewards}")
@@ -392,24 +392,6 @@ class SearchEnv(BaseEnv):
     # ------------------------------------------------------------------
     # Citation scoring
     # ------------------------------------------------------------------
-
-    def _score_search_efficiency(
-        self,
-        *,
-        calls: int,
-        correctness_raw: float,
-        reference_chunk_count: int,
-    ) -> float:
-        """Reward correct answers that do not search much past the gold chunk baseline."""
-        if correctness_raw <= 0:
-            return 0.0
-        if not search_within_budget(calls, self._max_search_calls):
-            return 0.0
-
-        baseline_calls = reference_chunk_count + 2
-        excess_calls = max(0, calls - baseline_calls)
-        decay = math.exp(-SEARCH_EFFICIENCY_DECAY_RATE * excess_calls)
-        return self._w_search_efficiency * correctness_raw * decay
 
     def _score_citations(
         self,
