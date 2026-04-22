@@ -281,7 +281,7 @@ class SearchEnv(BaseEnv):
 
     async def _search_tool(
         self,
-        query: str,
+        query: str = "",
         mode: str | None = None,
         limit: int = 10,
         **kwargs: Any,
