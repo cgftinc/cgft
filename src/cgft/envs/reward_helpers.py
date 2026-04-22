@@ -5,7 +5,9 @@ No Chunk or Pydantic dependency — uses only plain strings and dicts.
 
 from __future__ import annotations
 
+import math
 import re
+from collections.abc import Callable
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -113,42 +115,58 @@ def search_within_budget(calls: int, max_calls: int) -> bool:
     return calls <= max_calls
 
 
-_SOURCE_CITE_RE = re.compile(r"\[Source:\s*([^\]]+)\]")
+_SOURCE_CITE_RE = re.compile(r"\[Source:\s*([^\]]+)\]", re.IGNORECASE)
 
-_DEFAULT_EFFICIENCY_RANGES: list[tuple[int, int | None, float]] = [
-    (1, 3, 1.0),
-    (4, 6, 0.5),
-    (7, None, 0.0),
-]
+# Default exp-decay constant for tool_call_efficiency. Mirrors SearchEnv's
+# SEARCH_EFFICIENCY_DECAY_RATE so wizard rewards and SearchEnv's built-in
+# reward produce the same gradient shape by default.
+_DEFAULT_DECAY_RATE = 0.2
 
 
 def citation_score(
     completion: str | list[dict[str, Any]],
     reference_chunks: list[dict[str, Any]],
     *,
-    source_field: str = "source_id",
+    source_field: str | list[str] = "source_id",
+    canonicalize: Callable[[str], str] | None = None,
 ) -> dict[str, float]:
     """Score citation precision and recall against reference chunks.
 
-    Parses ``[Source: id]`` patterns from the completion text and compares
-    against source IDs found in each reference chunk's ``metadata[source_field]``.
+    Parses ``[Source: id]`` patterns from the completion (case-insensitive)
+    and compares against source IDs found in each reference chunk's
+    ``metadata[source_field]``.
+
+    Args:
+        source_field: metadata key to read source IDs from. When a list is
+            passed, the first non-empty key on each chunk wins — useful for
+            corpora where some chunks expose ``file`` and others ``file_path``.
+        canonicalize: optional normalizer applied to both cited IDs and
+            reference IDs before set intersection (e.g. lowercasing,
+            trimming, stripping file extensions).
 
     Returns ``{"precision": float, "recall": float}``.
     """
+    fields = [source_field] if isinstance(source_field, str) else list(source_field)
+    norm = canonicalize if canonicalize is not None else (lambda s: s.strip())
+
     text = extract_completion_text(completion)
-    cited = set(_SOURCE_CITE_RE.findall(text))
-    cited = {c.strip() for c in cited}
+    cited = {norm(c) for c in _SOURCE_CITE_RE.findall(text)}
+    cited.discard("")
 
     ref_ids: set[str] = set()
     for chunk in reference_chunks:
         meta = chunk.get("metadata", {})
-        if isinstance(meta, dict):
-            sid = meta.get(source_field)
-            if sid is not None:
-                ref_ids.add(str(sid))
+        if not isinstance(meta, dict):
+            continue
+        for field in fields:
+            sid = meta.get(field)
+            if sid is None or sid == "":
+                continue
+            norm_sid = norm(str(sid))
+            if norm_sid:
+                ref_ids.add(norm_sid)
+            break
 
-    if not cited and not ref_ids:
-        return {"precision": 0.0, "recall": 0.0}
     if not cited:
         return {"precision": 0.0, "recall": 0.0}
     if not ref_ids:
@@ -161,21 +179,43 @@ def citation_score(
 
 def tool_call_efficiency(
     completion: str | list[dict[str, Any]],
-    ranges: list[tuple[int, int | None, float]] | None = None,
+    *,
+    correctness_raw: float = 1.0,
+    reference_chunk_count: int = 0,
+    max_calls: int = 10,
+    decay_rate: float = _DEFAULT_DECAY_RATE,
 ) -> float:
-    """Score tool call efficiency based on call count ranges.
+    """Score tool call efficiency via correctness-scaled exp decay over an
+    adaptive baseline. Mirrors ``SearchEnv._score_search_efficiency`` — the
+    single source of truth for both the SearchEnv built-in reward and
+    wizard-configured tool-call-efficiency components.
 
-    Each range is ``(min_calls, max_calls, score)``.  ``None`` for
-    ``max_calls`` means unbounded.  Returns the score of the first
-    matching range, or ``0.0`` if no range matches.  Zero tool calls
-    always return ``0.0``.
+    Rollouts that answered incorrectly (``correctness_raw <= 0``) return 0:
+    efficiency is only meaningful conditional on getting the answer right.
+    Rollouts exceeding ``max_calls`` return 0 — hard cliff so the model
+    can't trade unbounded exploration for marginal correctness.
+
+    Otherwise the score is ``correctness_raw * exp(-decay_rate * excess)``
+    where ``excess = max(0, calls - (reference_chunk_count + 2))``. Calls
+    up to the baseline (ref_chunk_count + 2 headroom) earn full reward;
+    additional calls decay smoothly.
+
+    Args:
+        correctness_raw: Correctness score from the judge in [0, 1]. Acts
+            as both a hard gate (``<= 0`` → 0) and a soft multiplier on
+            the efficiency score — wrong answers get no efficiency reward,
+            partially correct answers get partial.
+        reference_chunk_count: Number of gold chunks for this prompt — the
+            baseline scales per-prompt instead of being fixed. Wizard
+            callers typically pass ``len(kwargs.get("reference_chunks", []))``.
+        max_calls: Hard cliff — returns 0 above this count.
+        decay_rate: Exp-decay constant for excess calls beyond baseline.
     """
-    calls = count_search_calls(completion)
-    if calls == 0:
+    if correctness_raw <= 0:
         return 0.0
-    if ranges is None:
-        ranges = _DEFAULT_EFFICIENCY_RANGES
-    for lo, hi, score in ranges:
-        if calls >= lo and (hi is None or calls <= hi):
-            return score
-    return 0.0
+    calls = count_search_calls(completion)
+    if calls > max_calls:
+        return 0.0
+    baseline = reference_chunk_count + 2
+    excess = max(0, calls - baseline)
+    return correctness_raw * math.exp(-decay_rate * excess)
