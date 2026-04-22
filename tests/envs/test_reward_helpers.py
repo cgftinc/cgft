@@ -140,6 +140,46 @@ class TestCitationScore:
         assert result["precision"] == 1.0
         assert result["recall"] == 0.0
 
+    def test_case_insensitive(self):
+        # Model emits lowercase [source: ...] (mirroring search tool output);
+        # regex must still match so citations count.
+        completion = "See [source: doc1] and [SOURCE: doc2]."
+        chunks = [
+            {"metadata": {"source_id": "doc1"}},
+            {"metadata": {"source_id": "doc2"}},
+        ]
+        result = citation_score(completion, chunks)
+        assert result["precision"] == 1.0
+        assert result["recall"] == 1.0
+
+    def test_source_field_list(self):
+        # Heterogeneous chunks: some expose `file`, others `file_path`.
+        # First-non-empty-key-wins semantics — chunks without either are ignored.
+        completion = "See [Source: a.md] and [Source: b.md]."
+        chunks = [
+            {"metadata": {"file": "a.md"}},
+            {"metadata": {"file_path": "b.md"}},
+            {"metadata": {"other": "c.md"}},
+        ]
+        result = citation_score(
+            completion, chunks, source_field=["file", "file_path"]
+        )
+        assert result["precision"] == 1.0
+        assert result["recall"] == 1.0
+
+    def test_canonicalize_hook(self):
+        # Subclass-style canonicalizer (e.g. strip extension + lowercase)
+        # applied symmetrically to cited + reference IDs before intersection.
+        completion = "See [Source: Doc1.MD]."
+        chunks = [{"metadata": {"source_id": "doc1.md"}}]
+        result = citation_score(
+            completion,
+            chunks,
+            canonicalize=lambda s: s.strip().lower().removesuffix(".md"),
+        )
+        assert result["precision"] == 1.0
+        assert result["recall"] == 1.0
+
 
 class TestToolCallEfficiency:
     def test_zero_calls(self):

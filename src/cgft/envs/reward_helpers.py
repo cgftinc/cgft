@@ -6,6 +6,7 @@ No Chunk or Pydantic dependency — uses only plain strings and dicts.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -113,7 +114,7 @@ def search_within_budget(calls: int, max_calls: int) -> bool:
     return calls <= max_calls
 
 
-_SOURCE_CITE_RE = re.compile(r"\[Source:\s*([^\]]+)\]")
+_SOURCE_CITE_RE = re.compile(r"\[Source:\s*([^\]]+)\]", re.IGNORECASE)
 
 _DEFAULT_EFFICIENCY_RANGES: list[tuple[int, int | None, float]] = [
     (1, 3, 1.0),
@@ -126,29 +127,46 @@ def citation_score(
     completion: str | list[dict[str, Any]],
     reference_chunks: list[dict[str, Any]],
     *,
-    source_field: str = "source_id",
+    source_field: str | list[str] = "source_id",
+    canonicalize: Callable[[str], str] | None = None,
 ) -> dict[str, float]:
     """Score citation precision and recall against reference chunks.
 
-    Parses ``[Source: id]`` patterns from the completion text and compares
-    against source IDs found in each reference chunk's ``metadata[source_field]``.
+    Parses ``[Source: id]`` patterns from the completion (case-insensitive)
+    and compares against source IDs found in each reference chunk's
+    ``metadata[source_field]``.
+
+    Args:
+        source_field: metadata key to read source IDs from. When a list is
+            passed, the first non-empty key on each chunk wins — useful for
+            corpora where some chunks expose ``file`` and others ``file_path``.
+        canonicalize: optional normalizer applied to both cited IDs and
+            reference IDs before set intersection (e.g. lowercasing,
+            trimming, stripping file extensions).
 
     Returns ``{"precision": float, "recall": float}``.
     """
+    fields = [source_field] if isinstance(source_field, str) else list(source_field)
+    norm = canonicalize if canonicalize is not None else (lambda s: s.strip())
+
     text = extract_completion_text(completion)
-    cited = set(_SOURCE_CITE_RE.findall(text))
-    cited = {c.strip() for c in cited}
+    cited = {norm(c) for c in _SOURCE_CITE_RE.findall(text)}
+    cited.discard("")
 
     ref_ids: set[str] = set()
     for chunk in reference_chunks:
         meta = chunk.get("metadata", {})
-        if isinstance(meta, dict):
-            sid = meta.get(source_field)
-            if sid is not None:
-                ref_ids.add(str(sid))
+        if not isinstance(meta, dict):
+            continue
+        for field in fields:
+            sid = meta.get(field)
+            if sid is None or sid == "":
+                continue
+            norm_sid = norm(str(sid))
+            if norm_sid:
+                ref_ids.add(norm_sid)
+            break
 
-    if not cited and not ref_ids:
-        return {"precision": 0.0, "recall": 0.0}
     if not cited:
         return {"precision": 0.0, "recall": 0.0}
     if not ref_ids:
