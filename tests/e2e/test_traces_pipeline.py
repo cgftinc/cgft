@@ -7,18 +7,19 @@ Two scenarios:
    transient BTQL errors silently drop a page mid-pagination (symptom:
    "fetches 500 when the project has 509").
 
-2. **All filters including pivot** — on a much smaller slice (10 traces),
-   run the whole ``TracesPipeline`` with heuristic + tool_relay + dedup +
-   pivot all enabled.  Proves every filter stage actually executes on
-   real data, and that the LLM-backed pivot path works end-to-end.  The
-   10-trace slice keeps per-turn LLM calls bounded so the test finishes
-   fast.
+2. **All filters including importance_filter** — on a much smaller slice
+   (10 traces), run the whole ``TracesPipeline`` with
+   ``min_completion_chars`` + ``max_tool_output_overlap`` +
+   ``max_example_similarity`` + ``importance_filter`` all enabled.
+   Proves every filter stage actually executes on real data, and that
+   the LLM-backed importance path works end-to-end.  The 10-trace slice
+   keeps per-turn LLM calls bounded so the test finishes fast.
 
 Env vars:
     BT_API_KEY          — Braintrust API key
     BT_PROJECT_ID       — Braintrust project ID with ≥ 500 traces
-    CGFT_API_KEY        — (pivot only) CGFT platform key for LLM relay
-    OPENAI_API_KEY      — (pivot only) fallback if CGFT key missing
+    CGFT_API_KEY        — (importance filter only) CGFT platform key for LLM relay
+    OPENAI_API_KEY      — (importance filter only) fallback if CGFT key missing
     LLM_BASE_URL        — (optional) override LLM endpoint
     LLM_MODEL           — (optional, default gpt-5.4-nano)
 
@@ -37,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-from cgft.traces import PivotConfig, TracesPipeline
+from cgft.traces import ImportanceFilterConfig, TracesPipeline
 from cgft.traces.braintrust.adapter import BraintrustTraceAdapter
 from cgft.traces.processing import MIN_TRAIN_SAMPLES
 
@@ -122,7 +123,7 @@ class TestBraintrustFetchAll:
         )
 
 
-# ── 2. Small-scale run with ALL filters + pivot ──────────────────────────
+# ── 2. Small-scale run with ALL filters + importance filter ──────────────
 
 
 def _fetch_small_slice(limit: int = 10):
@@ -141,7 +142,7 @@ def _build_llm_client():
     llm_api_key = os.environ.get("CGFT_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not llm_api_key:
         pytest.skip(
-            "CGFT_API_KEY or OPENAI_API_KEY required for pivot filter "
+            "CGFT_API_KEY or OPENAI_API_KEY required for importance filter "
             "(hits LLM relay for per-turn importance ratings)"
         )
 
@@ -159,35 +160,39 @@ def _build_llm_client():
 
 
 class TestBraintrustPipelineAllFilters:
-    """Smaller run, every filter turned on — including the LLM pivot.
+    """Smaller run, every filter turned on — including the LLM importance filter.
 
-    The full chain: detection → build_training_examples →
-    heuristic → tool_relay → dedup → pivot → target cap → split → JSONL.
-    Asserts each stage actually did work (not a silent no-op) and that
-    the final JSONL shape is correct.
+    The full chain: detection → build_training_examples → min_completion_chars
+    → max_tool_output_overlap → max_example_similarity → importance_filter
+    → max_examples cap → split → JSONL.  Asserts each stage actually did
+    work (not a silent no-op) and that the final JSONL shape is correct.
     """
 
-    def test_all_filters_including_pivot(self, tmp_path: Path) -> None:
+    def test_all_filters_including_importance(self, tmp_path: Path) -> None:
         _require_bt_creds()
         llm_client = _build_llm_client()
         traces = _fetch_small_slice(limit=10)
 
         t0 = time.monotonic()
-        _step("TracesPipeline.run() with heuristic + tool_relay + dedup + pivot ALL on")
+        _step(
+            "TracesPipeline.run() with min_completion_chars + "
+            "max_tool_output_overlap + max_example_similarity + "
+            "importance_filter ALL on"
+        )
         result = TracesPipeline(
             traces=traces,
             min_completion_chars=40,
-            tool_relay=0.8,
-            dedup=0.85,
-            pivot=PivotConfig(
+            max_tool_output_overlap=0.8,
+            max_example_similarity=0.85,
+            importance_filter=ImportanceFilterConfig(
                 llm_client=llm_client,
                 model=os.environ.get("LLM_MODEL", "gpt-5.4-nano"),
-                threshold=0.5,
+                min_importance_score=0.5,
                 anchor_fraction=0.1,
                 max_concurrency=8,
             ),
-            target_examples=60,
-            train_eval_split=0.9,
+            max_examples=60,
+            train_fraction=0.9,
             output_dir=tmp_path,
         ).run()
         elapsed = time.monotonic() - t0
@@ -196,27 +201,27 @@ class TestBraintrustPipelineAllFilters:
         _step(
             f"built={stats['examples_built']}  "
             f"after_heuristic_chain={stats['kept_after_filters']}  "
-            f"after_pivot={stats['pivot']['post_pivot']}  "
+            f"after_importance={stats['importance_filter']['post']}  "
             f"final={stats['final_kept']}  "
             f"train={stats['train_count']}  eval={stats['eval_count']}  "
             f"total={elapsed:.1f}s"
         )
 
         # Every filter had the opportunity to drop.  If kept_after_filters
-        # equals examples_built, the heuristic/tool_relay/dedup chain
-        # silently no-opped — a regression we care about.
+        # equals examples_built, the heuristic chain silently no-opped —
+        # a regression we care about.
         assert stats["examples_built"] > stats["kept_after_filters"], (
             f"Filter chain dropped nothing: {stats['examples_built']} → "
-            f"{stats['kept_after_filters']}.  One of heuristic/tool_relay/"
-            "dedup silently broke."
+            f"{stats['kept_after_filters']}.  One of min_completion_chars/"
+            "max_tool_output_overlap/max_example_similarity silently broke."
         )
 
-        # Pivot stage ran and produced stats
-        assert stats["pivot"] is not None, (
-            "stats['pivot'] is None — pivot stage was skipped somehow"
+        # Importance filter ran and produced stats
+        assert stats["importance_filter"] is not None, (
+            "stats['importance_filter'] is None — the LLM stage was skipped"
         )
-        assert stats["pivot"]["pre_pivot"] >= stats["pivot"]["post_pivot"], (
-            "pivot's post_pivot count exceeds pre_pivot — stage is wrong-way-round"
+        assert stats["importance_filter"]["pre"] >= stats["importance_filter"]["post"], (
+            "importance_filter's post count exceeds pre — stage is wrong-way-round"
         )
 
         # System-prompt detection fired
@@ -230,7 +235,7 @@ class TestBraintrustPipelineAllFilters:
         eval_ = result["eval_dataset"]
         assert len(train) >= MIN_TRAIN_SAMPLES, (
             f"Only {len(train)} train examples survived full filtering; "
-            f"need ≥ {MIN_TRAIN_SAMPLES}.  Pivot threshold too aggressive?"
+            f"need ≥ {MIN_TRAIN_SAMPLES}.  min_importance_score too aggressive?"
         )
         assert len(eval_) >= 1
 

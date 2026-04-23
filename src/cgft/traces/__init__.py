@@ -2,7 +2,7 @@
 
 Top-level surface:
     ``TracesPipeline`` — the ergonomic entrypoint for users.
-    ``PivotConfig`` — optional LLM-importance filter config.
+    ``ImportanceFilterConfig`` — optional LLM-importance filter config.
     ``NormalizedTrace`` / ``TraceMessage`` — the data model.
 
 Lower-level primitives live in ``cgft.traces.processing`` / ``cgft.traces.pivot``
@@ -16,11 +16,11 @@ from cgft.traces.adapter import (
     TraceMessage,
     ToolCall,
 )
-from cgft.traces.pipeline import PivotConfig, TracesPipeline
+from cgft.traces.pipeline import ImportanceFilterConfig, TracesPipeline
 
 __all__ = [
+    "ImportanceFilterConfig",
     "NormalizedTrace",
-    "PivotConfig",
     "ToolCall",
     "TraceCredentials",
     "TraceMessage",

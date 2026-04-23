@@ -37,11 +37,11 @@ class TestTracesPipelineSmoke:
         traces = [_trace(i) for i in range(40)]
         result = TracesPipeline(
             traces=traces,
-            target_examples=60,
-            train_eval_split=0.9,
+            max_examples=60,
+            train_fraction=0.9,
             output_dir=tmp_path,
             # dedup off — our synthetic traces are intentionally similar
-            dedup=None,
+            max_example_similarity=None,
         ).run()
 
         assert "train_dataset" in result
@@ -73,9 +73,9 @@ class TestTracesPipelineSmoke:
         result = TracesPipeline(
             traces=traces,
             min_completion_chars=None,
-            tool_relay=None,
-            dedup=None,
-            target_examples=100,
+            max_tool_output_overlap=None,
+            max_example_similarity=None,
+            max_examples=100,
         ).run()
         # With all heuristics off, every built example survives
         assert result["stats"]["final_kept"] == result["stats"]["examples_built"]
@@ -84,14 +84,14 @@ class TestTracesPipelineSmoke:
         # Only 2 traces → 4 examples — below MIN_TRAIN_SAMPLES of 16
         traces = [_trace(i) for i in range(2)]
         with pytest.raises(ValueError, match="need at least"):
-            TracesPipeline(traces=traces, dedup=None).run()
+            TracesPipeline(traces=traces, max_example_similarity=None).run()
 
     def test_explicit_system_prompt_overrides_detection(self) -> None:
         traces = [_trace(i, system="auto-detected prompt") for i in range(20)]
         result = TracesPipeline(
             traces=traces,
             system_prompt="explicit override",
-            dedup=None,
+            max_example_similarity=None,
         ).run()
         # When user passes explicit system_prompt, detection is skipped.
         assert result["system_prompt"] == "explicit override"
