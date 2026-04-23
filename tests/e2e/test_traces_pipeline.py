@@ -1,22 +1,31 @@
 """End-to-end agentic-trace pipeline against live Braintrust.
 
-Smoke test for the full ``BraintrustTraceAdapter.fetch_traces()`` →
-``TracesPipeline.run()`` flow, tuned for minimum cost + time:
+Two scenarios:
 
-  * Fetch a small page of traces (default 50)
-  * No LLM pivot filter (pure heuristic path)
-  * dedup disabled by default — adjacent Braintrust traces often differ
-    only in arguments, which tanks the dataset on a Jaccard threshold
+1. **Full fetch** — pull every trace in the project and verify the count
+   matches what BTQL ``count_traces`` reports.  This catches the bug where
+   transient BTQL errors silently drop a page mid-pagination (symptom:
+   "fetches 500 when the project has 509").
 
-Runs in ~5-15 seconds depending on Braintrust latency.  Zero LLM tokens.
+2. **All filters including pivot** — on a much smaller slice (10 traces),
+   run the whole ``TracesPipeline`` with heuristic + tool_relay + dedup +
+   pivot all enabled.  Proves every filter stage actually executes on
+   real data, and that the LLM-backed pivot path works end-to-end.  The
+   10-trace slice keeps per-turn LLM calls bounded so the test finishes
+   fast.
 
 Env vars:
-    BT_API_KEY — Braintrust API key
-    BT_PROJECT_ID — Braintrust project ID with ≥ 20 traces
+    BT_API_KEY          — Braintrust API key
+    BT_PROJECT_ID       — Braintrust project ID with ≥ 500 traces
+    CGFT_API_KEY        — (pivot only) CGFT platform key for LLM relay
+    OPENAI_API_KEY      — (pivot only) fallback if CGFT key missing
+    LLM_BASE_URL        — (optional) override LLM endpoint
+    LLM_MODEL           — (optional, default gpt-5.4-nano)
 
 Run manually::
 
-    BT_API_KEY=... BT_PROJECT_ID=... pytest -m e2e tests/e2e/test_traces_pipeline.py -v
+    BT_API_KEY=... BT_PROJECT_ID=... CGFT_API_KEY=... \\
+        pytest -m e2e tests/e2e/test_traces_pipeline.py -v -s
 """
 
 from __future__ import annotations
@@ -38,197 +47,207 @@ pytestmark = pytest.mark.e2e
 BT_API_KEY = os.environ.get("BT_API_KEY", "")
 BT_PROJECT_ID = os.environ.get("BT_PROJECT_ID", "")
 
-# Enough traces for MIN_TRAIN_SAMPLES=16 to survive the 0.9/0.1 split even
-# after heuristic drops.  Each trace yields ≥ 1 training example.
-MIN_TRACES_REQUIRED = 30
-
 
 def _step(message: str) -> None:
-    print(f"  [braintrust-traces] → {message}", flush=True)
+    print(f"  [traces-e2e] → {message}", flush=True)
     sys.stdout.flush()
 
 
-def _require_creds() -> None:
+def _require_bt_creds() -> None:
     if not BT_API_KEY or not BT_PROJECT_ID:
-        pytest.skip("BT_API_KEY and BT_PROJECT_ID required for e2e trace tests")
+        pytest.skip("BT_API_KEY and BT_PROJECT_ID required for trace e2e tests")
 
 
-def _fetch_traces(limit: int = 50):
+# ── 1. Full-fetch count parity ───────────────────────────────────────────
+
+
+class TestBraintrustFetchAll:
+    """Pull ALL traces and assert the fetched count matches the BTQL count.
+
+    This is the regression guard for the "fetched 500 when the project has
+    509" failure mode: a transient BTQL error (429/500/502/...) mid-
+    pagination used to bail out the whole loop, silently returning fewer
+    traces.  With retry-on-500 landed in ``cgft/traces/http.py`` and the
+    break-with-partial logic in ``_fetch_via_btql``, this test should
+    pass reliably.
+    """
+
+    def test_fetch_all_matches_count_traces(self) -> None:
+        _require_bt_creds()
+        adapter = BraintrustTraceAdapter(api_key=BT_API_KEY)
+
+        _step("count_traces(project_id) — paginates BTQL SELECT count(*)…")
+        t0 = time.monotonic()
+        count = adapter.count_traces(BT_PROJECT_ID)
+        _step(f"count_traces = {count}  ({time.monotonic()-t0:.1f}s)")
+
+        if count < 500:
+            pytest.skip(
+                f"Project has only {count} traces; need ≥ 500 to exercise "
+                "multi-page BTQL fetch."
+            )
+
+        _step(f"fetch_traces(limit={count}) — full paginated pull…")
+        t0 = time.monotonic()
+        traces, _ = adapter.fetch_traces(BT_PROJECT_ID, limit=count)
+        elapsed = time.monotonic() - t0
+        fetched = len(traces)
+        _step(f"fetched = {fetched}  ({elapsed:.1f}s)")
+
+        # Very tight delta: a handful of new traces may legitimately
+        # arrive between count and fetch, but losing 9 out of 509 is the
+        # exact failure mode we're guarding against.  Previous test used
+        # 2% which masked that.
+        delta = count - fetched
+        assert -3 <= delta <= 3, (
+            f"count_traces={count} but fetch_traces returned {fetched} "
+            f"(missing {delta}).  Likely partial-fetch bug — BTQL 500/502 "
+            "during pagination silently dropped a page."
+        )
+
+        # No duplicates
+        ids = [t.id for t in traces]
+        assert len(ids) == len(set(ids)), (
+            f"Duplicate trace IDs in fetch: {len(ids) - len(set(ids))} dupes"
+        )
+
+        # Every trace has at least 1 message — sanity check on the
+        # span-grouping + message-extraction path
+        empty = [t.id for t in traces if not t.messages]
+        assert not empty, f"{len(empty)} traces came back with no messages (e.g. {empty[:3]})"
+
+        _step(
+            f"parity OK: count={count} fetched={fetched} delta={delta}  "
+            f"throughput={fetched/elapsed:.0f} traces/sec"
+        )
+
+
+# ── 2. Small-scale run with ALL filters + pivot ──────────────────────────
+
+
+def _fetch_small_slice(limit: int = 10):
     adapter = BraintrustTraceAdapter(api_key=BT_API_KEY)
     t0 = time.monotonic()
-    _step(f"fetching up to {limit} traces via BTQL…")
+    _step(f"fetching {limit} traces for small-scale test…")
     traces, _ = adapter.fetch_traces(BT_PROJECT_ID, limit=limit)
-    _step(f"fetched {len(traces)} traces  ({time.monotonic() - t0:.1f}s)")
-
-    if len(traces) < MIN_TRACES_REQUIRED:
-        pytest.skip(
-            f"Project has only {len(traces)} traces; need ≥ {MIN_TRACES_REQUIRED} "
-            f"to exercise the pipeline (split requires ≥ {MIN_TRAIN_SAMPLES} train)."
-        )
+    _step(f"fetched {len(traces)} traces  ({time.monotonic()-t0:.1f}s)")
+    if len(traces) < limit:
+        pytest.skip(f"Project has only {len(traces)} traces; need ≥ {limit}")
     return traces
 
 
-def _assert_jsonl_row_shape(row: dict) -> None:
-    """Match TrainingExample.to_jsonl_dict() contract (see processing.py:167)."""
-    assert "prompt" in row, f"Missing 'prompt' in {row.keys()}"
-    assert "ground_truth" in row, f"Missing 'ground_truth' in {row.keys()}"
-    assert "init_rollout_args" in row, f"Missing 'init_rollout_args' in {row.keys()}"
-    assert isinstance(row["prompt"], list), "prompt must be a list of message dicts"
-    assert isinstance(row["ground_truth"], dict), "ground_truth must be a dict"
-    # init_rollout_args carries trace_id + turn_index so compute_reward() can
-    # cross-reference the original trace.
-    rargs = row["init_rollout_args"]
-    assert "trace_id" in rargs
-    assert "turn_index" in rargs
-
-
-# ── Pipeline smoke ────────────────────────────────────────────────────────
-
-
-class TestBraintrustTracesPipelineE2E:
-    def test_fetch_then_pipeline_run(self, tmp_path: Path) -> None:
-        """Full path: fetch → build → heuristic filter → split → JSONL."""
-        _require_creds()
-        traces = _fetch_traces(limit=50)
-
-        t0 = time.monotonic()
-        _step("TracesPipeline.run() — heuristic filters only")
-        result = TracesPipeline(
-            traces=traces,
-            # Real Braintrust projects often have near-duplicate trace
-            # content (same underlying agent); dedup at 0.85 can drop too
-            # many.  Turn it off for the smoke path.
-            dedup=None,
-            target_examples=50,
-            output_dir=tmp_path,
-        ).run()
-        _step(f"pipeline returned  ({time.monotonic() - t0:.1f}s)")
-
-        train = result["train_dataset"]
-        eval_ = result["eval_dataset"]
-        stats = result["stats"]
-
-        _step(
-            f"built={stats['examples_built']}  "
-            f"kept_after_filters={stats['kept_after_filters']}  "
-            f"final_kept={stats['final_kept']}  "
-            f"train={stats['train_count']}  eval={stats['eval_count']}"
+def _build_llm_client():
+    """Build an AsyncOpenAI client against CGFT's relay or OpenAI direct."""
+    llm_api_key = os.environ.get("CGFT_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not llm_api_key:
+        pytest.skip(
+            "CGFT_API_KEY or OPENAI_API_KEY required for pivot filter "
+            "(hits LLM relay for per-turn importance ratings)"
         )
 
-        # Shape assertions
-        assert len(train) >= MIN_TRAIN_SAMPLES, f"Only {len(train)} train examples"
-        assert len(eval_) >= 1, "Need at least 1 eval example"
-        assert stats["total_traces"] == len(traces)
-        assert stats["examples_built"] > 0
+    base_url = os.environ.get("LLM_BASE_URL")
+    # Default to CGFT's LLM relay when a CGFT_API_KEY was used.
+    if not base_url and os.environ.get("CGFT_API_KEY"):
+        base_url = "https://llm.cgft.io/v1"
 
-        _assert_jsonl_row_shape(train[0])
-        _assert_jsonl_row_shape(eval_[0])
+    from openai import AsyncOpenAI
 
-        # JSONL artifacts written to output_dir
-        assert (tmp_path / "train.jsonl").exists()
-        assert (tmp_path / "eval.jsonl").exists()
-        assert (tmp_path / "metadata.json").exists()
-        train_lines = (tmp_path / "train.jsonl").read_text().splitlines()
-        assert len(train_lines) == len(train)
+    kwargs: dict = {"api_key": llm_api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return AsyncOpenAI(**kwargs)
 
-    def test_detection_identifies_system_prompt(self) -> None:
-        """Auto-detection should surface either a system prompt or None, not crash."""
-        _require_creds()
-        traces = _fetch_traces(limit=30)
+
+class TestBraintrustPipelineAllFilters:
+    """Smaller run, every filter turned on — including the LLM pivot.
+
+    The full chain: detection → build_training_examples →
+    heuristic → tool_relay → dedup → pivot → target cap → split → JSONL.
+    Asserts each stage actually did work (not a silent no-op) and that
+    the final JSONL shape is correct.
+    """
+
+    def test_all_filters_including_pivot(self, tmp_path: Path) -> None:
+        _require_bt_creds()
+        llm_client = _build_llm_client()
+        traces = _fetch_small_slice(limit=10)
+
+        t0 = time.monotonic()
+        _step("TracesPipeline.run() with heuristic + tool_relay + dedup + pivot ALL on")
         result = TracesPipeline(
-            traces=traces,
-            dedup=None,
-            target_examples=40,
-        ).run()
-
-        sp = result["stats"]["detected_system_prompt"]
-        # Either the project has a detectable system prompt, or it doesn't —
-        # both are valid real-world cases.  What matters is the pipeline
-        # didn't blow up on the detection step.
-        if sp is not None:
-            assert sp["prompt"]
-            assert sp["count"] >= 1
-            _step(f"detected system prompt (len={len(sp['prompt'])}, count={sp['count']})")
-        else:
-            _step("no system prompt in project — detection returned None (expected)")
-
-    def test_disabling_heuristics_keeps_more_examples(self) -> None:
-        """Turning filters off produces ≥ the count we got with them on."""
-        _require_creds()
-        traces = _fetch_traces(limit=30)
-
-        with_filters = TracesPipeline(
             traces=traces,
             min_completion_chars=40,
             tool_relay=0.8,
-            dedup=None,
-            target_examples=200,  # high enough that cap doesn't bind
-        ).run()
-        without_filters = TracesPipeline(
-            traces=traces,
-            min_completion_chars=None,
-            tool_relay=None,
-            dedup=None,
-            target_examples=200,
-        ).run()
-
-        _step(
-            f"with filters: {with_filters['stats']['final_kept']}, "
-            f"without: {without_filters['stats']['final_kept']}"
-        )
-        assert (
-            without_filters["stats"]["final_kept"] >= with_filters["stats"]["final_kept"]
-        ), "Disabling filters should not reduce example count"
-
-
-# ── Pivot (optional, gated on OPENAI/LLM creds) ──────────────────────────
-
-
-class TestBraintrustTracesPipelinePivotE2E:
-    """Gated separately since pivot costs LLM tokens."""
-
-    def test_pivot_filter_runs_end_to_end(self, tmp_path: Path) -> None:
-        _require_creds()
-        llm_api_key = os.environ.get("CGFT_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        llm_base_url = os.environ.get(
-            "LLM_BASE_URL",
-            "https://llm.cgft.io/v1" if os.environ.get("CGFT_API_KEY") else None,
-        )
-        if not llm_api_key:
-            pytest.skip("CGFT_API_KEY or OPENAI_API_KEY required for pivot e2e")
-
-        from openai import AsyncOpenAI
-
-        client_kwargs = {"api_key": llm_api_key}
-        if llm_base_url:
-            client_kwargs["base_url"] = llm_base_url
-        llm_client = AsyncOpenAI(**client_kwargs)
-
-        traces = _fetch_traces(limit=40)
-
-        t0 = time.monotonic()
-        _step("TracesPipeline.run() with PivotConfig enabled")
-        result = TracesPipeline(
-            traces=traces,
-            dedup=None,
+            dedup=0.85,
             pivot=PivotConfig(
                 llm_client=llm_client,
                 model=os.environ.get("LLM_MODEL", "gpt-5.4-nano"),
                 threshold=0.5,
+                anchor_fraction=0.1,
                 max_concurrency=8,
             ),
-            target_examples=50,
+            target_examples=60,
+            train_eval_split=0.9,
             output_dir=tmp_path,
         ).run()
-        _step(f"pivot pipeline returned  ({time.monotonic() - t0:.1f}s)")
+        elapsed = time.monotonic() - t0
 
         stats = result["stats"]
-        assert stats["pivot"] is not None, "pivot stats must be populated when pivot is set"
-        assert stats["pivot"]["pre_pivot"] >= stats["pivot"]["post_pivot"]
-        # Final kept ≥ MIN_TRAIN_SAMPLES for the split to have succeeded
-        assert stats["final_kept"] >= MIN_TRAIN_SAMPLES
         _step(
-            f"pivot pre={stats['pivot']['pre_pivot']} "
-            f"post={stats['pivot']['post_pivot']} "
-            f"threshold={stats['pivot']['threshold']}"
+            f"built={stats['examples_built']}  "
+            f"after_heuristic_chain={stats['kept_after_filters']}  "
+            f"after_pivot={stats['pivot']['post_pivot']}  "
+            f"final={stats['final_kept']}  "
+            f"train={stats['train_count']}  eval={stats['eval_count']}  "
+            f"total={elapsed:.1f}s"
+        )
+
+        # Every filter had the opportunity to drop.  If kept_after_filters
+        # equals examples_built, the heuristic/tool_relay/dedup chain
+        # silently no-opped — a regression we care about.
+        assert stats["examples_built"] > stats["kept_after_filters"], (
+            f"Filter chain dropped nothing: {stats['examples_built']} → "
+            f"{stats['kept_after_filters']}.  One of heuristic/tool_relay/"
+            "dedup silently broke."
+        )
+
+        # Pivot stage ran and produced stats
+        assert stats["pivot"] is not None, (
+            "stats['pivot'] is None — pivot stage was skipped somehow"
+        )
+        assert stats["pivot"]["pre_pivot"] >= stats["pivot"]["post_pivot"], (
+            "pivot's post_pivot count exceeds pre_pivot — stage is wrong-way-round"
+        )
+
+        # System-prompt detection fired
+        assert stats["detected_system_prompt"] is not None, (
+            "No system prompt detected on a 30-trace slice — detection broken "
+            "or project has no system prompts (re-pick project)"
+        )
+
+        # MIN_TRAIN_SAMPLES guarantee holds
+        train = result["train_dataset"]
+        eval_ = result["eval_dataset"]
+        assert len(train) >= MIN_TRAIN_SAMPLES, (
+            f"Only {len(train)} train examples survived full filtering; "
+            f"need ≥ {MIN_TRAIN_SAMPLES}.  Pivot threshold too aggressive?"
+        )
+        assert len(eval_) >= 1
+
+        # JSONL row shape (matches TrainingExample.to_jsonl_dict())
+        row = train[0]
+        for key in ("prompt", "ground_truth", "init_rollout_args"):
+            assert key in row, f"missing {key} in train row: {list(row.keys())}"
+        assert isinstance(row["prompt"], list)
+        assert isinstance(row["ground_truth"], dict)
+        rargs = row["init_rollout_args"]
+        for key in ("trace_id", "turn_index"):
+            assert key in rargs, f"missing {key} in init_rollout_args"
+
+        # Artifacts on disk
+        for name in ("train.jsonl", "eval.jsonl", "metadata.json"):
+            assert (tmp_path / name).exists(), f"missing {name}"
+        train_lines = (tmp_path / "train.jsonl").read_text().splitlines()
+        assert len(train_lines) == len(train), (
+            f"train.jsonl has {len(train_lines)} lines, dataset has {len(train)}"
         )
