@@ -34,6 +34,10 @@ dependencies = [
 [project.optional-dependencies]
 chroma = [
     "chromadb>=1.0.0",
+    # Required by chromadb's client-side BM25 tokenizer when using the
+    # Search API in hybrid/lexical modes. Not declared by chromadb itself
+    # (they leave it to the caller). Tiny pure-Python package.
+    "snowballstemmer>=2.2.0",
 ]
 pinecone = [
     "pinecone>=5.0.0",
@@ -79,8 +83,11 @@ warn_unused_ignores = true
 strict_optional = true
 
 [tool.pytest.ini_options]
-markers = ["integration: requires live API credentials (deselected by default)"]
-addopts = "-m 'not integration'"
+markers = [
+    "integration: live-backend adapter tests (deselected by default)",
+    "e2e: full wizard / QA-gen path against live CGFT services — slow, costs LLM tokens, not CI-appropriate",
+]
+addopts = "-m 'not integration and not e2e'"
 
 [dependency-groups]
 dev = [

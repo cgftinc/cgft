@@ -9,6 +9,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+# Eager import so `from cgft.corpus.chroma.search import ChromaSearch`
+# pulls `.client` into sys.modules. Without this, cloudpickle's
+# `register_pickle_by_value(cgft)` doesn't know to inline the client
+# submodule — the rollout-server worker then fails the lazy `from .client
+# import ChromaClient` inside _get_client with `ModuleNotFoundError: cgft`.
+# Matches the CorporaSearch pattern (corpus/corpora/search.py:10).
+from .client import ChromaClient
+
 
 class ChromaSearch:
     """Pickle-safe Chroma search client for RL environments.
@@ -16,10 +24,17 @@ class ChromaSearch:
     Stores only serializable connection parameters.  The Chroma client
     is created lazily on first search call (including after unpickle).
 
+    Pass **either** Cloud credentials (``api_key`` + ``tenant`` +
+    ``database``) **or** a self-hosted ``host``. Cloud takes precedence
+    if both are set; wizard-emitted env classes always use Cloud.
+
     Args:
         collection_name: Name of the Chroma collection.
-        host: Chroma server hostname (required for training envs).
-        port: Chroma server port (default 8000).
+        api_key: Chroma Cloud API key (``ck-...``).
+        tenant: Chroma Cloud tenant ID.
+        database: Chroma Cloud database name.
+        host: Self-hosted server hostname.
+        port: Self-hosted server port (default 8000).
         embed_fn: Custom embedding function. When ``None``, Chroma's
             built-in embeddings are used.
         enable_bm25: Enable BM25 for lexical/hybrid modes.
@@ -29,13 +44,24 @@ class ChromaSearch:
     def __init__(
         self,
         collection_name: str,
-        host: str,
+        api_key: str | None = None,
+        tenant: str | None = None,
+        database: str | None = None,
+        host: str | None = None,
         port: int = 8000,
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
         enable_bm25: bool = True,
         content_attr: list[str] | None = None,
     ) -> None:
+        if not any([api_key and tenant and database, host]):
+            raise ValueError(
+                "ChromaSearch requires either Cloud credentials "
+                "(api_key + tenant + database) or a self-hosted host."
+            )
         self._collection_name = collection_name
+        self._api_key = api_key
+        self._tenant = tenant
+        self._database = database
         self._host = host
         self._port = port
         self._embed_fn = embed_fn
@@ -45,10 +71,11 @@ class ChromaSearch:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            from .client import ChromaClient
-
             self._client = ChromaClient(
                 collection_name=self._collection_name,
+                api_key=self._api_key,
+                tenant=self._tenant,
+                database=self._database,
                 host=self._host,
                 port=self._port,
                 embed_fn=self._embed_fn,
@@ -115,13 +142,22 @@ class ChromaSearch:
         return sorted(self._get_client().modes)
 
     def get_params(self) -> dict[str, Any]:
-        return {
+        params: dict[str, Any] = {
             "backend": "chroma",
             "collection_name": self._collection_name,
-            "host": self._host,
-            "port": self._port,
             "enable_bm25": self._enable_bm25,
         }
+        if self._api_key is not None:
+            # Redact the key — this dict is printed in diagnostics and logs.
+            params.update(
+                mode="cloud",
+                tenant=self._tenant,
+                database=self._database,
+                api_key=(self._api_key[:8] + "...") if self._api_key else None,
+            )
+        else:
+            params.update(mode="self_hosted", host=self._host, port=self._port)
+        return params
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
