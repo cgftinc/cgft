@@ -11,8 +11,6 @@ Provides 5 reward components:
 from __future__ import annotations
 
 import asyncio
-import math
-import re
 import traceback
 from collections.abc import Callable
 from typing import Any
@@ -23,15 +21,13 @@ from benchmax.envs.types import StandardizedExample, ToolDefinition
 
 from cgft.corpus.search_client import SearchClient
 from cgft.envs.reward_helpers import (
+    citation_score,
     clip01,
-    count_search_calls,
     extract_answer_block,
     extract_completion_text,
-    search_within_budget,
+    tool_call_efficiency,
 )
 from cgft.rubrics.rubric import Rubric, evaluate_single_rubric
-
-_CITATION_RE = re.compile(r"\[Source:\s*([^\]]+)\]", re.IGNORECASE)
 
 _CORRECTNESS_RUBRIC = Rubric(
     title="Answer correctness",
@@ -83,7 +79,6 @@ return your final answer inside <answer>...</answer> and cite supporting sources
 
 MAX_TOOL_OUTPUT_CHARS = 10000
 TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated due to character limit]"
-SEARCH_EFFICIENCY_DECAY_RATE = 0.2
 
 
 class SearchEnv(BaseEnv):
@@ -260,12 +255,15 @@ class SearchEnv(BaseEnv):
             rewards["citation_recall"] = self._w_citation_recall * recall
             rewards["citation_precision"] = self._w_citation_precision * precision
 
-            # 3. Search efficiency (shaped by search count vs. gold chunk baseline)
-            calls = count_search_calls(completion)
-            rewards["search_efficiency"] = self._score_search_efficiency(
-                calls=calls,
+            # 3. Search efficiency — correctness-scaled exp decay over
+            # an adaptive baseline of (reference_chunk_count + 2) calls.
+            # Shared with wizard reward codegen via the helper, so both
+            # paths produce identical gradient shape.
+            rewards["search_efficiency"] = self._w_search_efficiency * tool_call_efficiency(
+                completion,
                 correctness_raw=correctness_raw,
                 reference_chunk_count=reference_chunk_count,
+                max_calls=self._max_search_calls,
             )
 
             log_env(rollout_id, f"[SearchEnv] rewards={rewards}")
@@ -310,7 +308,7 @@ class SearchEnv(BaseEnv):
 
             header = f"{i}."
             if source:
-                header += f" — [source: {source}]"
+                header += f" — [Source: {source}]"
             if score:
                 header += f" (score: {score:.2f})"
 
@@ -395,24 +393,6 @@ class SearchEnv(BaseEnv):
     # Citation scoring
     # ------------------------------------------------------------------
 
-    def _score_search_efficiency(
-        self,
-        *,
-        calls: int,
-        correctness_raw: float,
-        reference_chunk_count: int,
-    ) -> float:
-        """Reward correct answers that do not search much past the gold chunk baseline."""
-        if correctness_raw <= 0:
-            return 0.0
-        if not search_within_budget(calls, self._max_search_calls):
-            return 0.0
-
-        baseline_calls = reference_chunk_count + 2
-        excess_calls = max(0, calls - baseline_calls)
-        decay = math.exp(-SEARCH_EFFICIENCY_DECAY_RATE * excess_calls)
-        return self._w_search_efficiency * correctness_raw * decay
-
     def _score_citations(
         self,
         answer_text: str,
@@ -421,44 +401,28 @@ class SearchEnv(BaseEnv):
         """Score citation recall and precision via exact source match.
 
         Returns (recall, precision).
-        """
-        ref_ids = self._extract_reference_ids(reference_chunks)
-        cited_ids = self._parse_citations(answer_text)
 
-        if not ref_ids:
+        Thin wrapper around :func:`citation_score` — preserves SearchEnv's
+        existing behavior of reading ``file`` / ``file_path`` as the source
+        ID and applying :meth:`_canonicalize_id` (overridable by subclasses
+        for corpus-specific normalization).
+        """
+        scores = citation_score(
+            answer_text,
+            reference_chunks,
+            source_field=["file", "file_path"],
+            canonicalize=self._canonicalize_id,
+        )
+        # SearchEnv predates citation_score's "no reference → precision=1.0"
+        # convention; keep the stricter zero-pair so the legacy behavior
+        # (and test_no_reference_chunks for SearchEnv) is preserved.
+        if not any(
+            isinstance(c, dict) and isinstance(c.get("metadata"), dict)
+            and (c["metadata"].get("file") or c["metadata"].get("file_path"))
+            for c in reference_chunks
+        ):
             return 0.0, 0.0
-
-        overlap = cited_ids & ref_ids
-        recall = len(overlap) / len(ref_ids)
-        precision = len(overlap) / len(cited_ids) if cited_ids else 0.0
-        return recall, precision
-
-    def _extract_reference_ids(self, reference_chunks: list[dict[str, Any]]) -> set[str]:
-        """Extract document-level source IDs from reference chunks.
-
-        Default uses the ``file`` metadata key. Override in subclasses
-        for corpus-specific ID extraction.
-        """
-        ids: set[str] = set()
-        for chunk in reference_chunks:
-            if not isinstance(chunk, dict):
-                continue
-            md = chunk.get("metadata", {})
-            if not isinstance(md, dict):
-                continue
-            file_id = str(md.get("file") or md.get("file_path") or "").strip()
-            if file_id:
-                ids.add(self._canonicalize_id(file_id))
-        return ids
-
-    def _parse_citations(self, text: str) -> set[str]:
-        """Parse [Source: <id>] citations from model answer."""
-        ids: set[str] = set()
-        for match in _CITATION_RE.finditer(text or ""):
-            cid = self._canonicalize_id(match.group(1).strip())
-            if cid:
-                ids.add(cid)
-        return ids
+        return scores["recall"], scores["precision"]
 
     def _canonicalize_id(self, source_id: str) -> str:
         """Normalize a source ID. Override for corpus-specific rules."""

@@ -132,7 +132,10 @@ class TestSearchTool:
     def test_metadata_search_includes_source_labels(self):
         env = _make_env(search=StubSearch(results=["foo", "bar"]))
         result = asyncio.run(env._search_tool(query="test"))
-        assert "[source: doc_0]" in result
+        # Source label must use capital S so it matches the [Source: ...] format
+        # the system prompt asks the model to write back — same-case consistency
+        # avoids small models mirroring lowercase from tool output.
+        assert "[Source: doc_0]" in result
         assert "Metadata:" in result
 
     def test_delegates_to_search_client(self):
