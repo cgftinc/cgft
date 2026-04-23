@@ -109,7 +109,9 @@ class TestStatusCodeHandling:
         assert result.status_code == 400
 
     def test_retries_on_all_retryable_codes(self):
-        for code in (429, 502, 503, 504):
+        # 500 is included — Braintrust returns intermittent 500s under load,
+        # treating them as non-retryable bailed out the whole trace fetch.
+        for code in (429, 500, 502, 503, 504):
             resp = _make_response(code)
             resp_200 = _make_response(200)
             with (

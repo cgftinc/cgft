@@ -11,7 +11,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS = (429, 502, 503, 504)
+_RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 
 
 def request_with_retry(
