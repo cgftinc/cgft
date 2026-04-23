@@ -9,6 +9,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+# Eager import so `from cgft.corpus.pinecone.search import PineconeSearch`
+# pulls `.index_client` into sys.modules. Without this, cloudpickle's
+# `register_pickle_by_value(cgft)` doesn't know to inline the submodule —
+# the rollout-server worker then fails the lazy `from .index_client import
+# PineconeIndexClient` inside _get_client with `ModuleNotFoundError: cgft`.
+# Matches the CorporaSearch / ChromaSearch pattern.
+from .index_client import PineconeIndexClient
+
 
 class PineconeSearch:
     """Pickle-safe Pinecone search client for RL environments.
@@ -50,8 +58,6 @@ class PineconeSearch:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            from .index_client import PineconeIndexClient
-
             self._client = PineconeIndexClient(
                 api_key=self._api_key,
                 index_name=self._index_name,
