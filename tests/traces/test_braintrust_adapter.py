@@ -249,8 +249,9 @@ class TestFetchTraces:
         ]
         resp = self._make_btql_response(spans)
 
-        with patch("httpx.request", return_value=resp):
-            traces, cursor = adapter.fetch_traces("proj-123", limit=10)
+        # BTQL uses a pooled httpx.Client, not httpx.request.
+        with patch("httpx.Client.request", return_value=resp):
+            traces, cursor = adapter.fetch_traces("proj-123", limit=10, verbose=False)
 
         assert len(traces) == 2
         assert {t.id for t in traces} == {"t1", "t2"}
@@ -261,10 +262,10 @@ class TestFetchTraces:
         spans = [self._make_span("t1", "t1", is_root=True)]
         resp = self._make_btql_response(spans)
 
-        with patch("httpx.request", return_value=resp) as mock_req:
-            adapter.fetch_traces("proj-123", limit=10)
+        with patch("httpx.Client.request", return_value=resp) as mock_req:
+            adapter.fetch_traces("proj-123", limit=10, verbose=False)
 
-        # Should use BTQL URL, not REST
+        # Client.request signature: (self, method, url, ...) — url is args[1].
         url = mock_req.call_args.args[1]
         assert "/btql" in url
 
@@ -285,13 +286,12 @@ class TestFetchTraces:
         }
         rest_resp.raise_for_status = MagicMock()
 
-        def side_effect(method, url, **kwargs):
-            if "/btql" in url:
-                return btql_resp
-            return rest_resp
-
-        with patch("httpx.request", side_effect=side_effect):
-            traces, cursor = adapter.fetch_traces("proj-123", limit=10)
+        # BTQL uses pooled Client.request; REST fallback uses httpx.request.
+        with (
+            patch("httpx.Client.request", return_value=btql_resp),
+            patch("httpx.request", return_value=rest_resp),
+        ):
+            traces, cursor = adapter.fetch_traces("proj-123", limit=10, verbose=False)
 
         assert len(traces) == 1
         assert traces[0].id == "t1"

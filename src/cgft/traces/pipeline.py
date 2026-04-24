@@ -1,21 +1,13 @@
 """User-facing traces pipeline — normalised traces → training examples.
 
-Mirrors the ergonomics of ``cgft.qa_generation.cgft_pipeline.CgftPipeline``:
-configure once, call ``.run()``, get ``{"train_dataset", "eval_dataset",
-"stats"}`` back.
+Configure, call ``.run()``, get ``{"train_dataset", "eval_dataset",
+"stats"}`` back.  Takes already-normalised traces as input — fetching
+lives in the ``TraceAdapter`` implementations under
+``cgft.traces.<provider>``.
 
-Scope: takes already-normalised traces as input.  Fetching from providers
-(Braintrust, Langfuse, etc.) is a separate concern handled by the
-``TraceAdapter`` implementations in ``cgft.traces.<provider>``.
-
-Design notes:
-- Scalar/bool knobs for simple filters (``min_completion_chars=40``) —
-  wrapping each in a one-knob dataclass is bloat.
-- Dataclass configs only where a stage has 3+ knobs or makes LLM calls
-  (currently just the importance filter).
-- Named stages in fixed order.  ``apply_filters``'s list-of-tuples API
-  stays available for power users who need custom ordering or new
-  filters, but most users should hit this pipeline.
+Simple filters are scalars/bools; only the LLM-backed importance filter
+earns its own dataclass.  Stages run in fixed order — use
+``apply_filters`` directly for custom ordering.
 """
 
 from __future__ import annotations
@@ -142,7 +134,6 @@ class TracesPipeline:
         filtering you get fewer — no up-sampling.
     train_fraction
         Fraction of kept examples that go to train; the rest go to eval.
-        Default 0.9 matches QA-gen defaults.
     random_seed
         For reproducible capping + splitting.
     output_dir
@@ -150,10 +141,8 @@ class TracesPipeline:
         returns the in-memory result.
     verbose
         Print ``[N/6]`` stage markers + a tqdm progress bar for the
-        importance-filter LLM calls.  Default ``True`` — matches the
-        ``CgftPipeline`` QA-gen default for interactive-notebook use.
-        Set ``False`` for clean library/CI output.  Progress markers
-        use ``tqdm.write`` so they interleave correctly with active bars.
+        importance-filter LLM calls.  Set ``False`` for clean library/CI
+        output.  Markers use ``tqdm.write`` to interleave with bars.
     """
 
     traces: list[NormalizedTrace]
@@ -206,9 +195,7 @@ class TracesPipeline:
 
         # 2. Build examples -------------------------------------------------
         _print_progress("[2/6] Building training examples from traces...", verbose=v)
-        # ``include_system_prompt=False`` strips the leading system message
-        # from each prompt so we don't duplicate it — the trainer appends
-        # sp_text separately via env config.
+        # ``include_system_prompt=False`` — trainer injects ``sp_text`` itself.
         examples = build_training_examples(self.traces, include_system_prompt=False)
         _print_progress(
             f"[2/6] Built {len(examples)} training examples "
@@ -245,8 +232,7 @@ class TracesPipeline:
         # 4. Optional LLM importance filter ---------------------------------
         importance_stats: dict[str, Any] | None = None
         if self.importance_filter is not None:
-            # Local import — avoid pulling openai into sys.modules when the
-            # importance filter is not used (e.g. tests, CLI dry-runs).
+            # Local import keeps openai out of sys.modules when unused.
             from cgft.traces.pivot import apply_pivot_filter_async
 
             pre = len(kept)
@@ -258,8 +244,7 @@ class TracesPipeline:
                 verbose=v,
             )
 
-            # Wire a tqdm bar through pivot.py's progress_callback so the
-            # user sees per-batch LLM progress in real time.
+            # Tqdm bar updated via pivot.py's progress_callback hook.
             pbar = tqdm(
                 total=pre,
                 desc="importance filter",
@@ -268,7 +253,7 @@ class TracesPipeline:
             )
 
             def _on_progress(completed: int, total: int) -> None:
-                pbar.total = total  # may change due to heuristic trivial-skip
+                pbar.total = total  # shrinks when heuristic skips trivial turns
                 pbar.n = completed
                 pbar.refresh()
 
