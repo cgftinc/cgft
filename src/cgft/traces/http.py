@@ -11,7 +11,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS = (429, 502, 503, 504)
+_RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 
 
 def request_with_retry(
@@ -22,28 +22,40 @@ def request_with_retry(
     json: dict[str, Any] | None = None,
     max_retries: int = 5,
     timeout: float = 60,
+    client: httpx.Client | None = None,
 ) -> httpx.Response:
     """HTTP request with exponential backoff + jitter on transient errors.
 
-    Retries on 429/502/503/504 status codes and on network-level failures
-    (timeouts, connection errors).  Respects ``Retry-After`` headers on 429
-    responses.  Jitter prevents thundering herd when multiple workers hit
-    the same API concurrently.
+    Retries on 429/500/502/503/504 and on network-level failures (timeouts,
+    connect errors).  Respects ``Retry-After`` on 429s.
 
-    ``max_retries`` is the number of *retries* after the initial attempt,
-    so total attempts = max_retries + 1.
+    ``max_retries`` counts *retries* after the initial attempt — total
+    attempts = max_retries + 1.
+
+    Passing ``client`` reuses its connection pool across calls; the caller
+    must set ``follow_redirects=True`` on the client (BTQL uses 303s for
+    large payloads).
     """
     resp: httpx.Response | None = None
     for attempt in range(max_retries + 1):
         try:
-            resp = httpx.request(
-                method,
-                url,
-                headers=headers,
-                json=json,
-                timeout=timeout,
-                follow_redirects=True,
-            )
+            if client is not None:
+                resp = client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json,
+                    timeout=timeout,
+                )
+            else:
+                resp = httpx.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json,
+                    timeout=timeout,
+                    follow_redirects=True,
+                )
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             if attempt == max_retries:
                 raise

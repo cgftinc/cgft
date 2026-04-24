@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import httpx
+from tqdm.auto import tqdm
+
 from cgft.traces.adapter import (
     NormalizedTrace,
     TraceCredentials,
@@ -21,6 +24,12 @@ _MAX_TRACES_PER_FETCH = 1000
 _BTQL_COLUMNS = (
     "id, span_id, root_span_id, input, output, scores, metadata, span_attributes, created"
 )
+
+
+def _print_progress(message: str, *, verbose: bool) -> None:
+    """Uses ``tqdm.write`` so lines interleave cleanly with the pagination bar."""
+    if verbose:
+        tqdm.write(message)
 
 
 class BraintrustTraceAdapter:
@@ -106,6 +115,7 @@ class BraintrustTraceAdapter:
         *,
         limit: int | None = None,
         cursor: str | None = None,
+        verbose: bool = True,
     ) -> tuple[list[NormalizedTrace], str | None]:
         """Fetch spans from Braintrust, group by root_span_id, and normalise.
 
@@ -114,90 +124,132 @@ class BraintrustTraceAdapter:
         ``cursor=None`` (no cross-call pagination — increase ``limit``
         to fetch more).
 
+        When ``verbose=True`` (default), prints stage markers and a tqdm
+        progress bar for pagination — matches the ``TracesPipeline``
+        convention so the CLI/notebook UX is consistent.
+
         Returns ``(traces, next_cursor)``.
         """
-        import httpx
-
         max_traces = min(limit, _MAX_TRACES_PER_FETCH) if limit else _MAX_TRACES_PER_FETCH
 
+        _print_progress(
+            f"[traces] fetching up to {max_traces} traces from project {project_id[:8]}…",
+            verbose=verbose,
+        )
+
         try:
-            trace_trees = self._fetch_via_btql(project_id, max_traces)
+            trace_trees = self._fetch_via_btql(project_id, max_traces, verbose=verbose)
         except (httpx.HTTPError, httpx.TimeoutException, httpx.ConnectError, KeyError) as e:
             logger.warning("BTQL fetch failed, falling back to REST: %s", e)
+            _print_progress(
+                f"[traces] BTQL failed ({type(e).__name__}); falling back to REST API…",
+                verbose=verbose,
+            )
             trace_trees, cursor = self._fetch_via_rest(project_id, max_traces, cursor)
 
+        _print_progress(
+            f"[traces] normalising {len(trace_trees)} trace trees → NormalizedTrace…",
+            verbose=verbose,
+        )
         traces: list[NormalizedTrace] = []
         for trace_id, tree in trace_trees.items():
             traces.append(_normalize_trace(trace_id, tree))
             if len(traces) >= max_traces:
                 break
 
+        _print_progress(f"[traces] done — {len(traces)} traces ready", verbose=verbose)
         return traces, cursor
 
     def _fetch_via_btql(
         self,
         project_id: str,
         max_traces: int,
+        *,
+        verbose: bool = False,
     ) -> dict[str, dict[str, Any]]:
         """Fetch spans using BTQL, return grouped trace trees.
 
-        BTQL has a 1000-row max per query.  Paginates using
-        ``WHERE created < '{last_timestamp}'`` to fetch additional pages.
-        ``project_id`` is always from ``list_projects()`` — not user input.
+        BTQL hard-caps LIMIT at 1000 per query.  Paginates using
+        ``WHERE created < '{last_timestamp}'``.  A pooled ``httpx.Client``
+        reuses the TCP+TLS connection across pages.
         """
         headers = {**self._credentials.to_headers(), "Content-Type": "application/json"}
         all_rows: list[dict[str, Any]] = []
+        distinct_roots: set[str] = set()
         created_before: str | None = None
-        trace_trees: dict[str, dict[str, Any]] = {}
 
-        while True:
-            where = f"WHERE created < '{created_before}'" if created_before else ""
-            query = (
-                f"SELECT {_BTQL_COLUMNS} "
-                f"FROM project_logs('{project_id}') "
-                f"{where} "
-                f"ORDER BY created DESC "
-                f"LIMIT 1000"
-            )
-            resp = request_with_retry(
-                "POST",
-                _BTQL_URL,
-                headers=headers,
-                json={"query": query, "fmt": "json"},
-                timeout=60,
-            )
-            if resp.status_code in (429, 502, 503, 504):
-                # Retries exhausted — return what we have so far
-                if all_rows:
-                    logger.warning(
-                        "BTQL pagination stopped at HTTP %d after %d rows",
-                        resp.status_code,
-                        len(all_rows),
+        # `follow_redirects=True` is load-bearing — BTQL 303-redirects large
+        # responses to a gzipped S3 JSON blob.
+        pbar = tqdm(
+            desc="  BTQL paginate",
+            disable=not verbose,
+            unit="page",
+            bar_format="{desc}: {n_fmt} pages, {postfix}",
+        )
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=httpx.Timeout(60.0, connect=15.0),
+        ) as client:
+            try:
+                while True:
+                    where = f"WHERE created < '{created_before}'" if created_before else ""
+                    query = (
+                        f"SELECT {_BTQL_COLUMNS} "
+                        f"FROM project_logs('{project_id}') "
+                        f"{where} "
+                        f"ORDER BY created DESC "
+                        f"LIMIT 1000"
                     )
-                    break
-                # First page failed — let caller handle the error
-                resp.raise_for_status()
-            resp.raise_for_status()
-            data = resp.json()
+                    resp = request_with_retry(
+                        "POST",
+                        _BTQL_URL,
+                        headers=headers,
+                        json={"query": query, "fmt": "json"},
+                        timeout=60,
+                        client=client,
+                    )
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        # Retries exhausted — return what we have so far
+                        if all_rows:
+                            logger.warning(
+                                "BTQL pagination stopped at HTTP %d after %d rows",
+                                resp.status_code,
+                                len(all_rows),
+                            )
+                            break
+                        # First page failed — let caller handle the error
+                        resp.raise_for_status()
+                    resp.raise_for_status()
+                    data = resp.json()
 
-            rows = data.get("data", data) if isinstance(data, dict) else data
-            if not isinstance(rows, list) or not rows:
-                break
+                    rows = data.get("data", data) if isinstance(data, dict) else data
+                    if not isinstance(rows, list) or not rows:
+                        break
 
-            all_rows.extend(rows)
-            created_before = rows[-1].get("created")
+                    all_rows.extend(rows)
+                    created_before = rows[-1].get("created")
 
-            trace_trees = _group_into_traces(all_rows)
-            if len(trace_trees) >= max_traces:
-                break
+                    # Running set lets us check the max_traces exit without
+                    # re-grouping the whole accumulated list every page.
+                    for row in rows:
+                        root = row.get("root_span_id")
+                        if root:
+                            distinct_roots.add(root)
+                    pbar.update(1)
+                    pbar.set_postfix_str(
+                        f"{len(all_rows)} spans, {len(distinct_roots)} traces"
+                    )
 
-            # Last page — fewer than 1000 rows means no more data
-            if len(rows) < 1000:
-                break
+                    if len(distinct_roots) >= max_traces:
+                        break
 
-        if not trace_trees:
-            trace_trees = _group_into_traces(all_rows)
+                    # Last page — fewer than 1000 rows means no more data
+                    if len(rows) < 1000:
+                        break
+            finally:
+                pbar.close()
 
+        trace_trees = _group_into_traces(all_rows)
         logger.info("BTQL fetch: %d spans, %d traces", len(all_rows), len(trace_trees))
         return trace_trees
 
