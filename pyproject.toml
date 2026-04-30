@@ -1,6 +1,6 @@
 [project]
 name = "cgft"
-version = "0.1.0"
+version = "0.1.2"
 description = "End-to-end pipeline for fine-tuning LLMs on RAG workloads using reinforcement learning"
 readme = "README.md"
 license = { text = "MIT" }
