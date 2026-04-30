@@ -121,7 +121,7 @@ class StorageClient:
             params["expiresInMinutes"] = expires_in_minutes
 
         response = self._http_client.get(
-            "/api/storage/upload-url",
+            "/v1/storage/upload-url",
             params=params,
         )
         self._handle_response_errors(response)
@@ -293,7 +293,7 @@ class TrainerClient:
             "eval_dataset_path": eval_dataset_path,
         }
         response = self._http_client.post(
-            "/api/experiments/launch",
+            "/v1/experiments/launch",
             json={
                 "type": experiment_type,
                 "name": name,
